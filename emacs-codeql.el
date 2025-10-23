@@ -743,21 +743,21 @@ Provides backwards references into the AST buffer from the source file.")
 ;;; buffer-local state tracking variables and functions
 
 ;; query server config state
-(defvar-local codeql--path-problem-max-paths 10)
+(defvar codeql--path-problem-max-paths 10)
 
 ;; local connection state
-(defvar-local codeql--query-server nil
+(defvar codeql--query-server nil
   "CodeQL query server rpc connection.")
 
 ;; local database state
-(defvar-local codeql--active-database nil)
-(defvar-local codeql--active-database-language nil)
-(defvar-local codeql--database-dataset-folder nil)
-(defvar-local codeql--database-source-location-prefix nil)
-(defvar-local codeql--database-source-archive-zip nil)
-(defvar-local codeql--database-source-archive-root nil)
-(defvar-local codeql--library-path nil)
-(defvar-local codeql--dbscheme nil)
+(defvar codeql--active-database nil)
+(defvar codeql--active-database-language nil)
+(defvar codeql--database-dataset-folder nil)
+(defvar codeql--database-source-location-prefix nil)
+(defvar codeql--database-source-archive-zip nil)
+(defvar codeql--database-source-archive-root nil)
+(defvar codeql--library-path nil)
+(defvar codeql--dbscheme nil)
 
 ;; this expects to run inside a query buffer-local context
 (defun codeql--reset-database-state ()
@@ -771,12 +771,12 @@ Provides backwards references into the AST buffer from the source file.")
   (setq codeql--database-source-archive-zip nil))
 
 ;; local query id state
-(defvar-local codeql--query-server-client-id 0)
-(defvar-local codeql--query-server-progress-id 0)
-(defvar-local codeql--query-server-evaluate-id 0)
+(defvar codeql--query-server-client-id 0)
+(defvar codeql--query-server-progress-id 0)
+(defvar codeql--query-server-evaluate-id 0)
 
 ;; local query history
-(defvar-local codeql--completed-query-history nil)
+(defvar codeql--completed-query-history nil)
 
 (defun codeql--query-server-on-shutdown (_obj buffer-context)
   ;; remove any active database from global database state
