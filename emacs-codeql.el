@@ -313,22 +313,22 @@ Leave nil for default.")
 
 ;; project.el integration for eglot
 
-;; (defun codeql--find-project-root (path)
-;;   (or (locate-dominating-file path "qlpack.yml")
-;;       (locate-dominating-file path "codeql-pack.yml")))
+(defun codeql--find-project-root (path)
+  (or (locate-dominating-file path "qlpack.yml")
+      (locate-dominating-file path "codeql-pack.yml")))
 
-;; (defun project-codeql (dir)
-;;   (let ((root (codeql--find-project-root dir)))
-;;     (when root
-;;       (list 'codeql root))))
+(defun project-codeql (dir)
+  (let ((root (codeql--find-project-root dir)))
+    (when root
+      (list 'codeql root))))
 
-;; (cl-defmethod project-root ((project (head codeql)))
-;;   (nth 1 project))
+(cl-defmethod project-root ((project (head codeql)))
+  (nth 1 project))
 
-;; (cl-defmethod project-external-roots ((project (head codeql)))
-;;   codeql--search-paths-buffer-local)
+(cl-defmethod project-external-roots ((project (head codeql)))
+  codeql--search-paths-buffer-local)
 
-;; (add-to-list 'project-find-functions #'project-codeql)
+(add-to-list 'project-find-functions #'project-codeql)
 
 ;; Eglot configuration
 
