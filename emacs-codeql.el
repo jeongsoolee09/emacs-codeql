@@ -3326,11 +3326,11 @@ Our implementation simply returns the thing at point as a candidate."
              #'codeql-transient-query-server-interact)))
 
 ;; cleanup on kill
-(add-hook 'kill-buffer-hook
-          (lambda ()
-            (when (eq major-mode 'ql-tree-sitter-mode)
-              (when codeql--query-server
-                (jsonrpc-shutdown codeql--query-server)))))
+;; (add-hook 'kill-buffer-hook
+;;           (lambda ()
+;;             (when (eq major-mode 'ql-tree-sitter-mode)
+;;               (when codeql--query-server
+;;                 (jsonrpc-shutdown codeql--query-server)))))
 
 (provide 'emacs-codeql)
 
