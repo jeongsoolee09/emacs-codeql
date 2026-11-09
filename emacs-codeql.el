@@ -1377,6 +1377,19 @@ Sets an optional HEADER."
     ;; return our nodes as org list
     (buffer-string)))
 
+(defun codeql--csv-field (field)
+  "Return FIELD as a single line CSV field that `org-table-convert-region' accepts.
+
+Labels can span multiple lines (e.g. function bodies), which would otherwise
+split a row and break the org-table line limit, and can contain commas or
+quotes, which would otherwise split a column.  Literal | characters would
+split org table cells, so they are displayed as ¦ instead."
+  (let ((field (replace-regexp-in-string
+                "|" "¦" (replace-regexp-in-string "[ \t]*\r?\n[ \t]*" " " field))))
+    (if (string-match-p "[,\"]" field)
+        (concat "\"" (replace-regexp-in-string "\"" "\"\"" field) "\"")
+      field)))
+
 (defun codeql--query-results-to-org (query-results results-type &optional columns)
   "Turn QUERY-RESULTS of RESULTS-TYPE into an org data."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
@@ -1403,7 +1416,8 @@ Sets an optional HEADER."
                                    (cl-map 'vector (lambda (col)
                                                      (let ((name (json-pointer-get col "/name"))
                                                            (kind (json-pointer-get col "/kind")))
-                                                       (format "%s" (or name kind "(unknown)"))))
+                                                       (codeql--csv-field
+                                                        (format "%s" (or name kind "(unknown)")))))
                                            ;; columns comes direct from the json, no need to reverse
                                            columns) ",")))
                 (insert (concat table-header "\n"))))
@@ -1421,7 +1435,8 @@ Sets an optional HEADER."
                                                                  (lambda (node)
                                                                    ;; we use buffer-local variables here
                                                                    (with-current-buffer parent-buffer
-                                                                     (codeql--result-node-to-org node))))
+                                                                     (codeql--csv-field
+                                                                      (codeql--result-node-to-org node)))))
                                                                row-data) ",")))
                                         query-results) "\n")))
               ;; this returns raw org data, does NOT render to a display buffer
