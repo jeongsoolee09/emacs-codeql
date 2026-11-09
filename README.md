@@ -16,6 +16,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Buffer local query server state with concurrent remote|local project, database and query support
 - Automatic database selection deconfliction
 - Org based rendering of path-problem, problem, and raw results
+- Pagination of large raw result sets
 - Remote query development + evaluation via TRAMP
 - Compatible with [github/gh-codeql](https://github.com/github/gh-codeql) for cli version management
 - Database source archive xref backend support
@@ -224,6 +225,20 @@ All query server interaction for your query buffer routes via an intuitive `tran
 This interface is self-documenting and allows you to start/stop query servers, select databases, run queries, and fetch query history.
 
 Otherwise hidden features such as max path depths for path queries are unobtrusively surfaced to the user.
+
+### Paginated raw results
+
+Raw (table) result sets with more tuples than `codeql-max-raw-results` (default: 2000) are rendered one page at a time, using the pagination support of `codeql bqrs info --paginate-rows` and `codeql bqrs decode --rows --start-at`. Paginated results buffers enable `codeql-results-pagination-mode`, which shows the current page in the header line and provides the following bindings:
+
+| Binding   | Command                       |
+|-----------|-------------------------------|
+| `C-c C-n` | `codeql-results-next-page`     |
+| `C-c C-p` | `codeql-results-previous-page` |
+| `C-c C-j` | `codeql-results-goto-page`     |
+| `C-c <`   | `codeql-results-first-page`    |
+| `C-c >`   | `codeql-results-last-page`     |
+
+Paging requires the query buffer that produced the results to still be live. Paginated results are re-rendered from the BQRS file when loaded from query history.
 
 ### TRAMP support
 

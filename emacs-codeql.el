@@ -209,7 +209,10 @@ in local and remote contexts to something that readily exists."
   :group 'emacs-codeql)
 
 (defcustom codeql-max-raw-results 2000
-  "The max amount of raw result tuples to render in an org-table."
+  "The max amount of raw result tuples to render in an org-table.
+
+Raw result sets that contain more tuples than this are paginated, with each
+page holding at most this many tuples.  See `codeql-results-pagination-mode'."
   :type 'integer
   :group 'emacs-codeql)
 
@@ -936,11 +939,23 @@ side effects."
           (json-parse-string json :object-type 'alist)
         (error (progn (message "error parsing json: %s" json) nil))))))
 
-(defun codeql--bqrs-info (bqrs-path)
-  "Retrieve info for BQRS-PATH."
+(defun codeql--bqrs-info (bqrs-path &optional paginate-rows paginate-result-set)
+  "Retrieve info for BQRS-PATH.
+
+When PAGINATE-ROWS is non-nil, also compute the byte offsets for pages of
+PAGINATE-ROWS rows in result set PAGINATE-RESULT-SET, for use with the
+`--start-at' option of `codeql bqrs decode'."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (let* ((cmd (format "%s bqrs info -v --log-to-stderr --format=json -- %s"
-                      (codeql--cli-buffer-local-as-string) (codeql--tramp-unwrap bqrs-path)))
+  (let* ((cmd (format "%s bqrs info -v --log-to-stderr --format=json%s -- %s"
+                      (codeql--cli-buffer-local-as-string)
+                      (if paginate-rows
+                          (concat (format " --paginate-rows=%d" paginate-rows)
+                                  (if paginate-result-set
+                                      (format " --paginate-result-set=%s"
+                                              (shell-quote-argument paginate-result-set))
+                                    ""))
+                        "")
+                      (codeql--tramp-unwrap bqrs-path)))
          (json (codeql--shell-command-to-string cmd)))
     (when json
       (condition-case nil
@@ -955,11 +970,23 @@ side effects."
     (when (codeql--shell-command-to-string cmd)
       (with-temp-buffer (insert-file-contents csv-file) (buffer-string)))))
 
-(defun codeql--bqrs-to-json (bqrs-path entities)
+(defun codeql--bqrs-to-json (bqrs-path entities &optional result-set rows start-at)
+  "Decode BQRS-PATH to json with ENTITIES.
+
+When RESULT-SET is non-nil, only decode that result set.  When ROWS and
+START-AT are non-nil, only decode ROWS rows starting at byte offset START-AT,
+as obtained from `codeql--bqrs-info' pagination offsets."
   (let* ((json-file (concat bqrs-path ".json"))
-         (cmd (format "%s bqrs decode --output=%s --format=json --entities=%s -- %s"
+         (cmd (format "%s bqrs decode --output=%s --format=json --entities=%s%s%s -- %s"
                       (codeql--cli-buffer-local-as-string)
-                      (codeql--tramp-unwrap json-file) entities (codeql--tramp-unwrap bqrs-path))))
+                      (codeql--tramp-unwrap json-file) entities
+                      (if result-set
+                          (format " --result-set=%s" (shell-quote-argument result-set))
+                        "")
+                      (if (and rows start-at)
+                          (format " --rows=%d --start-at=%d" rows start-at)
+                        "")
+                      (codeql--tramp-unwrap bqrs-path))))
     (when (codeql--shell-command-to-string cmd)
       (with-temp-buffer (insert-file-contents json-file) (buffer-string)))))
 
@@ -1260,7 +1287,8 @@ side effects."
     (org-mode)
     (condition-case nil
         (let ((org-table-convert-region-max-lines
-               codeql-max-raw-results))
+               ;; account for the table header line
+               (1+ codeql-max-raw-results)))
           (org-table-convert-region (point-min) (point-max) '(4))
           ;; seal off the top
           (goto-char (point-min))
@@ -1466,28 +1494,238 @@ Sets an optional HEADER."
         (switch-to-buffer-other-window buffer))
       (buffer-string))))
 
-(defun codeql--org-render-raw-query-results (org-data query-buffer &optional footer marker)
-  "Render ORG-DATA including an optional FOOTER."
+(defvar-local codeql--raw-results-pagination nil
+  "Pagination state of a raw results buffer.
+
+A plist with the keys :bqrs-path, :result-set, :offsets, :page, :total-rows
+and :footer.  :offsets is the vector of page byte offsets as computed by
+`codeql bqrs info --paginate-rows', and :page is the 0-based current page.")
+
+(defun codeql--raw-results-fill-buffer (org-data &optional footer)
+  "Replace the current buffer contents with raw results ORG-DATA and FOOTER."
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (insert org-data)
+    (unless (derived-mode-p 'org-mode)
+      (org-mode))
+    (goto-char (point-min))
+    (org-table-align)
+    ;; only add footer after alignment is done
+    (when footer
+      (goto-char (point-max))
+      (insert "\n* Results Footer\n")
+      (insert footer))
+    (goto-char (point-min))))
+
+(defun codeql--org-render-raw-query-results (org-data query-buffer &optional footer marker pagination)
+  "Render ORG-DATA including an optional FOOTER.
+
+PAGINATION is an optional plist describing a paginated result set, see
+`codeql--raw-results-pagination'."
   ;; raw results are org tables
   (let ((buffer
          (generate-new-buffer
           (format "* codeql-org-results:%s *" (if marker marker "")))))
     (with-current-buffer buffer
-      (insert org-data)
       (org-mode)
-      (goto-char (point-min))
-      (org-table-align)
-      ;; only add footer after alignment is done
-      (when footer
-        (goto-char (point-max))
-        (insert "\n* Results Footer\n")
-        (insert footer))
-      (goto-char (point-min))
-      (setq buffer-read-only t)
       (setq codeql--org-query-buffer query-buffer)
+      (when pagination
+        (setq codeql--raw-results-pagination pagination)
+        (codeql-results-pagination-mode 1))
+      (codeql--raw-results-fill-buffer
+       org-data
+       (if pagination (codeql--raw-results-pagination-footer) footer))
+      (setq buffer-read-only t)
       (save-excursion
         (switch-to-buffer-other-window buffer))
       (buffer-string))))
+
+;;; Pagination of raw results
+
+(defun codeql--raw-results-select-result-set (bqrs-info)
+  "Return the alist describing the result set to render from BQRS-INFO.
+
+Prefers #select, otherwise the first result set that holds any rows."
+  (let ((result-sets (append (alist-get 'result-sets bqrs-info) nil)))
+    (or (cl-find "#select" result-sets
+                 :key (lambda (rs) (alist-get 'name rs)) :test #'equal)
+        (cl-find-if (lambda (rs) (> (or (alist-get 'rows rs) 0) 0)) result-sets)
+        (car result-sets))))
+
+(defun codeql--raw-results-pages (pagination)
+  "Return the number of pages described by PAGINATION."
+  (max 1 (length (plist-get pagination :offsets))))
+
+(defun codeql--raw-results-pagination-footer ()
+  "Return the results footer for the current paginated results buffer."
+  (let* ((pagination codeql--raw-results-pagination)
+         (page (plist-get pagination :page))
+         (total-rows (plist-get pagination :total-rows))
+         (first-row (1+ (* page codeql-max-raw-results)))
+         (last-row (min total-rows (* (1+ page) codeql-max-raw-results))))
+    (concat (or (plist-get pagination :footer) "")
+            (format
+             (mapconcat
+              #'identity
+              '("#+RESULT_SET: %s"
+                "#+RESULTS_PAGE: %d/%d"
+                "#+RESULTS_ROWS: %d-%d of %d" "") "\n")
+             (plist-get pagination :result-set)
+             (1+ page) (codeql--raw-results-pages pagination)
+             first-row last-row total-rows))))
+
+(defun codeql--raw-results-header-line ()
+  "Return a header line describing the current results page."
+  (when codeql--raw-results-pagination
+    (let* ((pagination codeql--raw-results-pagination)
+           (page (plist-get pagination :page))
+           (total-rows (plist-get pagination :total-rows)))
+      (format " CodeQL results page %d/%d (rows %d-%d of %d)   %s next, %s previous, %s jump"
+              (1+ page) (codeql--raw-results-pages pagination)
+              (1+ (* page codeql-max-raw-results))
+              (min total-rows (* (1+ page) codeql-max-raw-results))
+              total-rows
+              (substitute-command-keys "\\<codeql-results-pagination-mode-map>\\[codeql-results-next-page]")
+              (substitute-command-keys "\\<codeql-results-pagination-mode-map>\\[codeql-results-previous-page]")
+              (substitute-command-keys "\\<codeql-results-pagination-mode-map>\\[codeql-results-goto-page]")))))
+
+(defun codeql--raw-tuples-to-query-results (tuples)
+  "Transform raw result TUPLES into a list of result node rows."
+  (let ((query-results nil))
+    ;; tuples are array of tuple, tuple are array of element
+    (cl-loop for tuple across tuples do
+             (let ((row-data nil))
+               (cl-loop for element across tuple do
+                        (cond
+                         ;; node with location info
+                         ((and (listp element)
+                               (json-pointer-get element "/url"))
+                          (let ((node (codeql--result-node-create
+                                       :label (json-pointer-get element "/label")
+                                       :mark "→"
+                                       :filename (codeql--uri-to-filename
+                                                  (json-pointer-get element "/url/uri"))
+                                       :line (json-pointer-get element "/url/startLine")
+                                       :column (json-pointer-get element "/url/startColumn")
+                                       :visitable t
+                                       :url (json-pointer-get element "/url"))))
+                            (cl-pushnew node row-data)))
+                         ;; node with no location info, but with a label
+                         ((and (listp element)
+                               (json-pointer-get element "/label"))
+                          (let ((node (codeql--result-node-create
+                                       :label (json-pointer-get element "/label")
+                                       :mark "≔")))
+                            (cl-pushnew node row-data)))
+                         ;; everything else is a literal node
+                         (t
+                          (let ((node (codeql--result-node-create
+                                       :label element
+                                       :mark "≔")))
+                            (cl-pushnew node row-data)))))
+               ;; represent each tuple as a row of node columns
+               (cl-pushnew row-data query-results)))
+    query-results))
+
+(defun codeql--raw-results-page-to-org (bqrs-path result-set offsets page)
+  "Return org data for PAGE of RESULT-SET in BQRS-PATH, or nil if empty.
+
+PAGE is 0-based and indexes into the byte OFFSETS vector.  When OFFSETS is
+nil the whole result set is decoded."
+  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (when-let* ((json-data (codeql--bqrs-to-json
+                          bqrs-path "string,url" result-set
+                          (when offsets codeql-max-raw-results)
+                          (when offsets (aref offsets page))))
+              (json (json-parse-string json-data :object-type 'alist))
+              (tuples (alist-get 'tuples json))
+              ((> (length tuples) 0)))
+    (codeql--query-results-to-org
+     (codeql--raw-tuples-to-query-results tuples)
+     'raw
+     (alist-get 'columns json))))
+
+(defun codeql--raw-results-show-page (page)
+  "Render PAGE (0-based) of the paginated results in the current buffer."
+  (unless codeql--raw-results-pagination
+    (user-error "Not a paginated CodeQL results buffer"))
+  (let* ((pagination codeql--raw-results-pagination)
+         (pages (codeql--raw-results-pages pagination))
+         (query-buffer codeql--org-query-buffer))
+    (unless (and (>= page 0) (< page pages))
+      (user-error "No such results page: %d (valid pages: 1-%d)" (1+ page) pages))
+    (unless (buffer-live-p query-buffer)
+      (user-error "The query buffer for these results is no longer live"))
+    (message "Loading results page %d/%d ..." (1+ page) pages)
+    (let ((org-data
+           (with-current-buffer query-buffer
+             (codeql--raw-results-page-to-org
+              (plist-get pagination :bqrs-path)
+              (plist-get pagination :result-set)
+              (plist-get pagination :offsets)
+              page))))
+      (unless org-data
+        (user-error "Failed to load results page %d" (1+ page)))
+      (setq codeql--raw-results-pagination
+            (plist-put (copy-sequence pagination) :page page))
+      (codeql--raw-results-fill-buffer org-data (codeql--raw-results-pagination-footer))
+      (force-mode-line-update)
+      (message "Showing results page %d/%d." (1+ page) pages))))
+
+(defun codeql-results-next-page ()
+  "Show the next page of CodeQL raw results."
+  (interactive)
+  (codeql--raw-results-show-page
+   (1+ (or (plist-get codeql--raw-results-pagination :page) 0))))
+
+(defun codeql-results-previous-page ()
+  "Show the previous page of CodeQL raw results."
+  (interactive)
+  (codeql--raw-results-show-page
+   (1- (or (plist-get codeql--raw-results-pagination :page) 0))))
+
+(defun codeql-results-first-page ()
+  "Show the first page of CodeQL raw results."
+  (interactive)
+  (codeql--raw-results-show-page 0))
+
+(defun codeql-results-last-page ()
+  "Show the last page of CodeQL raw results."
+  (interactive)
+  (codeql--raw-results-show-page
+   (1- (codeql--raw-results-pages codeql--raw-results-pagination))))
+
+(defun codeql-results-goto-page (page)
+  "Show PAGE (1-based) of CodeQL raw results."
+  (interactive
+   (progn
+     (unless codeql--raw-results-pagination
+       (user-error "Not a paginated CodeQL results buffer"))
+     (list (read-number
+            (format "Results page (1-%d): "
+                    (codeql--raw-results-pages codeql--raw-results-pagination))
+            (1+ (plist-get codeql--raw-results-pagination :page))))))
+  (codeql--raw-results-show-page (1- page)))
+
+(defvar codeql-results-pagination-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-n") #'codeql-results-next-page)
+    (define-key map (kbd "C-c C-p") #'codeql-results-previous-page)
+    (define-key map (kbd "C-c C-j") #'codeql-results-goto-page)
+    (define-key map (kbd "C-c <") #'codeql-results-first-page)
+    (define-key map (kbd "C-c >") #'codeql-results-last-page)
+    map)
+  "Keymap for `codeql-results-pagination-mode'.")
+
+(define-minor-mode codeql-results-pagination-mode
+  "Minor mode for paging through large CodeQL raw result sets.
+
+\\{codeql-results-pagination-mode-map}"
+  :lighter " CodeQL-Pages"
+  :keymap codeql-results-pagination-mode-map
+  (if codeql-results-pagination-mode
+      (setq-local header-line-format '(:eval (codeql--raw-results-header-line)))
+    (kill-local-variable 'header-line-format)))
 
 (defun codeql--print-node (node)
   ;; just for debugging
@@ -2523,71 +2761,48 @@ Our implementation simply returns the thing at point as a candidate."
              (message "No results found.")))))
        ;; fall through to raw results parsing
        (t
-        ;; raw results ... use an alist so we can use json-pointer-get
-        ;; moving to list based json here because it's less predictable
-        ;; and we can't just destructure from a set of known keys
-        (let* ((codeql--query-results nil)
-               (json (json-parse-string
-                      (codeql--bqrs-to-json bqrs-path "string,url")
-                      ;; json-pointer-get wants list based json
-                      :object-type 'alist))
-               (result-key (if (json-pointer-get json "/#select") "#select"
-                             ;; deep sigh ... deal with #Quick_evaluation_of_something tuples
-                             (cl-loop for ((k . v)) on json by #'cddr while v do
-                                      (message "Checking %s for tuples" k)
-                                      until (json-pointer-get json (format "/%s/tuples" k))
-                                      finally return k)))
-               (tuples (json-pointer-get json (format "/%s/tuples" result-key)))
-               (columns (json-pointer-get json (format "/%s/columns" result-key))))
-          (if (and tuples (> (length tuples) 0))
-              ;; alright, we got tooooooples! time to parse them into display items
-              (progn
-                ;; tuples are array of tuple, tuple are array of element
-                (cl-loop for tuple across tuples do
-                         (let ((row-data nil))
-                           (cl-loop for element across tuple do
-                                    (cond
-                                     ;; node with location info
-                                     ((and (listp element)
-                                           (json-pointer-get element "/url"))
-                                      (let ((node (codeql--result-node-create
-                                                   :label (json-pointer-get element "/label")
-                                                   :mark "→"
-                                                   :filename (codeql--uri-to-filename
-                                                              (json-pointer-get element "/url/uri"))
-                                                   :line (json-pointer-get element "/url/startLine")
-                                                   :column (json-pointer-get element "/url/startColumn")
-                                                   :visitable t
-                                                   :url (json-pointer-get element "/url"))))
-                                        (cl-pushnew node row-data)))
-                                     ;; node with no location info, but with a label
-                                     ((and (listp element)
-                                           (json-pointer-get element "/label"))
-                                      (let ((node (codeql--result-node-create
-                                                   :label (json-pointer-get element "/label")
-                                                   :mark "≔")))
-                                        (cl-pushnew node row-data)))
-                                     ;; everything else is a literal node
-                                     (t
-                                      (let ((node (codeql--result-node-create
-                                                   :label element
-                                                   :mark "≔")))
-                                        (cl-pushnew node row-data)))))
-                           ;; represent each tuple as a row of node columns
-                           (cl-pushnew row-data codeql--query-results))))
-            (message "No results in bqrs."))
-          ;; display results if we have any
-          (when codeql--query-results
-            (let ((org-data
-                   (codeql--query-results-to-org
-                    codeql--query-results 'raw columns)))
-              (when org-data
+        ;; raw results are decoded one page of `codeql-max-raw-results' rows at a
+        ;; time, using byte offsets precomputed by `codeql bqrs info'
+        (let* ((result-set-info (codeql--raw-results-select-result-set bqrs-info))
+               (result-set (alist-get 'name result-set-info))
+               (total-rows (or (alist-get 'rows result-set-info) 0)))
+          (if (not (and result-set (> total-rows 0)))
+              (message "No results in bqrs.")
+            (let* ((paginated (> total-rows codeql-max-raw-results))
+                   (offsets
+                    (when paginated
+                      (when-let ((paginated-info
+                                  (codeql--bqrs-info bqrs-path codeql-max-raw-results result-set)))
+                        (alist-get 'offsets
+                                   (alist-get 'pagination
+                                              (codeql--raw-results-select-result-set
+                                               paginated-info))))))
+                   (pagination
+                    (when (> (length offsets) 1)
+                      (list :bqrs-path bqrs-path
+                            :result-set result-set
+                            :offsets offsets
+                            :page 0
+                            :total-rows total-rows
+                            :footer footer)))
+                   (org-data (codeql--raw-results-page-to-org bqrs-path result-set offsets 0)))
+              (when (and paginated (not pagination))
+                (message "Could not compute result pagination offsets, rendering all %d rows."
+                         total-rows))
+              (if (not org-data)
+                  (message "No results in bqrs.")
                 (let ((rendered
                        (codeql--org-render-raw-query-results
                         org-data query-buffer footer
-                        (file-name-nondirectory query-path))))
-                  (with-temp-file (format "%s.org" bqrs-path)
-                    (insert rendered))))))))))))
+                        (file-name-nondirectory query-path)
+                        pagination)))
+                  ;; paginated results are re-rendered from the bqrs on reload so
+                  ;; that they remain navigable, only cache single page results
+                  (if pagination
+                      (when (file-exists-p (format "%s.org" bqrs-path))
+                        (delete-file (format "%s.org" bqrs-path)))
+                    (with-temp-file (format "%s.org" bqrs-path)
+                      (insert rendered)))))))))))))
 
 ;; request cancellation control
 
