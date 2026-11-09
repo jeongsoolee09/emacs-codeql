@@ -216,6 +216,15 @@ page holding at most this many tuples.  See `codeql-results-pagination-mode'."
   :type 'integer
   :group 'emacs-codeql)
 
+(defcustom codeql-results-page-cache-size 10
+  "The max amount of rendered raw result pages to keep per results buffer.
+
+Revisiting a cached page skips decoding and org-table rendering.  Each cached
+page holds up to `codeql-max-raw-results' rendered rows.  Set to 0 to disable
+caching."
+  :type 'integer
+  :group 'emacs-codeql)
+
 (defcustom codeql-use-gh-codeql-extension-when-available t
   "If emacs-codeql detects the presence of a codeql enabled gh cli, use it.
 
@@ -1512,20 +1521,26 @@ split org table cells, so they are displayed as ¦ instead."
 (defvar-local codeql--raw-results-pagination nil
   "Pagination state of a raw results buffer.
 
-A plist with the keys :bqrs-path, :result-set, :offsets, :page, :total-rows
-and :footer.  :offsets is the vector of page byte offsets as computed by
-`codeql bqrs info --paginate-rows', and :page is the 0-based current page.")
+A plist with the keys :bqrs-path, :result-set, :offsets, :page, :page-size,
+:total-rows and :footer.  :offsets is the vector of page byte offsets as
+computed by `codeql bqrs info --paginate-rows', and :page is the 0-based
+current page.")
+
+(defvar-local codeql--raw-results-page-cache nil
+  "Rendered org data of recently visited pages, as (PAGE . ORG-DATA) entries.
+
+Most recently used entries come first, see `codeql-results-page-cache-size'.")
 
 (defun codeql--raw-results-fill-buffer (org-data &optional footer)
-  "Replace the current buffer contents with raw results ORG-DATA and FOOTER."
+  "Replace the current buffer contents with raw results ORG-DATA and FOOTER.
+
+ORG-DATA is expected to be aligned already, see `codeql--csv-to-org-table'."
   (let ((inhibit-read-only t))
     (erase-buffer)
     (insert org-data)
     (unless (derived-mode-p 'org-mode)
       (org-mode))
-    (goto-char (point-min))
-    (org-table-align)
-    ;; only add footer after alignment is done
+    ;; only add footer after the table
     (when footer
       (goto-char (point-max))
       (insert "\n* Results Footer\n")
@@ -1546,6 +1561,7 @@ PAGINATION is an optional plist describing a paginated result set, see
       (setq codeql--org-query-buffer query-buffer)
       (when pagination
         (setq codeql--raw-results-pagination pagination)
+        (codeql--raw-results-cache-put (plist-get pagination :page) org-data)
         (codeql-results-pagination-mode 1))
       (codeql--raw-results-fill-buffer
        org-data
@@ -1571,13 +1587,40 @@ Prefers #select, otherwise the first result set that holds any rows."
   "Return the number of pages described by PAGINATION."
   (max 1 (length (plist-get pagination :offsets))))
 
+(defun codeql--raw-results-cache-get (page)
+  "Return cached org data for PAGE in the current results buffer, or nil.
+
+A hit marks PAGE as most recently used."
+  (when-let ((entry (assq page codeql--raw-results-page-cache)))
+    (setq codeql--raw-results-page-cache
+          (cons entry (delq entry codeql--raw-results-page-cache)))
+    (cdr entry)))
+
+(defun codeql--raw-results-cache-put (page org-data)
+  "Cache ORG-DATA for PAGE, evicting the least recently used pages."
+  (when (> codeql-results-page-cache-size 0)
+    (setq codeql--raw-results-page-cache
+          (cons (cons page org-data)
+                (assq-delete-all page codeql--raw-results-page-cache)))
+    (when (> (length codeql--raw-results-page-cache) codeql-results-page-cache-size)
+      (setcdr (nthcdr (1- codeql-results-page-cache-size) codeql--raw-results-page-cache)
+              nil))))
+
+(defun codeql--raw-results-row-range (pagination)
+  "Return the 1-based (FIRST . LAST) rows of the current page in PAGINATION."
+  (let ((page (plist-get pagination :page))
+        (page-size (plist-get pagination :page-size)))
+    (cons (1+ (* page page-size))
+          (min (plist-get pagination :total-rows) (* (1+ page) page-size)))))
+
 (defun codeql--raw-results-pagination-footer ()
   "Return the results footer for the current paginated results buffer."
   (let* ((pagination codeql--raw-results-pagination)
          (page (plist-get pagination :page))
          (total-rows (plist-get pagination :total-rows))
-         (first-row (1+ (* page codeql-max-raw-results)))
-         (last-row (min total-rows (* (1+ page) codeql-max-raw-results))))
+         (rows (codeql--raw-results-row-range pagination))
+         (first-row (car rows))
+         (last-row (cdr rows)))
     (concat (or (plist-get pagination :footer) "")
             (format
              (mapconcat
@@ -1594,12 +1637,11 @@ Prefers #select, otherwise the first result set that holds any rows."
   (when codeql--raw-results-pagination
     (let* ((pagination codeql--raw-results-pagination)
            (page (plist-get pagination :page))
-           (total-rows (plist-get pagination :total-rows)))
+           (rows (codeql--raw-results-row-range pagination)))
       (format " CodeQL results page %d/%d (rows %d-%d of %d)   %s next, %s previous, %s jump"
               (1+ page) (codeql--raw-results-pages pagination)
-              (1+ (* page codeql-max-raw-results))
-              (min total-rows (* (1+ page) codeql-max-raw-results))
-              total-rows
+              (car rows) (cdr rows)
+              (plist-get pagination :total-rows)
               (substitute-command-keys "\\<codeql-results-pagination-mode-map>\\[codeql-results-next-page]")
               (substitute-command-keys "\\<codeql-results-pagination-mode-map>\\[codeql-results-previous-page]")
               (substitute-command-keys "\\<codeql-results-pagination-mode-map>\\[codeql-results-goto-page]")))))
@@ -1642,23 +1684,26 @@ Prefers #select, otherwise the first result set that holds any rows."
                (cl-pushnew row-data query-results)))
     query-results))
 
-(defun codeql--raw-results-page-to-org (bqrs-path result-set offsets page)
+(defun codeql--raw-results-page-to-org (bqrs-path result-set offsets page page-size)
   "Return org data for PAGE of RESULT-SET in BQRS-PATH, or nil if empty.
 
-PAGE is 0-based and indexes into the byte OFFSETS vector.  When OFFSETS is
-nil the whole result set is decoded."
+PAGE is 0-based and indexes into the byte OFFSETS vector of pages holding
+PAGE-SIZE rows.  When OFFSETS is nil the whole result set is decoded."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (when-let* ((json-data (codeql--bqrs-to-json
                           bqrs-path "string,url" result-set
-                          (when offsets codeql-max-raw-results)
+                          (when offsets page-size)
                           (when offsets (aref offsets page))))
               (json (json-parse-string json-data :object-type 'alist))
               (tuples (alist-get 'tuples json))
               ((> (length tuples) 0)))
-    (codeql--query-results-to-org
-     (codeql--raw-tuples-to-query-results tuples)
-     'raw
-     (alist-get 'columns json))))
+    ;; size the org-table conversion limit by this buffer's page size, which
+    ;; may differ from the current `codeql-max-raw-results'
+    (let ((codeql-max-raw-results (or (and offsets page-size) codeql-max-raw-results)))
+      (codeql--query-results-to-org
+       (codeql--raw-tuples-to-query-results tuples)
+       'raw
+       (alist-get 'columns json)))))
 
 (defun codeql--raw-results-show-page (page)
   "Render PAGE (0-based) of the paginated results in the current buffer."
@@ -1669,18 +1714,22 @@ nil the whole result set is decoded."
          (query-buffer codeql--org-query-buffer))
     (unless (and (>= page 0) (< page pages))
       (user-error "No such results page: %d (valid pages: 1-%d)" (1+ page) pages))
-    (unless (buffer-live-p query-buffer)
-      (user-error "The query buffer for these results is no longer live"))
-    (message "Loading results page %d/%d ..." (1+ page) pages)
     (let ((org-data
-           (with-current-buffer query-buffer
-             (codeql--raw-results-page-to-org
-              (plist-get pagination :bqrs-path)
-              (plist-get pagination :result-set)
-              (plist-get pagination :offsets)
-              page))))
+           (or (codeql--raw-results-cache-get page)
+               (progn
+                 (unless (buffer-live-p query-buffer)
+                   (user-error "The query buffer for these results is no longer live"))
+                 (message "Loading results page %d/%d ..." (1+ page) pages)
+                 (with-current-buffer query-buffer
+                   (codeql--raw-results-page-to-org
+                    (plist-get pagination :bqrs-path)
+                    (plist-get pagination :result-set)
+                    (plist-get pagination :offsets)
+                    page
+                    (plist-get pagination :page-size)))))))
       (unless org-data
         (user-error "Failed to load results page %d" (1+ page)))
+      (codeql--raw-results-cache-put page org-data)
       (setq codeql--raw-results-pagination
             (plist-put (copy-sequence pagination) :page page))
       (codeql--raw-results-fill-buffer org-data (codeql--raw-results-pagination-footer))
@@ -2799,8 +2848,10 @@ Our implementation simply returns the thing at point as a candidate."
                             :offsets offsets
                             :page 0
                             :total-rows total-rows
+                            :page-size codeql-max-raw-results
                             :footer footer)))
-                   (org-data (codeql--raw-results-page-to-org bqrs-path result-set offsets 0)))
+                   (org-data (codeql--raw-results-page-to-org
+                              bqrs-path result-set offsets 0 codeql-max-raw-results)))
               (when (and paginated (not pagination))
                 (message "Could not compute result pagination offsets, rendering all %d rows."
                          total-rows))

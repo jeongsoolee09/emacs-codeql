@@ -238,7 +238,9 @@ Raw (table) result sets with more tuples than `codeql-max-raw-results` (default:
 | `C-c <`   | `codeql-results-first-page`    |
 | `C-c >`   | `codeql-results-last-page`     |
 
-Paging requires the query buffer that produced the results to still be live. Paginated results are re-rendered from the BQRS file when loaded from query history.
+Loading a page that isn't cached requires the query buffer that produced the results to still be live. Paginated results are re-rendered from the BQRS file when loaded from query history.
+
+Recently visited pages are cached per results buffer, so going back to them is near instant. The number of cached pages is controlled by `codeql-results-page-cache-size` (default: 10, set to 0 to disable).
 
 ### TRAMP support
 
