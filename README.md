@@ -300,6 +300,16 @@ The `codeql-search-paths` variable in `emacs-codeql` exists purely to provide yo
 
 `codeql-search-paths` entries are expanded in the context of their location, so if you do want to configure search paths that work across both local and remote systems, you're able to e.g. use a standard "~/path" notation, which will expand to the correct absolute path in the context of the remote or local system via TRAMP.
 
+### Persistent CLI server
+
+CodeQL CLI commands that `emacs-codeql` runs on your behalf, such as `codeql bqrs decode` for rendering results and `codeql resolve` for query and database metadata, are sent to a long-running `codeql execute cli-server` process. This avoids paying the JVM startup cost on every command, which e.g. makes loading a new page of paginated results noticeably faster.
+
+A CLI server is started on demand for each CLI and project root, both locally and over TRAMP, and is shut down when the last query buffer that uses it is killed. You can shut down all CLI servers with `M-x codeql-cli-servers-shutdown`, or disable the CLI server altogether, falling back to running a new CLI process for every command:
+
+```elisp
+(setq codeql-use-cli-server nil)
+```
+
 
 ### Custom tree-sitter artifacts
 

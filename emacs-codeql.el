@@ -225,6 +225,16 @@ caching."
   :type 'integer
   :group 'emacs-codeql)
 
+(defcustom codeql-use-cli-server t
+  "Whether to run CodeQL CLI commands through a persistent CLI server.
+
+When non-nil, commands such as `codeql bqrs decode' are sent to a long-running
+`codeql execute cli-server' process, which avoids the JVM startup cost of
+spawning a new CLI process for every command.  One server is kept per CLI and
+project directory, and it is started on demand."
+  :type 'boolean
+  :group 'emacs-codeql)
+
 (defcustom codeql-use-gh-codeql-extension-when-available t
   "If emacs-codeql detects the presence of a codeql enabled gh cli, use it.
 
@@ -380,8 +390,7 @@ Leave nil for default.")
 
 (defun codeql--get-cli-version ()
   ;; used in setup for ql-tree-sitter-mode so we can not assert the mode here yet.
-  (let* ((cmd (format "%s version" (codeql--cli-buffer-local-as-string))))
-    (codeql--shell-command-to-string cmd)))
+  (codeql--cli-command-to-string (list "version")))
 
 (defun codeql--buffer-local-init-hook ()
   "Set up a codeql buffer context correctly."
@@ -853,11 +862,141 @@ Provides backwards references into the AST buffer from the source file.")
           (if stdout-data stdout-data (error "failed to execute cmd"))))
     (error (progn (message "Error in codeql--shell-command-to-string: %s" cmd) nil))))
 
+;;; persistent cli server
+
+(defvar codeql--cli-servers (make-hash-table :test #'equal)
+  "Running CLI server processes, keyed by CLI command and `default-directory'.")
+
+(defun codeql--cli-server-key ()
+  (list codeql--cli-buffer-local default-directory))
+
+(defun codeql--cli-server-live-p (proc)
+  (and proc (process-live-p proc)))
+
+(defun codeql--cli-server-start ()
+  "Start a CLI server for the current buffer context and return its process."
+  (let* ((name (format "CODEQL CLI Server (%s%s)"
+                       (or (file-remote-p default-directory) "")
+                       (file-name-base (directory-file-name default-directory))))
+         (cmd (codeql--query-server-cmd
+               (append codeql--cli-buffer-local (list "execute" "cli-server"))))
+         (stdout (generate-new-buffer (format " *%s*" name)))
+         (stderr (generate-new-buffer (format " *%s stderr*" name))))
+    (when codeql-verbose-commands
+      (message "Starting CLI server with: %s" cmd))
+    (let ((proc (make-process
+                 :name name
+                 :buffer stdout
+                 :command cmd
+                 :connection-type 'pipe
+                 :coding 'utf-8-unix
+                 :noquery t
+                 :stderr stderr
+                 :sentinel #'ignore
+                 :file-handler t)))
+      (process-put proc 'codeql-stderr stderr)
+      (when-let ((stderr-proc (get-buffer-process stderr)))
+        (set-process-sentinel stderr-proc #'ignore))
+      proc)))
+
+(defun codeql--cli-server-kill (proc)
+  "Shut down and clean up CLI server PROC."
+  (when proc
+    (when (process-live-p proc)
+      (ignore-errors
+        (process-send-string proc (concat (json-serialize ["shutdown"]) "\0")))
+      (delete-process proc))
+    (let ((stderr (process-get proc 'codeql-stderr)))
+      (dolist (buffer (list (process-buffer proc) stderr))
+        (when (buffer-live-p buffer)
+          (let ((stderr-proc (get-buffer-process buffer)))
+            (when stderr-proc (delete-process stderr-proc)))
+          (kill-buffer buffer))))))
+
+(defun codeql--cli-server ()
+  "Return a live CLI server for the current buffer context, starting one if needed."
+  (let* ((key (codeql--cli-server-key))
+         (proc (gethash key codeql--cli-servers)))
+    (unless (codeql--cli-server-live-p proc)
+      (codeql--cli-server-kill proc)
+      (setq proc (codeql--cli-server-start))
+      (puthash key proc codeql--cli-servers))
+    proc))
+
+(defun codeql--cli-server-command-complete-p (proc)
+  (with-current-buffer (process-buffer proc)
+    (and (> (buffer-size) 0) (eq (char-before (point-max)) 0))))
+
+(defun codeql--cli-server-run (args)
+  "Run CLI ARGS on the CLI server and return stdout, or nil on failure.
+
+The server exits when a command fails, in which case it is restarted on the
+next command."
+  (let ((proc (codeql--cli-server))
+        (done nil))
+    (process-put proc 'codeql-busy t)
+    (unwind-protect
+        (progn
+          (with-current-buffer (process-buffer proc) (erase-buffer))
+          (with-current-buffer (process-get proc 'codeql-stderr) (erase-buffer))
+          (process-send-string
+           proc (concat (encode-coding-string (json-serialize (vconcat args)) 'utf-8)
+                        "\0"))
+          (while (and (not (setq done (codeql--cli-server-command-complete-p proc)))
+                      (process-live-p proc))
+            (accept-process-output proc 0.05 nil t))
+          ;; pick up any output that arrived together with the exit
+          (unless done
+            (setq done (codeql--cli-server-command-complete-p proc)))
+          (if done
+              (with-current-buffer (process-buffer proc)
+                (buffer-substring-no-properties (point-min) (1- (point-max))))
+            (let* ((stderr (process-get proc 'codeql-stderr))
+                   (stderr-proc (get-buffer-process stderr)))
+              ;; drain the error message, the server exits before it's read
+              (while (and stderr-proc (process-live-p stderr-proc)
+                          (accept-process-output stderr-proc 0.1 nil t)))
+              (message "CLI server command failed: %s"
+                       (with-current-buffer stderr (string-trim (buffer-string)))))
+            nil))
+      (process-put proc 'codeql-busy nil)
+      ;; a command that didn't complete leaves the server in an unknown state
+      (unless done
+        (codeql--cli-server-kill proc)
+        (remhash (codeql--cli-server-key) codeql--cli-servers)))))
+
+(defun codeql--cli-command-to-string (args &optional verbose)
+  "Run the buffer-local CodeQL CLI with ARGS and return stdout, or nil on failure.
+
+Uses a persistent CLI server when `codeql-use-cli-server' is non-nil."
+  (cl-assert codeql--cli-buffer-local t)
+  (let ((proc (gethash (codeql--cli-server-key) codeql--cli-servers)))
+    (if (and codeql-use-cli-server
+             ;; fall back to a new process for commands issued while the server
+             ;; is busy, e.g. from a process filter or timer
+             (not (and (codeql--cli-server-live-p proc)
+                       (process-get proc 'codeql-busy))))
+        (progn
+          (when (or verbose codeql-verbose-commands)
+            (message "Running %s cli server cmd: %s"
+                     (if (file-remote-p default-directory) "remote" "local")
+                     (string-join args " ")))
+          (codeql--cli-server-run args))
+      (codeql--shell-command-to-string
+       (mapconcat #'shell-quote-argument (append codeql--cli-buffer-local args) " ")
+       verbose))))
+
+(defun codeql-cli-servers-shutdown ()
+  "Shut down all running CodeQL CLI servers."
+  (interactive)
+  (maphash (lambda (_key proc) (codeql--cli-server-kill proc)) codeql--cli-servers)
+  (clrhash codeql--cli-servers)
+  (message "Shut down CLI servers."))
+
 (defun codeql--resolve-query-server ()
   "Resolve which query-server to use, legacy or query-server2."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (let* ((cmd (format "%s execute --help" (codeql--cli-buffer-local-as-string)))
-         (help (codeql--shell-command-to-string cmd)))
+  (let ((help (codeql--cli-command-to-string (list "execute" "--help"))))
     (if (string-match-p (regexp-quote "query-server2") help)
         "query-server2"
       "query-server")))
@@ -871,10 +1010,10 @@ context variables."
   ;; only resolve once for current query buffer
   (unless (and codeql--library-path codeql--dbscheme)
     (message "Resolving query paths.")
-    (let* ((cmd (format "%s resolve library-path -v --log-to-stderr --format=json --additional-packs=%s --query=%s"
-                        (codeql--cli-buffer-local-as-string) (codeql--search-path)
-                        (codeql--tramp-unwrap query-path)))
-           (json (codeql--shell-command-to-string cmd)))
+    (let ((json (codeql--cli-command-to-string
+                 (list "resolve" "library-path" "-v" "--log-to-stderr" "--format=json"
+                       (format "--additional-packs=%s" (codeql--search-path))
+                       (format "--query=%s" (codeql--tramp-unwrap query-path))))))
       (when json
         (condition-case nil
             (cl-destructuring-bind (&key libraryPath dbscheme &allow-other-keys)
@@ -891,9 +1030,9 @@ context variables."
 This version is used in early buffer local init of search paths and has no
 side effects."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (let* ((cmd (format "%s resolve library-path -v --log-to-stderr --format=json --query=%s"
-                      (codeql--cli-buffer-local-as-string) query-path))
-         (json (codeql--shell-command-to-string cmd)))
+  (let ((json (codeql--cli-command-to-string
+               (list "resolve" "library-path" "-v" "--log-to-stderr" "--format=json"
+                     (format "--query=%s" query-path)))))
     (when json
       (condition-case nil
           (cl-destructuring-bind (&key libraryPath &allow-other-keys)
@@ -905,9 +1044,9 @@ side effects."
 (defun codeql--resolve-qlpack-paths (dir)
   "Resolve qlpack paths from DIR."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (let* ((cmd (format "%s resolve qlpacks -v --log-to-stderr --format=json --search-path=%s"
-                      (codeql--cli-buffer-local-as-string) dir))
-         (json (codeql--shell-command-to-string cmd)))
+  (let ((json (codeql--cli-command-to-string
+               (list "resolve" "qlpacks" "-v" "--log-to-stderr" "--format=json"
+                     (format "--search-path=%s" dir)))))
     (when json
       (condition-case nil
           (let* ((qlpacks (json-parse-string json :object-type 'alist)))
@@ -918,9 +1057,9 @@ side effects."
 (defun codeql--database-info (database-path)
   "Resolve info for database at DATABASE-PATH."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (let* ((cmd (format "%s resolve database -v --log-to-stderr --format=json -- %s"
-                      (codeql--cli-buffer-local-as-string) (codeql--tramp-unwrap database-path)))
-         (json (codeql--shell-command-to-string cmd)))
+  (let ((json (codeql--cli-command-to-string
+               (list "resolve" "database" "-v" "--log-to-stderr" "--format=json"
+                     "--" (codeql--tramp-unwrap database-path)))))
     (when json
       (condition-case nil
           (json-parse-string json :object-type 'alist)
@@ -929,9 +1068,9 @@ side effects."
 (defun codeql--database-upgrades (database-scheme)
   "Resolve upgrades for DATABASE-SCHEME."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (let* ((cmd (format "%s resolve upgrades -v --log-to-stderr --format=json -- %s"
-                      (codeql--cli-buffer-local-as-string) (codeql--tramp-unwrap database-scheme)))
-         (json (codeql--shell-command-to-string cmd)))
+  (let ((json (codeql--cli-command-to-string
+               (list "resolve" "upgrades" "-v" "--log-to-stderr" "--format=json"
+                     "--" (codeql--tramp-unwrap database-scheme)))))
     (when json
       (condition-case nil
           (json-parse-string json :object-type 'alist)
@@ -940,9 +1079,9 @@ side effects."
 (defun codeql--query-info (query-path)
   "Retrieve metadata for QUERY-PATH."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (let* ((cmd (format "%s resolve metadata -v --log-to-stderr --format=json -- %s"
-                      (codeql--cli-buffer-local-as-string) (codeql--tramp-unwrap query-path)))
-         (json (codeql--shell-command-to-string cmd)))
+  (let ((json (codeql--cli-command-to-string
+               (list "resolve" "metadata" "-v" "--log-to-stderr" "--format=json"
+                     "--" (codeql--tramp-unwrap query-path)))))
     (when json
       (condition-case nil
           (json-parse-string json :object-type 'alist)
@@ -955,28 +1094,25 @@ When PAGINATE-ROWS is non-nil, also compute the byte offsets for pages of
 PAGINATE-ROWS rows in result set PAGINATE-RESULT-SET, for use with the
 `--start-at' option of `codeql bqrs decode'."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (let* ((cmd (format "%s bqrs info -v --log-to-stderr --format=json%s -- %s"
-                      (codeql--cli-buffer-local-as-string)
-                      (if paginate-rows
-                          (concat (format " --paginate-rows=%d" paginate-rows)
-                                  (if paginate-result-set
-                                      (format " --paginate-result-set=%s"
-                                              (shell-quote-argument paginate-result-set))
-                                    ""))
-                        "")
-                      (codeql--tramp-unwrap bqrs-path)))
-         (json (codeql--shell-command-to-string cmd)))
+  (let ((json (codeql--cli-command-to-string
+               (append (list "bqrs" "info" "-v" "--log-to-stderr" "--format=json")
+                       (when paginate-rows
+                         (list (format "--paginate-rows=%d" paginate-rows)))
+                       (when (and paginate-rows paginate-result-set)
+                         (list (format "--paginate-result-set=%s" paginate-result-set)))
+                       (list "--" (codeql--tramp-unwrap bqrs-path))))))
     (when json
       (condition-case nil
           (json-parse-string json :object-type 'alist)
         (error (progn (message "error parsing json: %s" json) nil))))))
 
 (defun codeql--bqrs-to-csv (bqrs-path entities)
-  (let* ((csv-file (concat bqrs-path ".csv"))
-         (cmd (format "%s bqrs decode --output=%s --format=csv --entities=%s -- %s"
-                      (codeql--cli-buffer-local-as-string)
-                      (codeql--tramp-unwrap csv-file) entities (codeql--tramp-unwrap bqrs-path))))
-    (when (codeql--shell-command-to-string cmd)
+  (let ((csv-file (concat bqrs-path ".csv")))
+    (when (codeql--cli-command-to-string
+           (list "bqrs" "decode"
+                 (format "--output=%s" (codeql--tramp-unwrap csv-file))
+                 "--format=csv" (format "--entities=%s" entities)
+                 "--" (codeql--tramp-unwrap bqrs-path)))
       (with-temp-buffer (insert-file-contents csv-file) (buffer-string)))))
 
 (defun codeql--bqrs-to-json (bqrs-path entities &optional result-set rows start-at)
@@ -985,18 +1121,16 @@ PAGINATE-ROWS rows in result set PAGINATE-RESULT-SET, for use with the
 When RESULT-SET is non-nil, only decode that result set.  When ROWS and
 START-AT are non-nil, only decode ROWS rows starting at byte offset START-AT,
 as obtained from `codeql--bqrs-info' pagination offsets."
-  (let* ((json-file (concat bqrs-path ".json"))
-         (cmd (format "%s bqrs decode --output=%s --format=json --entities=%s%s%s -- %s"
-                      (codeql--cli-buffer-local-as-string)
-                      (codeql--tramp-unwrap json-file) entities
-                      (if result-set
-                          (format " --result-set=%s" (shell-quote-argument result-set))
-                        "")
-                      (if (and rows start-at)
-                          (format " --rows=%d --start-at=%d" rows start-at)
-                        "")
-                      (codeql--tramp-unwrap bqrs-path))))
-    (when (codeql--shell-command-to-string cmd)
+  (let ((json-file (concat bqrs-path ".json")))
+    (when (codeql--cli-command-to-string
+           (append (list "bqrs" "decode"
+                         (format "--output=%s" (codeql--tramp-unwrap json-file))
+                         "--format=json" (format "--entities=%s" entities))
+                   (when result-set
+                     (list (format "--result-set=%s" result-set)))
+                   (when (and rows start-at)
+                     (list (format "--rows=%d" rows) (format "--start-at=%d" start-at)))
+                   (list "--" (codeql--tramp-unwrap bqrs-path))))
       (with-temp-buffer (insert-file-contents json-file) (buffer-string)))))
 
 (defun codeql--bqrs-to-sarif (bqrs-path id kind &optional max-paths)
@@ -1007,11 +1141,14 @@ as obtained from `codeql--bqrs-info' pagination offsets."
          ;; on messages for a single result which complicates SARIF parsing
          ;; also note that our --max-paths is set to 10 by default, as to 4 in
          ;; the codeql extension, which is why we show more results
-         (cmd (format "%s bqrs interpret -v --log-to-stderr -t=id=%s -t=kind=%s --output=%s --format=sarif-latest --max-paths=%s --no-group-results -- %s"
-                      (codeql--cli-buffer-local-as-string) id kind
-                      (codeql--tramp-unwrap sarif-file) (or max-paths codeql--path-problem-max-paths)
-                      (codeql--tramp-unwrap bqrs-path))))
-    (when (codeql--shell-command-to-string cmd)
+         (args (list "bqrs" "interpret" "-v" "--log-to-stderr"
+                     (format "-t=id=%s" id) (format "-t=kind=%s" kind)
+                     (format "--output=%s" (codeql--tramp-unwrap sarif-file))
+                     "--format=sarif-latest"
+                     (format "--max-paths=%s" (or max-paths codeql--path-problem-max-paths))
+                     "--no-group-results"
+                     "--" (codeql--tramp-unwrap bqrs-path))))
+    (when (codeql--cli-command-to-string args)
       (with-temp-buffer (insert-file-contents sarif-file) (buffer-string)))))
 
 (defun codeql--database-archive-zipinfo ()
@@ -3418,9 +3555,10 @@ Our implementation simply returns the thing at point as a candidate."
 
 (defun codeql--query-server-resolve-ram (&optional max-ram)
   "Resolve ram options for jvm, optionally bounding to MAX-RAM in MB."
-  (let* ((max-ram (if max-ram (format "-M=%s" max-ram) ""))
-         (cmd (format "%s resolve ram %s --" (codeql--cli-buffer-local-as-string) max-ram))
-         (options (codeql--shell-command-to-string cmd)))
+  (let ((options (codeql--cli-command-to-string
+                  (append (list "resolve" "ram")
+                          (when max-ram (list (format "-M=%s" max-ram)))
+                          (list "--")))))
     (when options
       ;; errr ... it's late
       (split-string (string-trim-right options) "\n"))))
@@ -3607,9 +3745,26 @@ Our implementation simply returns the thing at point as a candidate."
              #'codeql-transient-query-server-interact)))
 
 ;; cleanup on kill
+(defun codeql--cli-server-release ()
+  "Shut down the current buffer's CLI server unless another QL buffer uses it."
+  (let* ((key (codeql--cli-server-key))
+         (proc (gethash key codeql--cli-servers)))
+    (when (and proc
+               (not (cl-some (lambda (buffer)
+                               (and (not (eq buffer (current-buffer)))
+                                    (eq (buffer-local-value 'major-mode buffer)
+                                        'ql-tree-sitter-mode)
+                                    (equal (with-current-buffer buffer
+                                             (codeql--cli-server-key))
+                                           key)))
+                             (buffer-list))))
+      (codeql--cli-server-kill proc)
+      (remhash key codeql--cli-servers))))
+
 (add-hook 'kill-buffer-hook
           (lambda ()
             (when (eq major-mode 'ql-tree-sitter-mode)
+              (codeql--cli-server-release)
               (when codeql--query-server
                 (jsonrpc-shutdown codeql--query-server)))))
 
