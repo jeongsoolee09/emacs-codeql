@@ -228,7 +228,7 @@ Otherwise hidden features such as max path depths for path queries are unobtrusi
 
 ### Paginated raw results
 
-Raw (table) result sets with more tuples than `codeql-max-raw-results` (default: 2000) are rendered one page at a time, using the pagination support of `codeql bqrs info --paginate-rows` and `codeql bqrs decode --rows --start-at`. Paginated results buffers enable `codeql-results-pagination-mode`, which shows the current page in the header line and provides the following bindings:
+Raw (table) result sets with more tuples than `codeql-max-raw-results` (default: 200) are rendered one page at a time, using the pagination support of `codeql bqrs info --paginate-rows` and `codeql bqrs decode --rows --start-at`. Paginated results buffers enable `codeql-results-pagination-mode`, which shows the current page in the header line and provides the following bindings:
 
 | Binding   | Command                       |
 |-----------|-------------------------------|

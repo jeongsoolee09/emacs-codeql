@@ -208,7 +208,7 @@ in local and remote contexts to something that readily exists."
   :type 'directory
   :group 'emacs-codeql)
 
-(defcustom codeql-max-raw-results 2000
+(defcustom codeql-max-raw-results 200
   "The max amount of raw result tuples to render in an org-table.
 
 Raw result sets that contain more tuples than this are paginated, with each
