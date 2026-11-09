@@ -216,7 +216,7 @@ page holding at most this many tuples.  See `codeql-results-pagination-mode'."
   :type 'integer
   :group 'emacs-codeql)
 
-(defcustom codeql-results-page-cache-size 10
+(defcustom codeql-results-page-cache-size 50
   "The max amount of rendered raw result pages to keep per results buffer.
 
 Revisiting a cached page skips decoding and org-table rendering.  Each cached
