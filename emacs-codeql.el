@@ -3717,6 +3717,10 @@ See `codeql-results-diagnostics-mode'."
                   source (car region) (cdr region) type
                   (format "%s [%s]" text (string-trim marker "[* ]+" "[* ]+")))))))))
 
+;; it only reports the locations of results buffers, so it's safe to run on
+;; source archive files, which newer Flymake treats as untrusted content
+(put 'codeql--flymake-backend 'flymake-always-safe t)
+
 (defun codeql--diagnostics-wanted-p ()
   "Return non-nil if a results buffer has diagnostics for the current buffer."
   (when buffer-file-name
