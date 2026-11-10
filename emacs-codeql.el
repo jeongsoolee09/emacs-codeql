@@ -1456,10 +1456,18 @@ as obtained from `codeql--bqrs-info' pagination offsets."
          (buffer-string))))))
 
 (defun codeql--escape-org-description (description)
-  "Replace [] with something harmless in org link descriptions."
-  (replace-regexp-in-string "\\[\\|\\]\\|=\\|~\\|_\\|/\\|+\\|\\*"
+  "Neutralize characters in DESCRIPTION that org would treat as markup."
+  (replace-regexp-in-string "[][=~_/+*<^\\]"
                             ;; this wraps with a zero width space ;)
-                            (lambda (x) (format "​%s​" x)) description))
+                            (lambda (x) (format "​%s​" x)) description t t))
+
+(defun codeql--printable-text (text)
+  "Return TEXT on a single line, with control characters made visible."
+  (replace-regexp-in-string
+   "[\0-\x1f\x7f]"
+   (lambda (c) (string (if (eq (aref c 0) ?\x7f) ?␡ (+ ?␀ (aref c 0)))))
+   (replace-regexp-in-string "[ \t]*\r?\n[ \t]*" " " text)
+   t t))
 
 (defun codeql--printable-label (label)
   "Return LABEL in a form that is visible and safe to render as org text.
@@ -1467,16 +1475,16 @@ as obtained from `codeql--bqrs-info' pagination offsets."
 Empty and whitespace-only labels get a placeholder, so their links remain
 clickable, line breaks are collapsed and other control characters are shown
 as their Unicode control pictures."
-  (let ((label (replace-regexp-in-string "[ \t]*\r?\n[ \t]*" " " (format "%s" (or label "")))))
+  (let ((label (format "%s" (or label ""))))
     (cond
      ((string-empty-p label) "[empty string]")
      ((string-match-p "\\`[[:space:]]+\\'" label)
-      (format "[whitespace: \"%s\"]" label))
-     (t
-      (replace-regexp-in-string
-       "[\0-\x1f\x7f]"
-       (lambda (c) (string (if (eq (aref c 0) ?\x7f) ?␡ (+ ?␀ (aref c 0)))))
-       label t t)))))
+      (format "[whitespace: \"%s\"]" (codeql--printable-text label)))
+     (t (codeql--printable-text label)))))
+
+(defun codeql--org-text (text)
+  "Return TEXT escaped for display as literal text in org."
+  (codeql--escape-org-description (codeql--printable-label text)))
 
 (defun codeql--encode-link-path (path)
   "Percent encode the characters of PATH that org links in tables can't contain."
@@ -1510,8 +1518,7 @@ as their Unicode control pictures."
           (format "[[%s][%s]]" (org-link-escape link)
                   (codeql--escape-org-description desc))))
     ;; not visitable, just return the label
-    (codeql--escape-org-description
-     (codeql--printable-label (codeql--result-node-label node)))))
+    (codeql--org-text (codeql--result-node-label node))))
 
 (defun codeql--org-list-from-nodes (parent-buffer nodes &optional header)
   "Turn a given list of PARENT-BUFFER context location NODES into an org-list.
@@ -1636,10 +1643,8 @@ split org table cells, so they are displayed as ¦ instead."
                                          (codeql--result-node-rule-id issue)
                                          ;; swap sarif markdown links for org links if required
                                          (with-current-buffer parent-buffer
-                                           (if related-locations
-                                               (codeql--swap-sarif-links-for-org-links
-                                                (codeql--result-node-label issue) related-locations)
-                                             (codeql--result-node-label issue)))
+                                           (codeql--swap-sarif-links-for-org-links
+                                            (codeql--result-node-label issue) related-locations))
                                          (with-current-buffer parent-buffer
                                            (codeql--result-node-to-org
                                             location
@@ -1649,7 +1654,9 @@ split org table cells, so they are displayed as ¦ instead."
                                          (json-pointer-get url "/startLine")
                                          (json-pointer-get url "/startColumn"))
                                (format "* %s ... [location unknown]"
-                                       (codeql--result-node-label issue)))
+                                       (with-current-buffer parent-buffer
+                                         (codeql--swap-sarif-links-for-org-links
+                                          (codeql--result-node-label issue) related-locations))))
                              "\n"))
                            ;; add any codeflow paths and their associated nodes for this issue
                            (when code-flows
@@ -2005,43 +2012,56 @@ Group 8 matches the closing parenthesis.")
              when (= (codeql--result-node-related-id node) id)
              do (cl-return (codeql--result-node-to-org node text)))))
 
+(defconst codeql--sarif-message-link-regex
+  "\\[\\(\\(?:[^][\\]\\|\\\\[][\\]\\)*\\)\\](\\([0-9]+\\))"
+  "Regular expression for a [text](id) link in a SARIF message.
+
+Link text may contain escaped brackets and backslashes.")
+
+(defun codeql--unescape-sarif-text (text)
+  "Remove the backslash escapes of [, ] and \\ from SARIF message TEXT."
+  (replace-regexp-in-string "\\\\\\([][\\]\\)" "\\1" text t))
+
+(defun codeql--parse-sarif-message (message)
+  "Split SARIF MESSAGE into its plain text and link components.
+
+Returns a list of unescaped strings and (TEXT ID) lists for [text](id) links.
+Brackets and backslashes in messages are escaped with a backslash, so only an
+unescaped [ can start a link."
+  (let ((components nil)
+        (text-start 0)
+        (i 0)
+        (len (length message)))
+    (while (< i len)
+      (pcase (aref message i)
+        (?\\ (setq i (+ i 2)))
+        (?\[
+         (if (eq (string-match codeql--sarif-message-link-regex message i) i)
+             (progn
+               (push (codeql--unescape-sarif-text (substring message text-start i))
+                     components)
+               (push (list (codeql--unescape-sarif-text (match-string 1 message))
+                           (string-to-number (match-string 2 message)))
+                     components)
+               (setq i (match-end 0)
+                     text-start i))
+           (setq i (1+ i))))
+        (_ (setq i (1+ i)))))
+    (push (codeql--unescape-sarif-text (substring message text-start)) components)
+    (nreverse components)))
+
 (defun codeql--swap-sarif-links-for-org-links (message related-locations)
-  "Parse all [text](id) links out of a message text and replace them with org links."
+  "Render SARIF MESSAGE as org text, turning its [text](id) links into org links."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  ;; parent buffer
-  (let ((parent-buffer (current-buffer)))
-    ;; dst buffer
-    (with-temp-buffer
-      (let ((swap-buf (current-buffer)))
-        ;; src buffer
-        (with-temp-buffer
-          (insert message)
-          (goto-char (point-min))
-          (let ((last-point (point)))
-            (cl-loop
-             until (not (re-search-forward codeql--markdown-regex-link-inline nil t))
-             do (let* ((prefix (buffer-substring-no-properties
-                                last-point
-                                (- (point) (length (match-string 0)))))
-                       (sarif-link-text (match-string 3))
-                       (sarif-link-id (string-to-number (match-string 6)))
-                       (org-link
-                        ;; we need to be in the query server context to resolve TRAMP links
-                        (with-current-buffer parent-buffer
-                          (codeql--related-link-to-org-link
-                           (list sarif-link-text sarif-link-id) related-locations))))
-                  (setq last-point (point))
-                  (save-excursion
-                    (with-current-buffer swap-buf
-                      (insert prefix (or org-link "XXXCOULDNOTRESOLVELINKXXX"))))))
-            ;; if there's any postfix left, grab that too
-            (when (< (point) (point-max))
-              (let ((postfix (buffer-substring-no-properties (point) (point-max))))
-                (save-excursion
-                  (with-current-buffer swap-buf
-                    (insert postfix))))))))
-      ;; dump our dst buffer contents
-      (buffer-string))))
+  (mapconcat
+   (lambda (component)
+     (if (stringp component)
+         (codeql--escape-org-description (codeql--printable-text component))
+       (or (codeql--related-link-to-org-link component related-locations)
+           ;; unresolvable links are shown as their plain text
+           (codeql--escape-org-description
+            (codeql--printable-text (car component))))))
+   (codeql--parse-sarif-message message) ""))
 
 (defun codeql--issue-with-nodes (code-flows locations related-locations message rule-id)
   "Returns an issue node with all its associated nodes out of a SARIF result."
@@ -2784,12 +2804,12 @@ Our implementation simply returns the thing at point as a candidate."
            (save-excursion
              (with-current-buffer buffer-context
                (format "%s %s%s"
-                       (codeql--ast-item-label node)
+                       (codeql--org-text (codeql--ast-item-label node))
                        (codeql--result-node-to-org result-node "⧉")
                        ;; only add Line stamp to roots
                        (if (codeql--ast-item-parent node) "" (format " Line %s" line))))))
        ;; if not, just return a plain text heading
-       (codeql--ast-item-label node))) "\n"))
+       (codeql--org-text (codeql--ast-item-label node)))) "\n"))
   ;; hail to the guardians of the watch towers of the south.
   (cl-loop for node across (codeql--ast-item-children node) do
            (codeql--render-node node (concat level "*") buffer-context)))
