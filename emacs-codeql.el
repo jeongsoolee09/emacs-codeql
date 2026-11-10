@@ -1426,34 +1426,104 @@ as obtained from `codeql--bqrs-info' pagination offsets."
 
 ;;; Org-mode based result rendering, so we can turn results into audit notes \o/
 
-(defun codeql--csv-to-org-table (csv-data &optional set-header-line)
-  "Transform CSV-DATA into an org-table, optionally setting a header line."
-  (with-temp-buffer
-    (insert csv-data)
-    (org-mode)
-    (condition-case nil
-        (let ((org-table-convert-region-max-lines
-               ;; account for the table header line
-               (1+ codeql-max-raw-results)))
-          (org-table-convert-region (point-min) (point-max) '(4))
-          ;; seal off the top
-          (goto-char (point-min))
-          (when set-header-line
-            (save-excursion
-              ;; as below
-              (org-table-insert-hline)))
-          ;; so above
-          (org-table-insert-hline t)
-          ;; seal off the bottom
-          (goto-char (point-max))
-          (insert "|-")
-          (goto-char (point-min))
-          (org-table-align)
-          (buffer-string))
-      (error
-       (progn
-         (message "Rendering failed (too many results?) Returning raw CSV.")
-         (buffer-string))))))
+(defun codeql--org-table-cell (text)
+  "Return TEXT as the contents of a single org table cell.
+
+Labels can span multiple lines (e.g. function bodies), which would otherwise
+split a row.  Literal | characters would split the cell, so they are
+displayed as ¦ instead."
+  (string-trim
+   (replace-regexp-in-string
+    "|" "¦" (replace-regexp-in-string "[ \t]*\r?\n[ \t]*" " " text) t t)
+   "[ \t]+" "[ \t]+"))
+
+(defun codeql--org-table-cell-width (cell)
+  "Return the display width of CELL in an org buffer.
+
+Bracket links only show their description, as long as
+`org-link-descriptive' is set."
+  (string-width
+   (if (and (default-value 'org-link-descriptive)
+            (string-match-p "\\[\\[" cell))
+       (replace-regexp-in-string
+        org-link-bracket-re
+        (lambda (link) (or (match-string 2 link) (match-string 1 link)))
+        cell t t)
+     cell)))
+
+(defun codeql--org-table-column-alignment (cells)
+  "Return the alignment of a column holding CELLS, like `org-table-align'.
+
+That is \"r\" when enough of CELLS are numbers, see
+`org-table-number-fraction', \"l\" otherwise, unless a cookie such as
+<r> fixes the alignment."
+  (let ((numbers 0) (non-empty 0) fixed)
+    (cl-loop for cell in cells until fixed do
+             (cond ((string-empty-p cell))
+                   ((string-match "\\`<\\([lrc]\\)[0-9]*>\\'" cell)
+                    (setq fixed (match-string 1 cell)))
+                   (t (cl-incf non-empty)
+                      (when (string-match-p org-table-number-regexp cell)
+                        (cl-incf numbers)))))
+    (cond (fixed)
+          ((>= numbers (* org-table-number-fraction non-empty)) "r")
+          (t "l"))))
+
+(defun codeql--org-table (rows &optional header)
+  "Return an aligned org table holding ROWS, with an optional HEADER row.
+
+ROWS is a list of rows and HEADER a row, where a row is a list of cell
+strings that are already valid org, see `codeql--org-table-cell'.  The
+result is what `org-table-align' would produce, but building it directly
+avoids the cost of parsing and measuring a table in an org buffer."
+  (require 'org-table)
+  (let* ((all-rows (if header (cons header rows) rows))
+         (ncols (apply #'max 1 (mapcar #'length all-rows)))
+         (all-rows (mapcar (lambda (row)
+                             (vconcat row (make-vector (- ncols (length row)) "")))
+                           all-rows))
+         (widths (make-vector ncols 1))
+         (cell-widths
+          (mapcar (lambda (row)
+                    (let ((ws (make-vector ncols 0)))
+                      (dotimes (i ncols)
+                        (let ((w (codeql--org-table-cell-width (aref row i))))
+                          (aset ws i w)
+                          (aset widths i (max w (aref widths i)))))
+                      ws))
+                  all-rows))
+         (alignments
+          (vconcat (cl-loop for i below ncols collect
+                            (codeql--org-table-column-alignment
+                             (mapcar (lambda (row) (aref row i)) all-rows)))))
+         (rule (concat "|" (mapconcat (lambda (w) (make-string (+ 2 w) ?-)) widths "+")
+                       "|\n"))
+         ;; org 9.5+ marks the padding around fields for bidi reordering
+         (pre (if (boundp 'org-table--separator-space-pre)
+                  org-table--separator-space-pre " "))
+         (post (if (boundp 'org-table--separator-space-post)
+                   org-table--separator-space-post " ")))
+    (with-temp-buffer
+      (insert rule)
+      (cl-loop for row in all-rows
+               for ws in cell-widths
+               for first = t then nil do
+               (dotimes (i ncols)
+                 (let* ((spaces (- (aref widths i) (aref ws i)))
+                        (prefix (pcase (aref alignments i)
+                                  ("r" spaces)
+                                  ("c" (/ spaces 2))
+                                  (_ 0))))
+                   (insert "|" pre
+                           (make-string prefix ?\s)
+                           (aref row i)
+                           (make-string (- spaces prefix) ?\s)
+                           post)))
+               (insert "|\n")
+               (when (and first header)
+                 (insert rule)))
+      (insert rule)
+      (buffer-string))))
 
 (defun codeql--escape-org-description (description)
   "Neutralize characters in DESCRIPTION that org would treat as markup."
@@ -1559,19 +1629,6 @@ Sets an optional HEADER."
     ;; return our nodes as org list
     (buffer-string)))
 
-(defun codeql--csv-field (field)
-  "Return FIELD as a single line CSV field that `org-table-convert-region' accepts.
-
-Labels can span multiple lines (e.g. function bodies), which would otherwise
-split a row and break the org-table line limit, and can contain commas or
-quotes, which would otherwise split a column.  Literal | characters would
-split org table cells, so they are displayed as ¦ instead."
-  (let ((field (replace-regexp-in-string
-                "|" "¦" (replace-regexp-in-string "[ \t]*\r?\n[ \t]*" " " field))))
-    (if (string-match-p "[,\"]" field)
-        (concat "\"" (replace-regexp-in-string "\"" "\"\"" field) "\"")
-      field)))
-
 (defun codeql--query-results-to-org (query-results results-type &optional columns)
   "Turn QUERY-RESULTS of RESULTS-TYPE into an org data."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
@@ -1581,49 +1638,28 @@ split org table cells, so they are displayed as ¦ instead."
       (pcase results-type
         ;; raw result parsing of tuples
         ('raw
-         ;; insert the final org data to return for rendering
+         ;; we go through the json rather than csv output of bqrs decode, so
+         ;; that each cell's location data is handed to us and can be turned
+         ;; into org links directly
          (insert
-          ;; do the inner transform from bqrs results to csv, and csv to org table
-          (with-temp-buffer
-            ;; add a table header if needed
-            (when columns
-              ;; so we go from our json back to csv, I know this seems dumb but
-              ;; going direct to csv from bqrs means we have to write/maintain
-              ;; a ton of dense regex crud to transform into org links, using
-              ;; the json parsing, we get all that data nicely handed to us and
-              ;; we can then compose back into the data we'd like to represent
-              (let ((table-header (mapconcat
-                                   #'identity
-                                   ;; columns are a vector
-                                   (cl-map 'vector (lambda (col)
-                                                     (let ((name (json-pointer-get col "/name"))
-                                                           (kind (json-pointer-get col "/kind")))
-                                                       (codeql--csv-field
-                                                        (format "%s" (or name kind "(unknown)")))))
-                                           ;; columns comes direct from the json, no need to reverse
-                                           columns) ",")))
-                (insert (concat table-header "\n"))))
-            ;; add the main body, we pushed result tuples to head of list, so reverse for parsing
-            (let* ((query-results (reverse query-results))
-                   (table-body (mapconcat
-                                #'identity
-                                (cl-map 'list
-                                        ;; return csv'd row strings here
-                                        (lambda (row-data)
-                                          (let ((row-data (reverse row-data)))
-                                            (mapconcat #'identity
-                                                       (cl-map 'list
-                                                               (let ((parent-buffer parent-buffer))
-                                                                 (lambda (node)
-                                                                   ;; we use buffer-local variables here
-                                                                   (with-current-buffer parent-buffer
-                                                                     (codeql--csv-field
-                                                                      (codeql--result-node-to-org node)))))
-                                                               row-data) ",")))
-                                        query-results) "\n")))
-              ;; this returns raw org data, does NOT render to a display buffer
-              (insert table-body)
-              (codeql--csv-to-org-table (buffer-string) (if columns t nil))))))
+          (codeql--org-table
+           ;; we pushed result tuples to head of list, so reverse for rendering
+           (mapcar (lambda (row-data)
+                     (mapcar (lambda (node)
+                               ;; we use buffer-local variables here
+                               (with-current-buffer parent-buffer
+                                 (codeql--org-table-cell
+                                  (codeql--result-node-to-org node))))
+                             (reverse row-data)))
+                   (reverse query-results))
+           (when columns
+             ;; columns are a vector, direct from the json
+             (mapcar (lambda (col)
+                       (let ((name (json-pointer-get col "/name"))
+                             (kind (json-pointer-get col "/kind")))
+                         (codeql--org-table-cell
+                          (format "%s" (or name kind "(unknown)")))))
+                     columns)))))
         ;; kind: problem and path-problem use the exact same SARIF renderer
         ((or 'problem 'path-problem)
          ;; generate an org tree off of a list structure
@@ -1671,6 +1707,16 @@ split org table cells, so they are displayed as ¦ instead."
       ;; return final org data
       (buffer-string))))
 
+(defun codeql--hide-zero-width-spaces ()
+  "Display the zero width spaces of escaped org text with no width at all.
+
+By default graphical frames show them as thin spaces, which would offset the
+columns of tables aligned by character width."
+  (setq-local glyphless-char-display
+              (let ((table (copy-sequence (default-value 'glyphless-char-display))))
+                (aset table #x200b 'zero-width)
+                table)))
+
 (defun codeql--org-render-sarif-results (org-data query-buffer &optional footer marker)
   "Render ORG-DATA including an optional FOOTER."
   ;; sarif results are org trees
@@ -1680,6 +1726,7 @@ split org table cells, so they are displayed as ¦ instead."
     (with-current-buffer buffer
       (insert org-data)
       (org-mode)
+      (codeql--hide-zero-width-spaces)
       (when footer
         (goto-char (point-max))
         (insert "\n* Results Footer\n")
@@ -1707,7 +1754,7 @@ Most recently used entries come first, see `codeql-results-page-cache-size'.")
 (defun codeql--raw-results-fill-buffer (org-data &optional footer)
   "Replace the current buffer contents with raw results ORG-DATA and FOOTER.
 
-ORG-DATA is expected to be aligned already, see `codeql--csv-to-org-table'."
+ORG-DATA is expected to be aligned already, see `codeql--org-table'."
   (let ((inhibit-read-only t))
     (erase-buffer)
     (insert org-data)
@@ -1731,6 +1778,7 @@ PAGINATION is an optional plist describing a paginated result set, see
           (format "* codeql-org-results:%s *" (if marker marker "")))))
     (with-current-buffer buffer
       (org-mode)
+      (codeql--hide-zero-width-spaces)
       (setq codeql--org-query-buffer query-buffer)
       (when pagination
         (setq codeql--raw-results-pagination pagination)
