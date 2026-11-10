@@ -2042,6 +2042,24 @@ columns of tables aligned by character width."
                 (aset table #x200b 'zero-width)
                 table)))
 
+(defvar codeql-results-mode-map (make-sparse-keymap)
+  "Keymap for `codeql-results-mode'.")
+
+(define-derived-mode codeql-results-mode org-mode "CodeQL-Results"
+  "Major mode for CodeQL query results, derived from `org-mode'.
+
+Query results, compared results and the saved results of query history
+are shown in this mode, so they can have key bindings of their own in
+`codeql-results-mode-map' that leave other org buffers alone.  Its
+parent `org-mode-map' still applies, and `org-mode-hook' still runs.
+
+\{codeql-results-mode-map}"
+  (codeql--hide-zero-width-spaces)
+  (setq-local next-error-function #'codeql--results-next-error))
+
+;; the results of query history are saved as BQRS-PATH.org
+(add-to-list 'auto-mode-alist '("\\.bqrs\\.org\\'" . codeql-results-mode))
+
 (defun codeql--org-render-sarif-results (org-data query-buffer &optional footer marker)
   "Render ORG-DATA including an optional FOOTER."
   ;; sarif results are org trees
@@ -2050,8 +2068,7 @@ columns of tables aligned by character width."
           (format "* codeql-org-results:%s *" (if marker marker "")))))
     (with-current-buffer buffer
       (insert org-data)
-      (org-mode)
-      (codeql--hide-zero-width-spaces)
+      (codeql-results-mode)
       (when footer
         (goto-char (point-max))
         (insert "\n* Results Footer\n")
@@ -2059,7 +2076,6 @@ columns of tables aligned by character width."
       (goto-char (point-min))
       (setq buffer-read-only t)
       (setq codeql--org-query-buffer query-buffer)
-      (setq-local next-error-function #'codeql--results-next-error)
       (when codeql-results-diagnostics
         (codeql-results-diagnostics-mode 1))
       (save-excursion
@@ -2094,8 +2110,8 @@ ORG-DATA is expected to be aligned already, see `codeql--org-table'."
   (let ((inhibit-read-only t))
     (erase-buffer)
     (insert org-data)
-    (unless (derived-mode-p 'org-mode)
-      (org-mode))
+    (unless (derived-mode-p 'codeql-results-mode)
+      (codeql-results-mode))
     ;; only add footer after the table
     (when footer
       (goto-char (point-max))
@@ -2114,8 +2130,7 @@ PAGINATION is an optional plist describing a paginated result set, see
          (generate-new-buffer
           (format "* codeql-org-results:%s *" (if marker marker "")))))
     (with-current-buffer buffer
-      (org-mode)
-      (codeql--hide-zero-width-spaces)
+      (codeql-results-mode)
       (setq codeql--org-query-buffer query-buffer)
       (when pagination
         (setq codeql--raw-results-pagination pagination)
@@ -2125,7 +2140,6 @@ PAGINATION is an optional plist describing a paginated result set, see
        org-data
        (if pagination (codeql--raw-results-pagination-footer) footer))
       (setq buffer-read-only t)
-      (setq-local next-error-function #'codeql--results-next-error)
       (when codeql-results-diagnostics
         (codeql-results-diagnostics-mode 1))
       (save-excursion
@@ -3807,7 +3821,7 @@ Paginated results only show the locations of the current page.
 See also `codeql-results-diagnostics'."
   :lighter " CodeQL-Diag"
   (cond
-   ((not (derived-mode-p 'org-mode))
+   ((not (derived-mode-p 'codeql-results-mode))
     (setq codeql-results-diagnostics-mode nil)
     (user-error "Not a CodeQL results buffer"))
    (codeql-results-diagnostics-mode
@@ -3942,10 +3956,7 @@ These are the rendered results buffers, and the saved results of query
 history.  Other buffers with codeql: links, like the AST viewer, are not."
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
-         (and (derived-mode-p 'org-mode)
-              (or (eq next-error-function #'codeql--results-next-error)
-                  (and buffer-file-name
-                       (string-suffix-p ".bqrs.org" buffer-file-name)))))))
+         (derived-mode-p 'codeql-results-mode))))
 
 (defun codeql--alerts-results-buffer ()
   "Return the results buffer to navigate the alerts of."
@@ -5162,8 +5173,7 @@ with many results, as their tuples aren't decoded and rendered."
                 ;; since we render results in a flat text format
                 ;; we store it to disk on first render
                 (if (file-exists-p org-results)
-                    (with-current-buffer (find-file org-results)
-                      (setq-local next-error-function #'codeql--results-next-error))
+                    (find-file org-results)
                   (codeql-load-bqrs
                    bqrs-path
                    query-path
