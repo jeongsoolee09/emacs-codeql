@@ -16,6 +16,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Registration of zipped database archives
 - Result browsing
 - Jumping to result locations with completion, with optional [consult](https://github.com/minad/consult) preview and [embark](https://github.com/oantolin/embark) actions
+- Stepping through alerts and through the related locations and path steps of an alert, from results or source buffers
 - Source archive location opening
 - Buffer local query server state with concurrent remote|local project, database and query support
 - Automatic database selection deconfliction
@@ -247,6 +248,24 @@ Each query run writes a structured evaluator log next to its results (set `codeq
 
 There are no extra dependencies, but when [consult](https://github.com/minad/consult) is installed the locations are grouped by file and previewed as you move between them. When [embark](https://github.com/oantolin/embark) is loaded, `codeql:` links at point and the completion candidates are `codeql-location` targets, with the actions in `codeql-location-map`: `o` (or `RET`) visits the location, and `w` copies it as `FILE:LINE:COLUMN`.
 
+#### Navigating between alerts
+
+These commands step through the results from wherever you are, including the source files the results point into:
+
+- `codeql-next-alert` and `codeql-previous-alert` visit the location of the next or previous alert, in the order the results buffer lists them. An alert is a `problem` or `path-problem` result, or a row of a raw results table.
+- `codeql-next-alert-location` and `codeql-previous-alert-location` cycle through the locations of the current alert: its own location, then the related locations its message links to, then the steps of its paths from source to sink.
+
+Following a link in a results buffer, or visiting a location with these commands, makes its alert the current one. In a source file, point on one of the current alert's locations counts as that location, so the commands continue from where you are. Point in the results buffer moves along, and inside the results buffer the commands start from the alert at point, like `next-error` in compilation buffers. Paginated results are navigated one page at a time.
+
+The commands use the current results buffer, or else the one you last navigated, or one that shows its results as diagnostics. Results buffers also work with `next-error` and `previous-error` (`M-g n` and `M-g p`), which move between alerts.
+
+The commands aren't bound by default. `codeql-alert-navigation-map` has them on `n`, `p`, `f` and `b`. Bind it to a prefix key, and with `repeat-mode` on you can keep pressing `n`, `p`, `f` and `b` without the prefix:
+
+```elisp
+(keymap-global-set "C-c n" codeql-alert-navigation-map)
+(repeat-mode 1)
+```
+
 ### Database source archive Xref support
 
 `emacs-codeql` automatically retrieves references and definitions for database source archive files that are opened from a result buffer org link. It achieves this by registering a custom org-link handler for a `codeql:` link type which then performs a ridiculous elisp ritual to trick emacs into thinking it actually has xref support for these files specifically.
@@ -310,7 +329,7 @@ Recently visited pages are cached per results buffer, so going back to them is n
 - Raw result rows and the locations of problems are warnings. Their messages are the row, with column names, or the problem message.
 - Path steps and the related locations of problem messages are notes.
 
-The diagnostics follow the results buffer: they are updated when you change pages, and removed when you disable the mode or kill the buffer. Paginated results only show the locations of the current page. Files that are opened later, for example by following a result link, get their diagnostics right away, and the usual Flymake commands such as `flymake-goto-next-error` and `flymake-show-buffer-diagnostics` work as normal.
+The diagnostics follow the results buffer: they are updated when you change pages, and removed when you disable the mode or kill the buffer. Paginated results only show the locations of the current page. Files that are opened later, for example by following a result link, get their diagnostics right away, and the usual Flymake commands such as `flymake-goto-next-error` and `flymake-show-buffer-diagnostics` work as normal. To step through alerts and their related locations across files, see [Navigating between alerts](#navigating-between-alerts).
 
 Flymake is turned on in the source files that need it, and turned off again when no diagnostics remain, unless it was already on. Set `codeql-results-diagnostics` to `t` to enable `codeql-results-diagnostics-mode` in every new results buffer.
 
