@@ -10,6 +10,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Query execution
 - Quick query evaluation
 - Query history for the local session
+- Query performance summaries from evaluator logs
 - Database history for the global session
 - Result browsing
 - Source archive location opening
@@ -210,6 +211,12 @@ Visiting a location briefly flashes the code it spans. Set `codeql-highlight-vis
 Locations that span a whole file open that file at the top, and locations without a source file are shown as plain text.
 
 `emacs-codeql` will resolve file paths into the project snapshot source code archive included with the database archive.
+
+#### Query performance
+
+Each query run writes a structured evaluator log next to its results (set `codeql-evaluator-log` to `nil` to turn this off; it needs query-server2). `codeql-query-performance` (`t` in the query server transient) summarizes the log of a run from the query history with `codeql generate log-summary` and lists the predicates that were computed, the slowest first, in an org table with their time, tuple count, number of iterations and evaluation strategy. The header shows the total evaluation time and how many predicates came from the cache. Predicate names link to their definitions, `C-c C-a` shows the relational algebra of the predicate at point together with its iteration deltas, and the table can be sorted by any column with `org-table-sort-lines` (`C-c ^`). Only the `codeql-performance-max-predicates` (default: 300) slowest predicates are listed.
+
+`codeql-query-performance-compare` (`T`) matches the computed predicates of two runs by name and lists the time and tuples of each run, the largest difference in time first. Predicates that were taken from the cache in one of the runs show `-` for that run.
 
 ### Database source archive Xref support
 
