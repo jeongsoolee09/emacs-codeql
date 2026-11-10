@@ -1350,13 +1350,22 @@ as obtained from `codeql--bqrs-info' pagination offsets."
              (cl-map 'list (lambda (file) file) (split-string zipinfo "\n"))))
         zipinfo-relative-paths))))
 
+(defun codeql--source-archive-zip-browsable-p (zip)
+  "Return non-nil if the files in the ZIP archive can be visited directly.
+
+That needs `tramp-archive', which only works when Emacs has D-Bus support
+and GVFS is running, otherwise the archive is extracted instead."
+  (and (bound-and-true-p tramp-archive-enabled)
+       (ignore-errors (file-directory-p (file-name-as-directory zip)))))
+
 (defun codeql--database-extract-source-archive-zip (trusted-root)
   "Mount or extract a database source zip archive, ensuring TRUSTED-ROOT."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (message "archive-root: %s" (codeql--file-truename codeql--database-source-archive-root))
   (message "trusted-root: %s" (codeql--file-truename trusted-root))
   (cond
-   ((and (>= emacs-major-version 27) (eq system-type 'gnu/linux))
+   ((and (>= emacs-major-version 27) (eq system-type 'gnu/linux)
+         (codeql--source-archive-zip-browsable-p codeql--database-source-archive-zip))
     ;; >= emacs 27 we can just interact with the zip archive directly :)
     (setq codeql--database-source-archive-root codeql--database-source-archive-zip))
    ;; darwin does not support the zip archive via tramp
@@ -2894,7 +2903,8 @@ unescaped [ can start a link."
 ;; not what I meant when I said I was looking for closure :/
 (defun codeql--set-local-xref-bindings ()
   (unless codeql--xref-has-bindings
-    (use-local-map (copy-keymap (symbol-value (intern (format "%s-map" major-mode)))))
+    ;; not every major mode has a <mode>-map, e.g. `fundamental-mode'
+    (use-local-map (make-composed-keymap nil (current-local-map)))
     (local-set-key (kbd "M->")
                    ;; hail to the guardians of the watch towers of the west.
                    (lambda (identifier)
@@ -3196,6 +3206,9 @@ See `codeql-highlight-visited-location'."
     ;; results saved before empty locations got rendered as plain text
     (when (directory-name-p filename)
       (user-error "This location has no source file"))
+    ;; rather than visiting a new empty file
+    (unless (file-exists-p filename)
+      (user-error "Source file not found: %s" filename))
 
     (let ((query-buffer codeql--org-query-buffer))
       (when-let ((src-buffer (codeql--find-file-other-window filename)))
