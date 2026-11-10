@@ -100,6 +100,7 @@
 (require 'files)
 (require 'project)
 (require 'flymake)
+(require 'pulse)
 
 ;; bundled
 (require 'json-pointer)
@@ -192,6 +193,19 @@ active region, with point at its start, and nil doesn't highlight it."
   :type '(choice (const :tag "Flash the location" pulse)
                  (const :tag "Mark the location as the region" region)
                  (const :tag "Don't highlight" nil))
+  :group 'emacs-codeql)
+
+(defcustom codeql-pulse-delay 0.3
+  "Seconds to wait before pulsing a visited location.
+
+The wait starts once the location's window has been displayed, and gives
+you time to find that window before the pulse fades out."
+  :type 'number
+  :group 'emacs-codeql)
+
+(defcustom codeql-pulse-duration 1.0
+  "Seconds that the pulse on a visited location takes to fade out."
+  :type 'number
   :group 'emacs-codeql)
 
 (defcustom codeql-xref-resolve-on-visit nil
@@ -3187,7 +3201,23 @@ See `codeql-highlight-visited-location'."
   (when (< beg end)
     (pcase codeql-highlight-visited-location
       ('pulse
-       (pulse-momentary-highlight-region beg end))
+       ;; a freshly visited file may not have been displayed yet, and the
+       ;; pulse could fade out before its window is first drawn
+       (let ((beg (copy-marker beg)) (end (copy-marker end)))
+         (run-with-idle-timer
+          0 nil
+          (lambda ()
+            (run-with-timer
+             codeql-pulse-delay nil
+             (lambda ()
+               (when (buffer-live-p (marker-buffer beg))
+                 (with-current-buffer (marker-buffer beg)
+                   ;; the pulse fades out in `pulse-iterations' steps
+                   (let ((pulse-delay (/ (float codeql-pulse-duration)
+                                         (max 1 pulse-iterations))))
+                     (pulse-momentary-highlight-region beg end))))
+               (set-marker beg nil)
+               (set-marker end nil)))))))
       ('region
        (push-mark end t t)
        (goto-char beg)))))

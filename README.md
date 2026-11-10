@@ -205,7 +205,7 @@ kind: `problem` and `path-problem` are rendered as org trees, raw tuple results 
 
 Results contain source code locations in the form of org links, which can be visited with the normal org mode operations for link handling (e.g. `org-open-at-point`)
 
-Visiting a location briefly flashes the code it spans. Set `codeql-highlight-visited-location` to `region` to leave the location marked as the active region instead, or to `nil` to only move point to its start.
+Visiting a location briefly flashes the code it spans. Set `codeql-highlight-visited-location` to `region` to leave the location marked as the active region instead, or to `nil` to only move point to its start. The flash starts `codeql-pulse-delay` seconds after the location is displayed, so that you have time to find its window, and fades out over `codeql-pulse-duration` seconds.
 
 Locations that span a whole file open that file at the top, and locations without a source file are shown as plain text.
 
