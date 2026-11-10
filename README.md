@@ -207,6 +207,8 @@ Results contain source code locations in the form of org links, which can be vis
 
 Visiting a location briefly flashes the code it spans. Set `codeql-highlight-visited-location` to `region` to leave the location marked as the active region instead, or to `nil` to only move point to its start.
 
+Locations that span a whole file open that file at the top, and locations without a source file are shown as plain text.
+
 `emacs-codeql` will resolve file paths into the project snapshot source code archive included with the database archive.
 
 ### Database source archive Xref support

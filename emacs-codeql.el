@@ -1599,6 +1599,40 @@ as obtained from `codeql--bqrs-info' pagination offsets."
           (error "Unsupported file scheme: %s" resolved-path))
       (url-filename url))))
 
+(defun codeql--empty-location-uri-p (uri)
+  "Return non-nil if URI doesn't name a file.
+
+CodeQL gives entities without a location an empty path."
+  (or (not (stringp uri))
+      (member uri '("" "file:" "file:/" "file://" "file:///"))))
+
+(defun codeql--location-url (url)
+  "Return the bqrs location URL as an alist, or nil if it has no file.
+
+URL is either an alist with a uri and its positions, or a file:// string
+in the PATH:LINE:COLUMN:END-LINE:END-COLUMN form of getURL predicates.
+A location with all positions 0 spans its whole file."
+  (when (stringp url)
+    (setq url
+          (when (string-match
+                 "\\`file://\\(.+\\):\\([0-9]+\\):\\([0-9]+\\):\\([0-9]+\\):\\([0-9]+\\)\\'"
+                 url)
+            `((uri . ,(concat "file://" (match-string 1 url)))
+              ,@(cl-loop for key in '(startLine startColumn endLine endColumn)
+                         for group from 2
+                         collect (cons key (string-to-number
+                                            (match-string group url))))))))
+  (when (and (listp url)
+             (not (codeql--empty-location-uri-p (alist-get 'uri url))))
+    url))
+
+(defun codeql--location-position-text (url)
+  "Return the :LINE:COLUMN suffix of a location URL, or \"\" for a whole file."
+  (let ((line (json-pointer-get url "/startLine")))
+    (if (and (natnump line) (> line 0))
+        (format ":%s:%s" line (json-pointer-get url "/startColumn"))
+      "")))
+
 (cl-defstruct (codeql--result-node
                (:constructor codeql--result-node-create) (:copier nil))
   (label             nil :read-only t)
@@ -1831,8 +1865,9 @@ Sets an optional HEADER."
                       (with-current-buffer parent-buffer
                         (codeql--result-node-to-org node))))
                     (suffix
-                     (if-let ((url (codeql--result-node-url node)))
-                         (format "%s:%s:%s"
+                     (if-let ((url (and (codeql--result-node-visitable node)
+                                        (codeql--result-node-url node))))
+                         (format "%s%s"
                                  ;; set a custom description for this link
                                  (with-current-buffer parent-buffer
                                    (codeql--result-node-to-org node
@@ -1841,8 +1876,7 @@ Sets an optional HEADER."
                                                                  (json-pointer-get url "/uri")))))
                                  ;; org links don't support column offsets
                                  ;; so this is mostly just eye candy :P
-                                 (json-pointer-get url "/startLine")
-                                 (json-pointer-get url "/startColumn"))
+                                 (codeql--location-position-text url))
                        ;; get ahead, but don't say nothing.
                        ""))
                     ;; do some basic ballpark alignment based on prefix label length
@@ -1898,8 +1932,9 @@ Sets an optional HEADER."
                   (cl-loop for location in locations do
                            (insert
                             (concat
-                             (if-let ((url (codeql--result-node-url location)))
-                                 (format "* %s [%s] %s ... %s:%s:%s"
+                             (if-let ((url (and (codeql--result-node-visitable location)
+                                                (codeql--result-node-url location))))
+                                 (format "* %s [%s] %s ... %s%s"
                                          (or (codeql--result-node-mark issue) " ")
                                          (codeql--result-node-rule-id issue)
                                          ;; swap sarif markdown links for org links if required
@@ -1912,9 +1947,10 @@ Sets an optional HEADER."
                                             (file-name-nondirectory
                                              (codeql--uri-to-filename
                                               (json-pointer-get url "/uri")))))
-                                         (json-pointer-get url "/startLine")
-                                         (json-pointer-get url "/startColumn"))
-                               (format "* %s ... [location unknown]"
+                                         (codeql--location-position-text url))
+                               (format "* %s [%s] %s ... [location unknown]"
+                                       (or (codeql--result-node-mark issue) " ")
+                                       (codeql--result-node-rule-id issue)
                                        (with-current-buffer parent-buffer
                                          (codeql--swap-sarif-links-for-org-links
                                           (codeql--result-node-label issue) related-locations))))
@@ -2179,16 +2215,17 @@ A hit marks PAGE as most recently used."
                         (cond
                          ;; node with location info
                          ((and (listp element)
-                               (json-pointer-get element "/url"))
-                          (let ((node (codeql--result-node-create
-                                       :label (json-pointer-get element "/label")
-                                       :mark "→"
-                                       :filename (codeql--uri-to-filename
-                                                  (json-pointer-get element "/url/uri"))
-                                       :line (json-pointer-get element "/url/startLine")
-                                       :column (json-pointer-get element "/url/startColumn")
-                                       :visitable t
-                                       :url (json-pointer-get element "/url"))))
+                               (codeql--location-url (json-pointer-get element "/url")))
+                          (let* ((url (codeql--location-url (json-pointer-get element "/url")))
+                                 (node (codeql--result-node-create
+                                        :label (json-pointer-get element "/label")
+                                        :mark "→"
+                                        :filename (codeql--uri-to-filename
+                                                   (json-pointer-get url "/uri"))
+                                        :line (json-pointer-get url "/startLine")
+                                        :column (json-pointer-get url "/startColumn")
+                                        :visitable t
+                                        :url url)))
                             (cl-pushnew node row-data)))
                          ;; node with no location info, but with a label
                          ((and (listp element)
@@ -2603,6 +2640,11 @@ unescaped [ can start a link."
    (let* ((uri (if uri-base-id
                    (format "file:%s/%s" uri-base-id uri)
                  uri))
+          (visitable (not (codeql--empty-location-uri-p uri)))
+          ;; without a region a location spans its whole file, which CodeQL
+          ;; locations express with all positions 0
+          (start-line (if region (json-pointer-get region "/startLine") 0))
+          (start-column (if region (or (json-pointer-get region "/startColumn") 1) 0))
           (node
            (codeql--result-node-create
             :label (or (json-pointer-get location message-index) message)
@@ -2619,20 +2661,24 @@ unescaped [ can start a link."
                              "..."))
                     ;; mark as a result node
                     "-->")
-            :filename (or (codeql--uri-to-filename uri) uri)
-            :line  (json-pointer-get region "/startLine")
-            :column (or (json-pointer-get region "/startColumn") 1)
-            :visitable region
+            :filename (and visitable (or (codeql--uri-to-filename uri) uri))
+            :line start-line
+            :column start-column
+            :visitable visitable
             :related-id related-id
             ;; build a json alist to parse out for url
             :url `(,(cons 'uri uri)
-                   ,(cons 'startLine (json-pointer-get region "/startLine"))
-                   ,(cons 'endLine (or (json-pointer-get region "/endLine")
-                                       (json-pointer-get region "/startLine")))
-                   ,(cons 'startColumn (or (json-pointer-get region "/startColumn") 1))
+                   ,(cons 'startLine start-line)
+                   ,(cons 'endLine (if region
+                                       (or (json-pointer-get region "/endLine")
+                                           start-line)
+                                     0))
+                   ,(cons 'startColumn start-column)
                    ;; SARIF end columns are exclusive, unlike those of CodeQL locations
-                   ,(cons 'endColumn (when-let ((end (json-pointer-get region "/endColumn")))
-                                       (1- end)))
+                   ,(cons 'endColumn (if region
+                                         (when-let ((end (json-pointer-get region "/endColumn")))
+                                           (1- end))
+                                       0))
                    ;; throw these in here just in case they exist and we need them
                    ,(cons 'charOffset (json-pointer-get region "/charOffset"))
                    ,(cons 'charLength (json-pointer-get region "/charLength"))
@@ -3147,6 +3193,10 @@ See `codeql-highlight-visited-location'."
     ;; XXX: pending which results are being navigated, so this is
     ;; XXX: probably ok in practice
 
+    ;; results saved before empty locations got rendered as plain text
+    (when (directory-name-p filename)
+      (user-error "This location has no source file"))
+
     (let ((query-buffer codeql--org-query-buffer))
       (when-let ((src-buffer (codeql--find-file-other-window filename)))
         (with-current-buffer src-buffer
@@ -3159,8 +3209,10 @@ See `codeql-highlight-visited-location'."
             (message "No active query buffer for these results, opened from history?"))
           (setq codeql--org-query-buffer query-buffer)
           (widen)
-          ;; codeql is 1 based, eglot calcs are 0 based, adjust accordingly
-          (when (and column line)
+          ;; codeql is 1 based, eglot calcs are 0 based, adjust accordingly,
+          ;; line 0 is a location spanning the whole file
+          (if (not (and line column (> line 0)))
+              (goto-char (point-min))
             (goto-char (codeql--eglot--lsp-position-to-point
                         `(;; align
                           :line ,(1- line)
@@ -3210,9 +3262,11 @@ entries, see `codeql--parse-link-location' for the positions.")
      t t))))
 
 (defun codeql--diagnostics-location-text (text)
-  "Return org TEXT as plain text, without a trailing FILE:LINE:COLUMN."
+  "Return org TEXT as plain text, without a trailing FILE:LINE:COLUMN.
+
+Whole file locations are shown as just their FILE after \"... \"."
   (replace-regexp-in-string
-   " *\\(?:\\.\\.\\. \\)?[^ ]+:[0-9]+:[0-9]+\\'" ""
+   " *\\(?:\\(?:\\.\\.\\. \\)?[^ ]+:[0-9]+:[0-9]+\\|\\.\\.\\. [^ ]+\\)\\'" ""
    (codeql--diagnostics-text text) t t))
 
 (defun codeql--diagnostics-problem-text (heading)
