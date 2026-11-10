@@ -1455,6 +1455,9 @@ and GVFS is running, otherwise the archive is extracted instead."
     (transient-setup 'codeql-transient-query-server-init-start)
     (error "No query server running, please start one and re-select database."))
 
+  ;; the cli doesn't expand ~ and resolves relative paths against the query
+  (setq database-path (expand-file-name database-path))
+
   ;; database archives are unbundled into the state dir first
   (when (and (string-suffix-p ".zip" database-path t) (file-regular-p database-path))
     (setq database-path (codeql--database-unbundle database-path)))
@@ -1468,7 +1471,8 @@ and GVFS is running, otherwise the archive is extracted instead."
          (database-dataset-folder (json-pointer-get database-info "/datasetFolder")))
 
     (cl-assert codeql--query-server t)
-    (cl-assert database-dataset-folder t)
+    (unless database-dataset-folder
+      (user-error "Not a CodeQL database: %s" database-path))
 
     ;; perform any local deregistration first
     (when (and codeql--active-database codeql--database-dataset-folder)
