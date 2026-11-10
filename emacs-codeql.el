@@ -99,6 +99,7 @@
 (require 'ol)
 (require 'files)
 (require 'project)
+(require 'flymake)
 
 ;; bundled
 (require 'json-pointer)
@@ -240,6 +241,15 @@ page holding at most this many tuples.  See `codeql-results-pagination-mode'."
 Queries that report more results than this are paginated, with each page
 holding at most this many results.  See `codeql-results-pagination-mode'."
   :type 'integer
+  :group 'emacs-codeql)
+
+(defcustom codeql-results-diagnostics nil
+  "Whether new results buffers show their locations as Flymake diagnostics.
+
+When non-nil, `codeql-results-diagnostics-mode' is enabled in the results
+buffers of queries, so that the locations they link to are underlined in
+the database source files."
+  :type 'boolean
   :group 'emacs-codeql)
 
 (defcustom codeql-results-page-cache-size 50
@@ -1751,12 +1761,19 @@ checked once rather than for every result node.")
   "Transform a result node into an org compatible link|string representation."
   ;; https://orgmode.org/guide/Hyperlinks.html
   (if (codeql--result-node-visitable node)
-      ;; since we have our own link type, also add in a column
-      (let ((link (format "codeql:%s%s::%s:%s"
-                          (codeql--source-link-prefix)
-                          (codeql--encode-link-path (codeql--result-node-filename node))
-                          (codeql--result-node-line node)
-                          (codeql--result-node-column node)))
+      ;; since we have our own link type, also add in a column, and the end
+      ;; of the location when known, see `codeql--parse-link-location'
+      (let* ((url (codeql--result-node-url node))
+             (end-line (and (listp url) (alist-get 'endLine url)))
+             (end-column (and (listp url) (alist-get 'endColumn url)))
+             (link (format "codeql:%s%s::%s:%s%s"
+                           (codeql--source-link-prefix)
+                           (codeql--encode-link-path (codeql--result-node-filename node))
+                           (codeql--result-node-line node)
+                           (codeql--result-node-column node)
+                           (if (and (natnump end-line) (natnump end-column))
+                               (format ":%s:%s" end-line end-column)
+                             "")))
             (desc (codeql--printable-label (or custom-description
                                                (codeql--result-node-label node)))))
         (format "[[%s][%s]]"
@@ -1912,6 +1929,8 @@ columns of tables aligned by character width."
       (goto-char (point-min))
       (setq buffer-read-only t)
       (setq codeql--org-query-buffer query-buffer)
+      (when codeql-results-diagnostics
+        (codeql-results-diagnostics-mode 1))
       (save-excursion
         (switch-to-buffer-other-window buffer))
       (buffer-string))))
@@ -1951,7 +1970,8 @@ ORG-DATA is expected to be aligned already, see `codeql--org-table'."
       (goto-char (point-max))
       (insert "\n* Results Footer\n")
       (insert footer))
-    (goto-char (point-min))))
+    (goto-char (point-min))
+    (codeql--diagnostics-results-changed)))
 
 (defun codeql--org-render-raw-query-results (org-data query-buffer &optional footer marker pagination)
   "Render ORG-DATA including an optional FOOTER.
@@ -1974,6 +1994,8 @@ PAGINATION is an optional plist describing a paginated result set, see
        org-data
        (if pagination (codeql--raw-results-pagination-footer) footer))
       (setq buffer-read-only t)
+      (when codeql-results-diagnostics
+        (codeql-results-diagnostics-mode 1))
       (save-excursion
         (switch-to-buffer-other-window buffer))
       (buffer-string))))
@@ -2578,7 +2600,9 @@ unescaped [ can start a link."
                    ,(cons 'endLine (or (json-pointer-get region "/endLine")
                                        (json-pointer-get region "/startLine")))
                    ,(cons 'startColumn (or (json-pointer-get region "/startColumn") 1))
-                   ,(cons 'endColumn (json-pointer-get region "/endColumn"))
+                   ;; SARIF end columns are exclusive, unlike those of CodeQL locations
+                   ,(cons 'endColumn (when-let ((end (json-pointer-get region "/endColumn")))
+                                       (1- end)))
                    ;; throw these in here just in case they exist and we need them
                    ,(cons 'charOffset (json-pointer-get region "/charOffset"))
                    ,(cons 'charLength (json-pointer-get region "/charLength"))
@@ -3001,12 +3025,24 @@ Our implementation simply returns the thing at point as a candidate."
           (setq buffer-read-only t))
         (switch-to-buffer-other-window value)))))
 
+(defun codeql--parse-link-location (link)
+  "Parse the path of a codeql: LINK into a list of its location parts.
+
+The list is (FILENAME LINE COLUMN END-LINE END-COLUMN).  Links look like
+FILENAME::LINE:COLUMN, optionally followed by :END-LINE:END-COLUMN.
+Positions are 1-based and inclusive like those of CodeQL locations, they
+are nil when LINK doesn't have them."
+  (if (string-match
+       "\\`\\(.*\\)::\\([0-9]+\\):\\([0-9]+\\)\\(?::\\([0-9]+\\):\\([0-9]+\\)\\)?\\'" link)
+      (cons (codeql--decode-link-path (match-string 1 link))
+            (mapcar (lambda (group)
+                      (when-let ((n (match-string group link)))
+                        (string-to-number n)))
+                    '(2 3 4 5)))
+    (list (codeql--decode-link-path (car (split-string link "::"))) nil nil nil nil)))
+
 (defun codeql--org-open-file-link (link)
-  (let* ((parsed (string-match "\\`\\(.*\\)::\\([0-9]+\\):\\([0-9]+\\)\\'" link))
-         (filename (codeql--decode-link-path
-                    (if parsed (match-string 1 link) (car (split-string link "::")))))
-         (line (when parsed (match-string 2 link)))
-         (column (when parsed (match-string 3 link))))
+  (pcase-let ((`(,filename ,line ,column) (codeql--parse-link-location link)))
 
     ;; XXX: hrmmm ... we probably want to force unique file visits
     ;; XXX: since we don't want to use a cross-query state when there
@@ -3031,12 +3067,279 @@ Our implementation simply returns the thing at point as a candidate."
           (when (and column line)
             (goto-char (codeql--eglot--lsp-position-to-point
                         `(;; align
-                          :line ,(1- (string-to-number line))
-                          :character ,(1- (string-to-number column))))))
+                          :line ,(1- line)
+                          :character ,(1- column)))))
           ;; enable our xref backend, this kicks in templated queries for refs and defs
           (codeql-xref-backend))))))
 
 (org-link-set-parameters "codeql" :follow #'codeql--org-open-file-link)
+
+;;; Flymake diagnostics for the locations in a results buffer
+
+(defvar codeql-results-diagnostics-mode)
+
+(defvar codeql--diagnostics-results-buffers nil
+  "Results buffers in which `codeql-results-diagnostics-mode' is enabled.")
+
+(defvar-local codeql--results-diagnostics nil
+  "Hash table of the locations in a results buffer, keyed by file name.
+
+Its values are lists of (LINE COLUMN END-LINE END-COLUMN TYPE TEXT)
+entries, see `codeql--parse-link-location' for the positions.")
+
+(defvar-local codeql--diagnostics-enabled-flymake nil
+  "Non-nil if `flymake-mode' was enabled to show results diagnostics.")
+
+(defun codeql--diagnostics-file-key (file)
+  "Return the key that FILE is stored under in `codeql--results-diagnostics'."
+  (expand-file-name file))
+
+(defun codeql--diagnostics-text (text)
+  "Return org TEXT as plain text, with links replaced by their descriptions."
+  (string-trim
+   (replace-regexp-in-string
+    "[ \t]+" " "
+    (replace-regexp-in-string
+     "\u200b" ""
+     (replace-regexp-in-string
+      org-link-bracket-re
+      (lambda (link) (or (match-string 2 link) (match-string 1 link)))
+      text t t)
+     t t))))
+
+(defun codeql--diagnostics-location-text (text)
+  "Return org TEXT as plain text, without a trailing FILE:LINE:COLUMN."
+  (replace-regexp-in-string
+   " *\\(?:\\.\\.\\. \\)?[^ ]+:[0-9]+:[0-9]+\\'" ""
+   (codeql--diagnostics-text text) t t))
+
+(defun codeql--diagnostics-problem-text (heading)
+  "Return the message of the problem described by an org HEADING line."
+  (replace-regexp-in-string
+   "\\`[^][:alnum:][]+ +" ""
+   (codeql--diagnostics-location-text
+    (replace-regexp-in-string "\\`\\*+ +" "" heading t t))
+   t t))
+
+(defun codeql--diagnostics-table-header ()
+  "Return the column names of the org table at point, or nil if it has none."
+  (save-excursion
+    (goto-char (org-table-begin))
+    (when (looking-at-p "[ \t]*|-")
+      (forward-line 1)
+      (let ((header (buffer-substring-no-properties
+                     (line-beginning-position) (line-end-position))))
+        (forward-line 1)
+        (when (looking-at-p "[ \t]*|-")
+          (mapcar #'codeql--diagnostics-text
+                  (split-string (string-trim header "[ \t]*|" "|[ \t]*") "|")))))))
+
+(defun codeql--diagnostics-table-row-text (header)
+  "Describe the org table row at point, using the column names in HEADER."
+  (let ((cells (mapcar #'codeql--diagnostics-text
+                       (split-string
+                        (string-trim (buffer-substring-no-properties
+                                      (line-beginning-position) (line-end-position))
+                                     "[ \t]*|" "|[ \t]*")
+                        "|"))))
+    (mapconcat #'identity
+               (cl-loop for cell in cells
+                        for i from 0
+                        for name = (nth i header)
+                        collect (if (and name (not (string-empty-p name)))
+                                    (format "%s: %s" name cell)
+                                  cell))
+               ", ")))
+
+(defun codeql--diagnostics-collect ()
+  "Return the locations of the codeql: links in the current results buffer.
+
+The result is a hash table as described in `codeql--results-diagnostics'.
+The locations of raw result rows and of problem results are `:warning'
+diagnostics, path steps and related locations are `:note' diagnostics."
+  (require 'org-table)
+  (let ((diagnostics (make-hash-table :test #'equal))
+        (seen (make-hash-table :test #'equal))
+        (header-cache nil))
+    (save-excursion
+      (save-restriction
+        (widen)
+        (goto-char (point-min))
+        (while (re-search-forward org-link-bracket-re nil t)
+          (let ((link (org-link-unescape (match-string-no-properties 1)))
+                (description (or (match-string-no-properties 2) ""))
+                (link-end (match-end 0)))
+            (when (string-prefix-p "codeql:" link)
+              (pcase-let*
+                  ((`(,file ,line ,column ,end-line ,end-column)
+                    (codeql--parse-link-location (substring link (length "codeql:"))))
+                   (line-text (buffer-substring-no-properties
+                               (line-beginning-position) (line-end-position)))
+                   (`(,type ,text)
+                    (cond
+                     ;; a row of a raw results table
+                     ((org-at-table-p)
+                      (let ((table (org-table-begin)))
+                        (unless (eq (car header-cache) table)
+                          (setq header-cache
+                                (cons table (codeql--diagnostics-table-header))))
+                        (list :warning (codeql--diagnostics-table-row-text
+                                        (cdr header-cache)))))
+                     ;; a problem heading, its last link is the problem location
+                     ((string-match-p "\\`\\*+ " line-text)
+                      (let ((message (codeql--diagnostics-problem-text line-text)))
+                        (if (save-excursion
+                              (goto-char link-end)
+                              (re-search-forward org-link-bracket-re
+                                                 (line-end-position) t))
+                            (list :note (format "Related location \"%s\" of: %s"
+                                                (codeql--diagnostics-text description)
+                                                message))
+                          (list :warning message))))
+                     ;; a step of a path, or some other location
+                     (t
+                      (list :note (concat "Path step "
+                                          (codeql--diagnostics-location-text line-text))))))
+                   (entry (list line column end-line end-column type text))
+                   (key (codeql--diagnostics-file-key file)))
+                (when (and line (not (gethash (cons key entry) seen)))
+                  (puthash (cons key entry) t seen)
+                  (push entry (gethash key diagnostics)))))
+            (goto-char link-end)))))
+    diagnostics))
+
+(defun codeql--diagnostics-region (line column end-line end-column)
+  "Return the (BEG . END) region of a CodeQL location in the current buffer."
+  (let ((beg (and column (> line 0)
+                  (codeql--eglot--lsp-position-to-point
+                   `(:line ,(1- line) :character ,(max 0 (1- column))))))
+        (end (and end-line end-column (> end-line 0)
+                  (codeql--eglot--lsp-position-to-point
+                   `(:line ,(1- end-line) :character ,end-column)))))
+    (if (and beg end (< beg end))
+        (cons beg end)
+      ;; whole file locations have line 0, otherwise guess the extent
+      (flymake-diag-region (current-buffer) (max 1 line) (and (> line 0) column)))))
+
+(defun codeql--flymake-backend (report-fn &rest _args)
+  "Flymake backend reporting the locations of results buffers to REPORT-FN.
+
+See `codeql-results-diagnostics-mode'."
+  (funcall
+   report-fn
+   (when buffer-file-name
+     (let ((key (codeql--diagnostics-file-key buffer-file-name))
+           (source (current-buffer)))
+       (cl-loop
+        for results in codeql--diagnostics-results-buffers
+        when (buffer-live-p results)
+        nconc
+        (cl-loop
+         with marker = (buffer-name results)
+         for (line column end-line end-column type text)
+         in (gethash key (buffer-local-value 'codeql--results-diagnostics results))
+         for region = (codeql--diagnostics-region line column end-line end-column)
+         when region
+         collect (flymake-make-diagnostic
+                  source (car region) (cdr region) type
+                  (format "%s [%s]" text (string-trim marker "[* ]+" "[* ]+")))))))))
+
+(defun codeql--diagnostics-wanted-p ()
+  "Return non-nil if a results buffer has diagnostics for the current buffer."
+  (when buffer-file-name
+    (let ((key (codeql--diagnostics-file-key buffer-file-name)))
+      (cl-some (lambda (results)
+                 (and (buffer-live-p results)
+                      (gethash key (buffer-local-value 'codeql--results-diagnostics
+                                                       results))))
+               codeql--diagnostics-results-buffers))))
+
+(defun codeql--diagnostics-refresh-buffer ()
+  "Show or clear results diagnostics in the current file buffer."
+  (let ((wanted (codeql--diagnostics-wanted-p))
+        (active (memq #'codeql--flymake-backend flymake-diagnostic-functions)))
+    (cond
+     (wanted
+      (unless active
+        (if flymake-mode
+            (add-hook 'flymake-diagnostic-functions #'codeql--flymake-backend nil t)
+          ;; the database source archive needs no other checkers
+          (setq-local flymake-diagnostic-functions (list #'codeql--flymake-backend))
+          (setq codeql--diagnostics-enabled-flymake t)
+          (flymake-mode 1)))
+      (flymake-start))
+     (active
+      (if codeql--diagnostics-enabled-flymake
+          (progn
+            (flymake-mode -1)
+            (kill-local-variable 'flymake-diagnostic-functions)
+            (setq codeql--diagnostics-enabled-flymake nil))
+        ;; report nothing before letting go of the backend
+        (when flymake-mode
+          (flymake-start))
+        (remove-hook 'flymake-diagnostic-functions #'codeql--flymake-backend t))))))
+
+(defun codeql--diagnostics-refresh ()
+  "Update the results diagnostics of all file buffers."
+  (setq codeql--diagnostics-results-buffers
+        (seq-filter #'buffer-live-p codeql--diagnostics-results-buffers))
+  (dolist (buffer (buffer-list))
+    (when (buffer-local-value 'buffer-file-name buffer)
+      (with-current-buffer buffer
+        (codeql--diagnostics-refresh-buffer)))))
+
+(defun codeql--diagnostics-find-file ()
+  "Show the diagnostics of results buffers in a newly visited file."
+  (when codeql--diagnostics-results-buffers
+    (codeql--diagnostics-refresh-buffer)))
+
+(add-hook 'find-file-hook #'codeql--diagnostics-find-file)
+
+(defun codeql--diagnostics-results-changed ()
+  "Recollect the diagnostics of the current results buffer, if it shows them."
+  (when codeql-results-diagnostics-mode
+    (setq codeql--results-diagnostics (codeql--diagnostics-collect))
+    (codeql--diagnostics-refresh)))
+
+(defun codeql--diagnostics-results-killed ()
+  "Clear the diagnostics of the current results buffer as it is killed."
+  (when codeql-results-diagnostics-mode
+    (setq codeql--diagnostics-results-buffers
+          (delq (current-buffer) codeql--diagnostics-results-buffers))
+    (setq codeql--results-diagnostics nil)
+    (codeql--diagnostics-refresh)))
+
+(define-minor-mode codeql-results-diagnostics-mode
+  "Show the locations of a CodeQL results buffer as Flymake diagnostics.
+
+The locations linked from the results buffer are underlined in the
+database source files they point into, and listed by
+`flymake-show-buffer-diagnostics'.  Raw result rows and problem
+locations are warnings, path steps and related locations are notes.
+Paginated results only show the locations of the current page.
+
+See also `codeql-results-diagnostics'."
+  :lighter " CodeQL-Diag"
+  (cond
+   ((not (derived-mode-p 'org-mode))
+    (setq codeql-results-diagnostics-mode nil)
+    (user-error "Not a CodeQL results buffer"))
+   (codeql-results-diagnostics-mode
+    (setq codeql--results-diagnostics (codeql--diagnostics-collect))
+    (cl-pushnew (current-buffer) codeql--diagnostics-results-buffers)
+    (add-hook 'kill-buffer-hook #'codeql--diagnostics-results-killed nil t)
+    (codeql--diagnostics-refresh)
+    (let ((count (cl-loop for entries being the hash-values of codeql--results-diagnostics
+                          sum (length entries))))
+      (message "Showing %d result location%s in %d file%s." count (if (= count 1) "" "s")
+               (hash-table-count codeql--results-diagnostics)
+               (if (= (hash-table-count codeql--results-diagnostics) 1) "" "s"))))
+   (t
+    (remove-hook 'kill-buffer-hook #'codeql--diagnostics-results-killed t)
+    (setq codeql--diagnostics-results-buffers
+          (delq (current-buffer) codeql--diagnostics-results-buffers))
+    (setq codeql--results-diagnostics nil)
+    (codeql--diagnostics-refresh))))
 
 (defun codeql--process-defs (json src-filename src-root _src-buffer)
   (puthash src-filename (list json src-root) codeql--definitions-cache)

@@ -17,6 +17,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Automatic database selection deconfliction
 - Org based rendering of path-problem, problem, and raw results
 - Pagination of large raw result sets
+- Result locations shown as Flymake diagnostics in database source files
 - Remote query development + evaluation via TRAMP
 - Compatible with [github/gh-codeql](https://github.com/github/gh-codeql) for cli version management
 - Database source archive xref backend support
@@ -261,6 +262,17 @@ Problem and path-problem queries are paginated as well: when they produce more a
 Loading a page that isn't cached requires the query buffer that produced the results to still be live. Paginated results, and results with more than one result set, are re-rendered from the BQRS file when loaded from query history.
 
 Recently visited pages are cached per results buffer, so going back to them is near instant. The number of cached pages is controlled by `codeql-results-page-cache-size` (default: 50, set to 0 to disable).
+
+### Result locations as diagnostics
+
+`M-x codeql-results-diagnostics-mode` in a results buffer underlines the source locations it links to, using Flymake, in the database source archive files they point into. This works for raw, `problem` and `path-problem` results, and for results reopened from query history.
+
+- Raw result rows and the locations of problems are warnings. Their messages are the row, with column names, or the problem message.
+- Path steps and the related locations of problem messages are notes.
+
+The diagnostics follow the results buffer: they are updated when you change pages, and removed when you disable the mode or kill the buffer. Paginated results only show the locations of the current page. Files that are opened later, for example by following a result link, get their diagnostics right away, and the usual Flymake commands such as `flymake-goto-next-error` and `flymake-show-buffer-diagnostics` work as normal.
+
+Flymake is turned on in the source files that need it, and turned off again when no diagnostics remain, unless it was already on. Set `codeql-results-diagnostics` to `t` to enable `codeql-results-diagnostics-mode` in every new results buffer.
 
 ### TRAMP support
 
