@@ -292,6 +292,21 @@ the database source files."
   :type 'boolean
   :group 'emacs-codeql)
 
+(defcustom codeql-evaluator-log t
+  "Whether to write a structured evaluator log for each query run.
+
+The log is kept next to the results of the run, and is what
+`codeql-query-performance' summarizes.  Only supported by query-server2."
+  :type 'boolean
+  :group 'emacs-codeql)
+
+(defcustom codeql-performance-max-predicates 300
+  "The max amount of predicates to list in a query performance buffer.
+
+The slowest predicates are listed first."
+  :type 'integer
+  :group 'emacs-codeql)
+
 (defcustom codeql-results-page-cache-size 50
   "The max amount of rendered result pages to keep per results buffer.
 
@@ -4167,6 +4182,8 @@ QUICK-EVAL is `count', only the number of results is computed."
      ((string= codeql-query-server "query-server2")
       (let* ((query-target
               (codeql--query-target query-path quick-eval))
+             (log-path (when codeql-evaluator-log
+                         (concat (file-name-sans-extension bqrs-path) ".evaluator-log.jsonl")))
              (run-query-params
               `(:body
                 (;; align
@@ -4179,7 +4196,8 @@ QUICK-EVAL is `count', only the number of results is computed."
                  ;; do we want Datalog Intermediary Language dumps?
                  ;; https://codeql.github.com/docs/codeql-overview/codeql-glossary/#dil
                  ;;:dilPath: string
-                 ;;:logPath: string
+                 ,@(when log-path
+                     (list :logPath (codeql--tramp-unwrap log-path)))
                  :target ,query-target)
                 :progressId ,(codeql--query-server-next-progress-id))))
         (message "Running query ...")
@@ -4195,6 +4213,7 @@ QUICK-EVAL is `count', only the number of results is computed."
                    (query-path query-path)
                    (db-path db-path)
                    (quick-eval quick-eval)
+                   (log-path log-path)
                    (src-filename src-filename)
                    (src-root codeql--database-source-archive-root))
                (jsonrpc-lambda
@@ -4231,7 +4250,8 @@ QUICK-EVAL is `count', only the number of results is computed."
                                     :timestamp ,timestamp
                                     :name ,name
                                     :kind ,kind
-                                    :id ,id)
+                                    :id ,id
+                                    :log-path ,(and log-path (file-exists-p log-path) log-path))
                                   codeql--completed-query-history)))
                              ;; display results
                              (codeql-load-bqrs
@@ -4639,6 +4659,304 @@ Interactively, prompt for FROM and then for TO."
                      ", no rows in common"
                    ""))))))
 
+;;; Query performance
+
+(defun codeql--evaluator-log-summary (log-path)
+  "Return the predicate events of the evaluator log at LOG-PATH.
+
+The log is summarized by `codeql generate log-summary', and the summary is
+kept next to the log for later use.  Each event is a plist."
+  (let ((summary-path (concat (file-name-sans-extension log-path) ".summary.jsonl")))
+    (unless (file-exists-p summary-path)
+      (message "Summarizing the evaluator log ...")
+      (unless (codeql--cli-command-to-string
+               (list "generate" "log-summary" "--format=predicates" "--minify-output"
+                     "--" (codeql--tramp-unwrap log-path) (codeql--tramp-unwrap summary-path)))
+        (user-error "Could not summarize the evaluator log %s" log-path)))
+    (with-temp-buffer
+      (insert-file-contents summary-path)
+      (goto-char (point-min))
+      (let (events)
+        (while (progn (skip-chars-forward " \t\r\n") (not (eobp)))
+          (let ((event (json-parse-buffer :object-type 'plist :null-object nil)))
+            (when (plist-get event :predicateName)
+              (push event events))))
+        (nreverse events)))))
+
+(defun codeql--performance-history-entries ()
+  "Return the query history keys of runs with an evaluator log, newest first."
+  (when codeql--completed-query-history
+    (let (entries)
+      (maphash (lambda (key data)
+                 (when (plist-get data :log-path)
+                   (push (cons (date-to-time (plist-get data :timestamp)) key) entries)))
+               codeql--completed-query-history)
+      (mapcar #'cdr (sort entries (lambda (a b) (time-less-p (car b) (car a))))))))
+
+(defun codeql--read-performance-history-entry (prompt &optional exclude)
+  "Read a query history key with an evaluator log with PROMPT, other than EXCLUDE."
+  (let ((keys (remove exclude (codeql--performance-history-entries))))
+    (unless keys
+      (user-error (if exclude
+                      "No other query in the history has an evaluator log"
+                    "No query in the history has an evaluator log, see `codeql-evaluator-log'")))
+    (completing-read prompt keys nil t nil nil (car keys))))
+
+(defun codeql--performance-computed-events (events)
+  "Return the EVENTS of predicates that were computed, the slowest first."
+  (seq-sort-by (lambda (event) (plist-get event :millis)) #'>
+               (seq-filter (lambda (event) (plist-get event :millis)) events)))
+
+(defun codeql--performance-predicate-cell (name)
+  "Return the predicate NAME as the text of an org table cell."
+  (codeql--escape-org-description (codeql--org-table-cell name)))
+
+(defun codeql--performance-cell-predicate (cell)
+  "Return the predicate name shown in the org table CELL."
+  (replace-regexp-in-string "\u200b" "" cell t t))
+
+(defun codeql--performance-predicate-link (event)
+  "Return an org link to the definition of the predicate of EVENT, or its name."
+  (let ((name (codeql--performance-predicate-cell (plist-get event :predicateName)))
+        (position (plist-get event :position)))
+    (if (and position (string-match "\\`\\(.*\\):\\([0-9]+\\),[0-9]+-[0-9]+,[0-9]+\\'" position))
+        (format "[[file:%s::%s][%s]]"
+                (codeql--tramp-wrap (match-string 1 position))
+                (match-string 2 position)
+                name)
+      name)))
+
+(defun codeql--performance-strategy (event)
+  "Return a short name for the evaluation strategy of EVENT."
+  (pcase (plist-get event :evaluationStrategy)
+    ("COMPUTE_SIMPLE" "simple")
+    ("COMPUTE_RECURSIVE" "recursive")
+    ("COMPUTED_EXTENSIONAL" "extensional")
+    (strategy (downcase (or strategy "?")))))
+
+(defvar-local codeql--performance-events nil
+  "The predicate events of the evaluator log shown in a query performance buffer.")
+
+(defvar codeql-performance-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-a") #'codeql-performance-show-ra)
+    map)
+  "Keymap for `codeql-performance-mode'.")
+
+(define-minor-mode codeql-performance-mode
+  "Minor mode for query performance buffers.
+
+\\{codeql-performance-mode-map}"
+  :lighter " CodeQL-Perf"
+  :keymap codeql-performance-mode-map)
+
+(defun codeql--performance-buffer (name events)
+  "Return a new org buffer NAME for the evaluator log EVENTS."
+  (let ((buffer (generate-new-buffer name)))
+    (with-current-buffer buffer
+      (org-mode)
+      (codeql-performance-mode 1)
+      (setq codeql--performance-events events))
+    buffer))
+
+(defun codeql--performance-insert-table (header rows)
+  "Insert an org table with HEADER and ROWS, both lists of org cell strings."
+  (insert (codeql--org-table rows header)))
+
+(defun codeql-query-performance (entry)
+  "Show where the time of the query run ENTRY of the query history went.
+
+The evaluator log of the run is summarized, and the predicates that were
+computed are listed in an org table, the slowest first.  Each predicate
+links to its definition, and `codeql-performance-show-ra' shows the
+relational algebra it was evaluated with.  Sort the table with
+`org-table-sort-lines'.
+
+Interactively, prompt for a run, defaulting to the most recent one."
+  (interactive
+   (progn
+     (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+     (list (codeql--read-performance-history-entry "Query performance of: "))))
+  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (let* ((data (or (gethash entry codeql--completed-query-history)
+                   (user-error "Unknown query history entry")))
+         (log-path (or (plist-get data :log-path)
+                       (user-error "%s has no evaluator log" entry)))
+         (events (codeql--evaluator-log-summary log-path))
+         (computed (codeql--performance-computed-events events))
+         (shown (seq-take computed codeql-performance-max-predicates))
+         (buffer (codeql--performance-buffer
+                  (format "* codeql-performance:%s *"
+                          (file-name-nondirectory (plist-get data :query-path)))
+                  events)))
+    (with-current-buffer buffer
+      (insert (format "#+TITLE: Query performance of %s\n\n" entry))
+      (insert (format "Evaluation time: %s ms in %d computed predicates (%d cache hits, %d empty)\n"
+                      (apply #'+ (mapcar (lambda (event) (plist-get event :millis)) computed))
+                      (length computed)
+                      (seq-count (lambda (event)
+                                   (equal (plist-get event :evaluationStrategy) "CACHE_HIT"))
+                                 events)
+                      (seq-count (lambda (event)
+                                   (equal (plist-get event :evaluationStrategy) "SENTINEL_EMPTY"))
+                                 events)))
+      (when (< (length shown) (length computed))
+        (insert (format "Showing the %d slowest predicates.\n" (length shown))))
+      (insert "\n")
+      (codeql--performance-insert-table
+       '("Time (ms)" "Tuples" "Iterations" "Strategy" "Predicate")
+       (mapcar (lambda (event)
+                 (list (number-to-string (plist-get event :millis))
+                       (number-to-string (or (plist-get event :resultSize) 0))
+                       (number-to-string (max 1 (length (plist-get event :deltaSizes))))
+                       (codeql--performance-strategy event)
+                       (codeql--performance-predicate-link event)))
+               shown))
+      (goto-char (point-min))
+      (set-buffer-modified-p nil))
+    (switch-to-buffer-other-window buffer)))
+
+(defun codeql--performance-predicate-at-point ()
+  "Return the name of the predicate in the table row at point, if any."
+  (when (org-at-table-p)
+    (let ((cell (car (last (split-string
+                            (buffer-substring-no-properties (line-beginning-position)
+                                                            (line-end-position))
+                            "|" t "[ \t]+")))))
+      (if (and cell (string-match "\\`\\[\\[.*\\]\\[\\(.*\\)\\]\\]\\'" cell))
+          (match-string 1 cell)
+        cell))))
+
+(defun codeql-performance-show-ra (name)
+  "Show the relational algebra that the predicate NAME was evaluated with.
+
+Interactively, NAME is the predicate in the table row at point."
+  (interactive
+   (list (let ((at-point (codeql--performance-predicate-at-point))
+               (names (delete-dups
+                       (mapcar (lambda (event) (plist-get event :predicateName))
+                               (seq-filter (lambda (event) (plist-get event :ra))
+                                           codeql--performance-events)))))
+           (if (and at-point (member (codeql--performance-cell-predicate at-point) names))
+               (codeql--performance-cell-predicate at-point)
+             (completing-read "Show the RA of: " names nil t)))))
+  (let ((events (seq-filter (lambda (event)
+                              (and (equal (plist-get event :predicateName) name)
+                                   (plist-get event :ra)))
+                            codeql--performance-events)))
+    (unless events
+      (user-error "No relational algebra for %s" name))
+    (with-current-buffer (get-buffer-create "*codeql-performance-ra*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (dolist (event events)
+          (insert (format "%s\n  %s, %s ms, %s tuples%s\n"
+                          name
+                          (codeql--performance-strategy event)
+                          (or (plist-get event :millis) "?")
+                          (or (plist-get event :resultSize) "?")
+                          (if-let ((deltas (plist-get event :deltaSizes)))
+                              (format ", %d iterations with deltas %s"
+                                      (length deltas)
+                                      (mapconcat #'number-to-string deltas " "))
+                            "")))
+          (let ((ra (plist-get event :ra))
+                (runs (plist-get event :pipelineRuns)))
+            (while ra
+              (let* ((pipeline (substring (symbol-name (car ra)) 1))
+                     (counts (seq-some (lambda (run)
+                                         (and (equal (plist-get run :raReference) pipeline)
+                                              (plist-get run :counts)))
+                                       runs)))
+                (insert (format "\n  pipeline %s%s:\n" pipeline
+                                (if counts
+                                    (format " (tuple counts per step: %s)"
+                                            (mapconcat #'number-to-string counts " "))
+                                  "")))
+                (seq-doseq (line (cadr ra))
+                  (insert line "\n")))
+              (setq ra (cddr ra))))
+          (insert "\n")))
+      (goto-char (point-min))
+      (special-mode)
+      (display-buffer (current-buffer)))))
+
+(defun codeql--performance-millis-by-predicate (events)
+  "Return a hash table of the total time and tuples of each predicate in EVENTS."
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (event events)
+      (when-let ((millis (plist-get event :millis)))
+        (let ((entry (gethash (plist-get event :predicateName) table (cons 0 0))))
+          (puthash (plist-get event :predicateName)
+                   (cons (+ (car entry) millis)
+                         (+ (cdr entry) (or (plist-get event :resultSize) 0)))
+                   table))))
+    table))
+
+(defun codeql-query-performance-compare (from to)
+  "Compare where the time of the query runs FROM and TO went.
+
+The computed predicates of both runs are matched by name and listed in an
+org table, the largest difference in time first.
+
+Interactively, prompt for FROM and then for TO."
+  (interactive
+   (progn
+     (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+     (let ((from (codeql--read-performance-history-entry "Compare query performance of: ")))
+       (list from (codeql--read-performance-history-entry
+                   (format "Compare %s with: " from) from)))))
+  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (let* ((from-data (or (gethash from codeql--completed-query-history)
+                        (user-error "Unknown query history entry")))
+         (to-data (or (gethash to codeql--completed-query-history)
+                      (user-error "Unknown query history entry")))
+         (from-events (codeql--evaluator-log-summary
+                       (or (plist-get from-data :log-path)
+                           (user-error "%s has no evaluator log" from))))
+         (to-events (codeql--evaluator-log-summary
+                     (or (plist-get to-data :log-path)
+                         (user-error "%s has no evaluator log" to))))
+         (from-table (codeql--performance-millis-by-predicate from-events))
+         (to-table (codeql--performance-millis-by-predicate to-events))
+         (names (delete-dups (append (hash-table-keys from-table) (hash-table-keys to-table))))
+         (rows (mapcar (lambda (name)
+                         (let ((a (gethash name from-table))
+                               (b (gethash name to-table)))
+                           (list name a b (- (if b (car b) 0) (if a (car a) 0)))))
+                       names))
+         (rows (seq-sort-by (lambda (row) (abs (nth 3 row))) #'> rows))
+         (total (lambda (table)
+                  (let ((sum 0))
+                    (maphash (lambda (_ entry) (setq sum (+ sum (car entry)))) table)
+                    sum)))
+         (buffer (codeql--performance-buffer
+                  (format "* codeql-performance-compare:%s *"
+                          (file-name-nondirectory (plist-get to-data :query-path)))
+                  (append from-events to-events))))
+    (with-current-buffer buffer
+      (insert (format "#+TITLE: Query performance of %s compared with %s\n\n" to from))
+      (insert (format "Evaluation time: %s ms in %d computed predicates, compared with %s ms in %d\n"
+                      (funcall total to-table) (hash-table-count to-table)
+                      (funcall total from-table) (hash-table-count from-table)))
+      (when (> (length rows) codeql-performance-max-predicates)
+        (insert (format "Showing the %d largest differences.\n" codeql-performance-max-predicates)))
+      (insert "\n")
+      (codeql--performance-insert-table
+       '("Delta (ms)" "Before (ms)" "After (ms)" "Tuples before" "Tuples after" "Predicate")
+       (mapcar (lambda (row)
+                 (cl-destructuring-bind (name a b delta) row
+                   (list (format "%+d" delta)
+                         (if a (number-to-string (car a)) "-")
+                         (if b (number-to-string (car b)) "-")
+                         (if a (number-to-string (cdr a)) "-")
+                         (if b (number-to-string (cdr b)) "-")
+                         (codeql--performance-predicate-cell name))))
+               (seq-take rows codeql-performance-max-predicates)))
+      (goto-char (point-min))
+      (set-buffer-modified-p nil))
+    (switch-to-buffer-other-window buffer)))
+
 (defun codeql-database-history ()
   "Offer global database history selection to the user."
   (interactive)
@@ -4942,6 +5260,8 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
            ("n" "quick eval count" codeql-query-server-quick-eval-count)
            ("h" "history" codeql-query-history)
            ("C" "compare" codeql-query-history-compare)
+           ("t" "performance" codeql-query-performance)
+           ("T" "compare performance" codeql-query-performance-compare)
            ("c" "cancel" codeql-query-server-cancel-query)]
           ["Config"
            ("p" codeql-set-max-paths

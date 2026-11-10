@@ -11,6 +11,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Quick query evaluation of regions or of the predicate at point, and quick evaluation counts
 - Query history for the local session
 - Comparing the results of two query runs
+- Query performance summaries from evaluator logs
 - Database history for the global session
 - Result browsing
 - Source archive location opening
@@ -219,6 +220,12 @@ Locations that span a whole file open that file at the top, and locations withou
 `codeql-query-history-compare` (`C` in the query server transient) compares the results of two runs from the query history, e.g. of two versions of the same query. It prompts for the two runs, which must be on the active database and have result sets with the same names and number of columns. Problem and path-problem results can only be compared with each other.
 
 The rows only found in the first run and those only found in the second run are computed by `codeql bqrs diff` and shown side by side in two results buffers, named after the runs they came from. These work like any other results buffer, so problem results are rendered as org trees and raw results as tables that can be sorted and paged. The echo area summarizes how many rows each side has to itself.
+
+#### Query performance
+
+Each query run writes a structured evaluator log next to its results (set `codeql-evaluator-log` to `nil` to turn this off; it needs query-server2). `codeql-query-performance` (`t` in the query server transient) summarizes the log of a run from the query history with `codeql generate log-summary` and lists the predicates that were computed, the slowest first, in an org table with their time, tuple count, number of iterations and evaluation strategy. The header shows the total evaluation time and how many predicates came from the cache. Predicate names link to their definitions, `C-c C-a` shows the relational algebra of the predicate at point together with its iteration deltas, and the table can be sorted by any column with `org-table-sort-lines` (`C-c ^`). Only the `codeql-performance-max-predicates` (default: 300) slowest predicates are listed.
+
+`codeql-query-performance-compare` (`T`) matches the computed predicates of two runs by name and lists the time and tuples of each run, the largest difference in time first. Predicates that were taken from the cache in one of the runs show `-` for that run.
 
 ### Database source archive Xref support
 
