@@ -174,6 +174,18 @@ Database selection is buffer-local per query file and you can run as many concur
 
 `emacs-codeql` buffer-local approach means you can work on e.g. a `cpp` and `javascript` project concurrently, and you can an arbitrary amount of concurrent results buffers as you toggle between your query buffers.
 
+#### Sharing a query server across query and library files
+
+When a query grows into helper `.qll` files, you'll want those buffers to use the same query server and database, e.g. to quick-eval a library predicate. Select `i` (inherit) in the transient of a buffer without a query server to share the server, active database and query history of another query buffer on the same host.
+
+To share them automatically, set `codeql-share-query-server`:
+
+```elisp
+(setq codeql-share-query-server t)
+```
+
+All query buffers on the same host that use the same CodeQL CLI then share a single query server, database and query history, as in the VS Code extension. A server started in one of them is picked up by the others, including buffers you open later, and registering a database in any of them makes it active in all of them. Stopping the server stops it for all of them. Killing a buffer only shuts the server down when no other buffer uses it.
+
 You can find existing databases for a ton of open source projects on [LGTM.com](https://codeql.github.com/docs/codeql-cli/creating-codeql-databases/#obtaining-databases-from-lgtm-com), or you can [create your own](https://codeql.github.com/docs/codeql-cli/creating-codeql-databases/#creating-codeql-databases) using the codeql cli.
 
 #### Run a query or quick evaluate query regions
