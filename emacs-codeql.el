@@ -155,6 +155,49 @@
   ;; fall back to the external tree-sitter support
   (require 'ql-tree-sitter))
 
+;;; codeql-mode aliases for ql-tree-sitter-mode
+
+(defun codeql--alias-variable (alias base)
+  "Make ALIAS a variable alias of BASE.
+A value that ALIAS was given before this package loaded carries over to
+BASE: hook functions are added to it, other values replace its value."
+  (when (and (boundp base)
+             (eq (indirect-variable alias) alias)
+             (not (eq alias (indirect-variable base))))
+    (let ((bound (boundp alias))
+          (value (and (boundp alias) (symbol-value alias))))
+      (when bound
+        (makunbound alias))
+      (defvaralias alias base)
+      (when bound
+        (if (string-suffix-p "-hook" (symbol-name alias))
+            (dolist (fn (reverse (if (functionp value) (list value) value)))
+              (unless (eq fn t)
+                (add-hook base fn)))
+          (set-default base value))))))
+
+(defalias 'codeql-mode 'ql-tree-sitter-mode
+  "Major mode for editing CodeQL files.
+An alias for `ql-tree-sitter-mode'.")
+
+;; make (derived-mode-p 'codeql-mode) hold in CodeQL buffers
+(when (and (fboundp 'derived-mode-add-parents)
+           (not (memq 'codeql-mode (get 'ql-tree-sitter-mode
+                                        'derived-mode-extra-parents))))
+  (derived-mode-add-parents 'ql-tree-sitter-mode
+                            (cons 'codeql-mode
+                                  (get 'ql-tree-sitter-mode
+                                       'derived-mode-extra-parents))))
+
+(dolist (pair '((codeql-mode-map . ql-tree-sitter-mode-map)
+                (codeql-mode-hook . ql-tree-sitter-mode-hook)
+                (codeql-mode-abbrev-table . ql-tree-sitter-mode-abbrev-table)
+                (codeql-mode-syntax-table . ql-tree-sitter-mode-syntax-table)
+                (codeql-mode-syntax-table . ql-tree-sitter-mode--syntax-table)
+                (codeql-mode-indent-offset . ql-tree-sitter-mode-indent-offset)
+                (codeql-mode-indent-offset . ql-tree-sitter-indent-offset)))
+  (codeql--alias-variable (car pair) (cdr pair)))
+
 ;;; global user configuration options
 
 (defgroup emacs-codeql nil
@@ -590,8 +633,20 @@ Leave nil for default.")
     ;; no LSP for us due to error
     (error (message "Ignoring failed LSP initialization and plowing ahead!"))))
 
+(defun codeql--maybe-buffer-local-init ()
+  "Run `codeql--buffer-local-init-hook' in buffers that visit a file.
+Other buffers in CodeQL mode, such as those org uses to fontify and
+edit source blocks, only get the major mode."
+  (when (buffer-file-name)
+    (codeql--buffer-local-init-hook)))
+
 ;; add a hook that sets up all the things we need to be available in the buffer-local context
-(add-hook 'ql-tree-sitter-mode-hook #'codeql--buffer-local-init-hook)
+(remove-hook 'ql-tree-sitter-mode-hook #'codeql--buffer-local-init-hook)
+(add-hook 'ql-tree-sitter-mode-hook #'codeql--maybe-buffer-local-init)
+
+;; #+begin_src codeql finds codeql-mode by name, ql needs a mapping
+(with-eval-after-load 'org-src
+  (add-to-list 'org-src-lang-modes '("ql" . codeql)))
 
 ;; backup formatting utilities for when ql-tree-sitter is not available
 (defun codeql-format (&optional min max)
