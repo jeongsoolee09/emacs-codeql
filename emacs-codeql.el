@@ -253,6 +253,21 @@ in local and remote contexts to something that readily exists."
   :type 'directory
   :group 'emacs-codeql)
 
+(defcustom codeql-database-history-file nil
+  "The file that the databases registered in each project are kept in.
+
+When nil, this is database-history.eld in `codeql-state-dir'.  The file
+is always local, also for databases on remote hosts."
+  :type '(choice (const :tag "In codeql-state-dir" nil) file)
+  :group 'emacs-codeql)
+
+(defcustom codeql-register-last-database t
+  "Whether starting a query server registers the last database of the project.
+
+The project is the one of the query buffer, see `codeql-database-history'."
+  :type 'boolean
+  :group 'emacs-codeql)
+
 (defcustom codeql-max-raw-results 200
   "The max amount of raw result tuples to render in an org-table.
 
@@ -786,7 +801,13 @@ If optional MARKER, return a marker instead"
 
 ;;; emacs-wide state tracking variables and functions
 
-(defvar codeql--registered-database-history nil)
+(defvar codeql--database-history 'unloaded
+  "The databases registered in each project, see `codeql-database-history'.
+
+A list of plists with the :path, :project and :language of a database, and
+the :added and :used times of when it was first and last registered in
+the project, most recently used first.  It is read from
+`codeql-database-history-file' on first use.")
 
 ;; global caches for database source archive files defs/refs/ast
 (defvar codeql--definitions-cache (make-hash-table :test #'equal))
@@ -1397,7 +1418,7 @@ and GVFS is running, otherwise the archive is extracted instead."
 
 (defun codeql-query-server-register-database (database-path)
   "Register a database with the query server."
-  (interactive (list (read-file-name "Database: " nil default-directory t)))
+  (interactive (list (read-file-name "Database or database archive: " nil default-directory t)))
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
 
   ;; if no server is running yet, offer to start one
@@ -1405,9 +1426,9 @@ and GVFS is running, otherwise the archive is extracted instead."
     (transient-setup 'codeql-transient-query-server-init-start)
     (error "No query server running, please start one and re-select database."))
 
-  ;; init the database history if need be
-  (unless codeql--registered-database-history
-    (setq codeql--registered-database-history (make-hash-table :test #'equal)))
+  ;; database archives are unbundled into the state dir first
+  (when (and (string-suffix-p ".zip" database-path t) (file-regular-p database-path))
+    (setq database-path (codeql--database-unbundle database-path)))
 
   ;; resolve and set the dataset folder, we need this when running queries
   (let* ((database-info (codeql--database-info database-path))
@@ -1459,7 +1480,7 @@ and GVFS is running, otherwise the archive is extracted instead."
              ;; global addition can be asynchronous, so we do that on success only
              (codeql--active-datasets-add database-dataset-folder (current-buffer))
              ;; save in database selection history
-             (puthash database-path database-path codeql--registered-database-history)
+             (codeql--database-history-add database-path database-language)
              ;; these variables are buffer-local to ql-tree-sitter-mode
              (setq codeql--active-database database-path)
              (setq codeql--active-database-language database-language)
@@ -1504,7 +1525,7 @@ and GVFS is running, otherwise the archive is extracted instead."
              ;; global addition can be asynchronous, so we do that on success only
              (codeql--active-datasets-add database-dataset-folder (current-buffer))
              ;; save in database selection history
-             (puthash database-path database-path codeql--registered-database-history)
+             (codeql--database-history-add database-path database-language)
              ;; these variables are buffer-local to ql-tree-sitter-mode
              (setq codeql--active-database database-path)
              (setq codeql--active-database-language database-language)
@@ -4421,32 +4442,264 @@ See also `codeql-results-diagnostics'."
     ;; XXX: do we want to serialize query history state to disk?
     (message "No query history available yet in this session.")))
 
+;;; Database history, by project
+
+(declare-function consult--read "ext:consult")
+(declare-function consult--type-group "ext:consult")
+(declare-function consult--type-narrow "ext:consult")
+(defvar embark-keymap-alist)
+
+(defun codeql--database-history-file ()
+  "Return the file that the database history is kept in."
+  (or codeql-database-history-file
+      (let ((default-directory "~/"))
+        (expand-file-name "database-history.eld" (expand-file-name codeql-state-dir)))))
+
+(defun codeql--database-history ()
+  "Return the database history, reading it from its file if need be."
+  (when (eq codeql--database-history 'unloaded)
+    (setq codeql--database-history
+          (let ((file (codeql--database-history-file)))
+            (when (file-readable-p file)
+              (condition-case err
+                  (with-temp-buffer
+                    (insert-file-contents file)
+                    (seq-filter (lambda (entry) (plist-get entry :path))
+                                (read (current-buffer))))
+                (error
+                 (message "Could not read the database history %s: %s"
+                          file (error-message-string err))
+                 nil))))))
+  codeql--database-history)
+
+(defun codeql--database-history-save ()
+  "Write the database history to its file."
+  (let ((file (codeql--database-history-file))
+        (entries (codeql--database-history)))
+    (make-directory (file-name-directory file) t)
+    (with-temp-file file
+      (let ((print-length nil)
+            (print-level nil))
+        (insert ";; -*- mode: lisp-data -*-\n"
+                ";; The CodeQL databases registered in each project, by emacs-codeql.\n")
+        (prin1 entries (current-buffer))
+        (insert "\n")))))
+
+(defun codeql--database-history-project ()
+  "Return the project that databases registered in the current buffer belong to.
+
+This is the root of the version controlled project of the buffer, or the
+root of its CodeQL pack, or else its directory."
+  (abbreviate-file-name
+   (file-name-as-directory
+    (expand-file-name
+     (or (when-let ((project (let ((project-find-functions
+                                    (remq #'project-codeql project-find-functions)))
+                               (project-current nil default-directory))))
+           (project-root project))
+         (codeql--find-project-root default-directory)
+         default-directory)))))
+
+(defun codeql--database-history-path (database-path)
+  "Return DATABASE-PATH the way it is kept in the database history."
+  (directory-file-name (expand-file-name database-path)))
+
+(defun codeql--database-history-add (database-path language)
+  "Record that DATABASE-PATH, of LANGUAGE, was registered in the current project."
+  ;; pick up what other Emacs sessions recorded meanwhile
+  (setq codeql--database-history 'unloaded)
+  (let* ((path (codeql--database-history-path database-path))
+         (project (codeql--database-history-project))
+         (now (float-time))
+         (entries (codeql--database-history))
+         (old (seq-find (lambda (entry)
+                          (and (equal (plist-get entry :path) path)
+                               (equal (plist-get entry :project) project)))
+                        entries)))
+    (setq codeql--database-history
+          (cons (list :path path
+                      :project project
+                      :language (or language (plist-get old :language))
+                      :added (or (plist-get old :added) now)
+                      :used now)
+                (delq old entries)))
+    (condition-case err
+        (codeql--database-history-save)
+      (error (message "Could not save the database history: %s" (error-message-string err))))))
+
+(defun codeql-database-history-remove (database-path)
+  "Remove DATABASE-PATH from the database history of all projects.
+
+This only forgets about the database, it stays on disk."
+  (interactive (list (codeql--read-database "Remove from database history: ")))
+  (setq codeql--database-history 'unloaded)
+  (let ((path (codeql--database-history-path database-path)))
+    (setq codeql--database-history
+          (seq-remove (lambda (entry) (equal (plist-get entry :path) path))
+                      (codeql--database-history)))
+    (codeql--database-history-save)
+    (message "Removed %s from the database history" path)))
+
+(defun codeql--database-history-entries ()
+  "Return the database history entries offered in the current buffer.
+
+These are the databases on the host of the current buffer, those of its
+project first, most recently used first, and then those only registered
+in other projects.  Each database is listed once."
+  (let* ((project (codeql--database-history-project))
+         (remote (file-remote-p default-directory))
+         (entries (seq-sort-by (lambda (entry) (or (plist-get entry :used) 0)) #'>
+                               (seq-filter (lambda (entry)
+                                             (equal (file-remote-p (plist-get entry :path))
+                                                    remote))
+                                           (codeql--database-history))))
+         (ours (seq-filter (lambda (entry) (equal (plist-get entry :project) project))
+                           entries))
+         (seen (mapcar (lambda (entry) (plist-get entry :path)) ours))
+         (others (seq-filter (lambda (entry)
+                               (unless (member (plist-get entry :path) seen)
+                                 (push (plist-get entry :path) seen)))
+                             entries)))
+    (list ours others)))
+
+(defun codeql--database-annotation (entry other)
+  "Return the completion annotation of the database history ENTRY.
+
+OTHER is non-nil when ENTRY belongs to another project."
+  (let ((path (plist-get entry :path)))
+    (concat
+     (propertize " " 'display '(space :align-to (max 50 (+ left 2))))
+     (propertize (format "%-12s" (or (plist-get entry :language) "?"))
+                 'face 'font-lock-type-face)
+     (propertize (format-time-string "%Y-%m-%d %H:%M" (plist-get entry :used))
+                 'face 'completions-annotations)
+     (when other
+       (propertize (format "  %s" (plist-get entry :project))
+                   'face 'completions-annotations))
+     ;; checking remote databases would be slow
+     (unless (or (file-remote-p path) (file-directory-p path))
+       (propertize "  missing" 'face 'error)))))
+
+(defun codeql--read-database (prompt)
+  "Read a database from the database history with PROMPT, and return its path.
+
+With consult installed, the databases of the current project and of other
+projects can be narrowed to with p and o."
+  (pcase-let* ((`(,ours ,others) (codeql--database-history-entries))
+               (annotations (make-hash-table :test #'equal))
+               (candidates
+                (append
+                 (mapcar (lambda (entry)
+                           (let ((cand (abbreviate-file-name (plist-get entry :path))))
+                             (puthash cand (codeql--database-annotation entry nil) annotations)
+                             (propertize cand 'consult--type ?p)))
+                         ours)
+                 (mapcar (lambda (entry)
+                           (let ((cand (abbreviate-file-name (plist-get entry :path))))
+                             (puthash cand (codeql--database-annotation entry t) annotations)
+                             (propertize cand 'consult--type ?o)))
+                         others)))
+               (annotate (lambda (cand) (gethash cand annotations)))
+               (types '((?p . "This project") (?o . "Other projects"))))
+    (unless candidates
+      (user-error "No databases in the history yet, register one with `codeql-query-server-register-database'"))
+    (expand-file-name
+     (if (require 'consult nil t)
+        (consult--read candidates
+                       :prompt prompt
+                       :category 'codeql-database
+                       :require-match t
+                       :sort nil
+                       :annotate annotate
+                       :group (consult--type-group types)
+                       :narrow (consult--type-narrow types))
+      (completing-read
+       prompt
+       (lambda (string predicate action)
+         (if (eq action 'metadata)
+             `(metadata (category . codeql-database)
+                        (display-sort-function . identity)
+                        (annotation-function . ,annotate)
+                        (group-function
+                         . ,(lambda (cand transform)
+                              (if transform
+                                  cand
+                                (alist-get (if (member (expand-file-name cand)
+                                                       (mapcar (lambda (entry)
+                                                                 (plist-get entry :path))
+                                                               ours))
+                                               ?p ?o)
+                                           types)))))
+           (complete-with-action action candidates string predicate)))
+       nil t)))))
+
 (defun codeql-database-history ()
-  "Offer global database history selection to the user."
+  "Register a database from the database history.
+
+The history is kept across sessions in `codeql-database-history-file'.
+The databases registered in the project of the query buffer are offered
+first, most recently used first, followed by those registered in other
+projects.  Only databases on the host of the query buffer are offered.
+A project is a version controlled directory tree, or else a CodeQL pack."
   (interactive)
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (if (and codeql--registered-database-history
-           (not (eql 0 (hash-table-count codeql--registered-database-history))))
-      (let* ((db-keys (vconcat (hash-table-keys codeql--registered-database-history)))
-             (db (completing-read
-                  "Recent Databases: "
-                  ;; show remote files only for active remote context
-                  ;; show local files in global local context
-                  (reverse
-                   (append
-                    (cl-loop
-                     ;; file-remote-p returns the tramp prefix of a remote file or nil
-                     with remote-prefix = (file-remote-p default-directory)
-                     for k across db-keys
-                     ;; deal with both strings and symbols
-                     when (equal (file-remote-p k) remote-prefix)
-                     collect k)
-                    nil))
-                  nil t)))
-        (when db
-          (let ((database-path (gethash db codeql--registered-database-history)))
-            (codeql-query-server-register-database database-path))))
-    (message "No database history available across any sessions.")))
+  (codeql-query-server-register-database (codeql--read-database "Database: ")))
+
+(defun codeql--register-last-database ()
+  "Register the database last registered in the project of the current buffer."
+  (unless codeql--active-database
+    (when-let* ((entry (seq-find (lambda (entry)
+                                   (let ((path (plist-get entry :path)))
+                                     (or (file-remote-p path) (file-directory-p path))))
+                                 (car (codeql--database-history-entries)))))
+      (message "Registering the last database of this project: %s" (plist-get entry :path))
+      (codeql-query-server-register-database (plist-get entry :path)))))
+
+(defun codeql--database-unbundle (archive)
+  "Unbundle the database ARCHIVE into `codeql-state-dir' and return its path.
+
+An archive that was unbundled before is reused."
+  (let* ((target (expand-file-name (codeql--tramp-wrap (concat codeql-state-dir "/databases"))))
+         (name (file-name-base archive))
+         (database (expand-file-name name target)))
+    (if (file-exists-p (expand-file-name "codeql-database.yml" database))
+        (message "Using %s, unbundled from %s before" database archive)
+      (make-directory target t)
+      (message "Unbundling %s ..." archive)
+      (unless (codeql--cli-command-to-string
+               (list "database" "unbundle"
+                     (format "--name=%s" name)
+                     (format "--target=%s" (codeql--tramp-unwrap target))
+                     "--" (codeql--tramp-unwrap (expand-file-name archive))))
+        (user-error "Could not unbundle %s" archive))
+      (unless (file-exists-p (expand-file-name "codeql-database.yml" database))
+        (user-error "%s is not a CodeQL database archive" archive))
+      (message "Unbundled %s into %s" archive database))
+    database))
+
+(defun codeql-database-dired (database-path)
+  "Open the directory of DATABASE-PATH."
+  (interactive (list (codeql--read-database "Open database directory: ")))
+  (dired (expand-file-name database-path)))
+
+(defun codeql-database-copy-path (database-path)
+  "Copy DATABASE-PATH to the kill ring."
+  (interactive (list (codeql--read-database "Copy database path: ")))
+  (kill-new (expand-file-name database-path))
+  (message "Copied %s" (expand-file-name database-path)))
+
+(defvar codeql-database-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'codeql-query-server-register-database)
+    (define-key map (kbd "r") #'codeql-query-server-register-database)
+    (define-key map (kbd "k") #'codeql-database-history-remove)
+    (define-key map (kbd "d") #'codeql-database-dired)
+    (define-key map (kbd "w") #'codeql-database-copy-path)
+    map)
+  "Embark actions for databases in the database history.")
+
+(with-eval-after-load 'embark
+  (add-to-list 'embark-keymap-alist '(codeql-database . codeql-database-map)))
 
 ;;; transient ui for buffer-local server state management
 
@@ -4621,7 +4874,9 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
         (unless codeql--completed-query-history
           (setq codeql--completed-query-history (make-hash-table :test #'equal)))
         (codeql--query-server-share)
-        (message "Started query server.")))))
+        (message "Started query server.")
+        (when codeql-register-last-database
+          (codeql--register-last-database))))))
 
 (transient-define-suffix codeql-transient-query-server-stop ()
   "Stop a CodeQL query server."
