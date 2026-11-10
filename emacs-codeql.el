@@ -184,6 +184,22 @@ Users may cancel queries instead through the transient UI."
   :type 'boolean
   :group 'emacs-codeql)
 
+(defcustom codeql-xref-resolve-on-visit nil
+  "Whether to resolve xrefs as soon as a source archive file is visited.
+
+When nil, the definitions and references of a database source archive file
+are resolved by running a query the first time they are looked up, e.g.
+with \\[xref-find-definitions], and cached from then on.  When non-nil,
+both are resolved in the background whenever a file is opened from a
+results buffer for the first time."
+  :type 'boolean
+  :group 'emacs-codeql)
+
+(defcustom codeql-xref-timeout 120
+  "Seconds to wait for the definitions or references of a file to resolve."
+  :type 'number
+  :group 'emacs-codeql)
+
 (defcustom codeql-share-query-server nil
   "Share one query server and database across all QL buffers.
 
@@ -767,6 +783,9 @@ If optional MARKER, return a marker instead"
 (defvar codeql--references-cache (make-hash-table :test #'equal))
 (defvar codeql--ast-cache (make-hash-table :test #'equal))
 
+(defvar codeql--xref-pending (make-hash-table :test #'equal)
+  "The (FILE . QUERY-NAME) keys of the xref queries that are running.")
+
 (defvar codeql--ast-backwards-definitions (make-hash-table :test #'equal)
   "A hash table of src-filename -> ast-table.
 
@@ -779,6 +798,7 @@ Provides backwards references into the AST buffer from the source file.")
   (setq codeql--definitions-cache (make-hash-table :test #'equal))
   (setq codeql--references-cache (make-hash-table :test #'equal))
   (setq codeql--ast-cache (make-hash-table :test #'equal))
+  (setq codeql--xref-pending (make-hash-table :test #'equal))
   (message "Cleared refs/defs/ast caches."))
 
 ;; (defvar codeql--active-source-roots-with-buffers nil
@@ -2871,23 +2891,74 @@ a codeql database source archive."
                  (file-remote-p (buffer-file-name))
                  (not codeql-enable-remote-xrefs))
 
-      (cond ((and (gethash (buffer-file-name) codeql--references-cache)
-                  (gethash (buffer-file-name) codeql--definitions-cache))
+      (cond ((or (gethash (buffer-file-name) codeql--references-cache)
+                 (gethash (buffer-file-name) codeql--definitions-cache))
              (codeql--set-local-xref-bindings)
              'codeql)
             ((buffer-live-p codeql--org-query-buffer)
-             (let ((src-filename (buffer-file-name))
-                   (src-buffer (current-buffer)))
-               (with-current-buffer codeql--org-query-buffer
-                 (let ((language (intern (format ":%s" codeql--active-database-language))))
-                   (message "Cooking up CodeQL xrefs for %s, please hold." (file-name-nondirectory src-filename))
-                   (codeql--run-templated-query language "localDefinitions" src-filename src-buffer)
-                   (codeql--run-templated-query language "localReferences" src-filename src-buffer)))
-               ;; we want our bindings available
-               (codeql--set-local-xref-bindings)
-               'codeql))
+             ;; otherwise xrefs are resolved when they are first looked up
+             (when codeql-xref-resolve-on-visit
+               (message "Cooking up CodeQL xrefs for %s, please hold."
+                        (file-name-nondirectory (buffer-file-name)))
+               (codeql--xref-resolve "localDefinitions")
+               (codeql--xref-resolve "localReferences"))
+             ;; we want our bindings available
+             (codeql--set-local-xref-bindings)
+             'codeql)
             (t (message "No xref cache or query buffer available, xref support deactivated.")
                nil)))))
+
+(defun codeql--xref-cache (query-name)
+  "Return the cache that holds the results of templated QUERY-NAME."
+  (if (string= query-name "localDefinitions")
+      codeql--definitions-cache
+    codeql--references-cache))
+
+(defun codeql--xref-resolve (query-name)
+  "Run templated QUERY-NAME for the current source file, unless done already.
+
+Returns non-nil if its results are cached or on their way."
+  (let ((src-filename (buffer-file-name))
+        (src-buffer (current-buffer)))
+    (cond ((gethash src-filename (codeql--xref-cache query-name)) t)
+          ((gethash (cons src-filename query-name) codeql--xref-pending) t)
+          ((buffer-live-p codeql--org-query-buffer)
+           (with-current-buffer codeql--org-query-buffer
+             (codeql--run-templated-query
+              (intern (format ":%s" codeql--active-database-language))
+              query-name src-filename src-buffer))
+           (puthash (cons src-filename query-name) t codeql--xref-pending)
+           t))))
+
+(defun codeql--xref-ensure (query-name)
+  "Wait for the results of templated QUERY-NAME for the current source file.
+
+Runs the query when needed, see `codeql-xref-resolve-on-visit', and waits
+for at most `codeql-xref-timeout' seconds."
+  (let* ((src-filename (buffer-file-name))
+         (key (cons src-filename query-name))
+         (cache (codeql--xref-cache query-name)))
+    (unless (gethash src-filename cache)
+      (if (not (codeql--xref-resolve query-name))
+          (message "No query buffer available to resolve xrefs for %s."
+                   (file-name-nondirectory src-filename))
+        (let ((deadline (+ (float-time) codeql-xref-timeout))
+              (done nil))
+          (message "Resolving CodeQL %s for %s, please hold."
+                   (if (eq cache codeql--definitions-cache) "definitions" "references")
+                   (file-name-nondirectory src-filename))
+          (unwind-protect
+              (progn
+                (while (and (not (gethash src-filename cache))
+                            (< (float-time) deadline))
+                  (accept-process-output nil 0.05))
+                (setq done t))
+            ;; let a failed, timed out or interrupted query be run again
+            (unless (and done (gethash src-filename cache))
+              (remhash key codeql--xref-pending)))
+          (unless (gethash src-filename cache)
+            (message "Timed out resolving CodeQL xrefs for %s."
+                     (file-name-nondirectory src-filename))))))))
 
 (cl-defmethod xref-backend-identifier-at-point ((_backend (eql codeql)))
   "Return the thing at point."
@@ -2917,6 +2988,7 @@ a codeql database source archive."
 
 (cl-defmethod xref-backend-definitions ((_backend (eql codeql)) _symbol)
   "Get known definitions for location at point."
+  (codeql--xref-ensure "localDefinitions")
   (cl-multiple-value-bind (json src-root) (gethash (buffer-file-name) codeql--definitions-cache)
     ;; re-parsing the json for every definition is terribly inefficient
     ;; so once this works, move into more performant datastructures
@@ -2948,6 +3020,7 @@ a codeql database source archive."
 
 (cl-defmethod xref-backend-references ((_backend (eql codeql)) _symbol)
   "Get known references for location at point."
+  (codeql--xref-ensure "localReferences")
   (cl-multiple-value-bind (json src-root) (gethash (buffer-file-name) codeql--references-cache)
     (when (and json src-root)
       (cl-loop with tuples = (json-pointer-get json "/#select/tuples")
@@ -3343,10 +3416,12 @@ See also `codeql-results-diagnostics'."
 
 (defun codeql--process-defs (json src-filename src-root _src-buffer)
   (puthash src-filename (list json src-root) codeql--definitions-cache)
+  (remhash (cons src-filename "localDefinitions") codeql--xref-pending)
   (message "Processed definitions for: %s" (file-name-nondirectory src-filename)))
 
 (defun codeql--process-refs (json src-filename src-root _src-buffer)
   (puthash src-filename (list json src-root) codeql--references-cache)
+  (remhash (cons src-filename "localReferences") codeql--xref-pending)
   (message "Processed references for: %s" (file-name-nondirectory src-filename)))
 
 ;; AST viewer
