@@ -183,6 +183,11 @@ Users may cancel queries instead through the transient UI."
   :type 'boolean
   :group 'emacs-codeql)
 
+(defcustom codeql-remote-server-ready-timeout 60
+  "Seconds to wait for a remote query or CLI server process to start."
+  :type 'number
+  :group 'emacs-codeql)
+
 (defcustom codeql-enable-remote-xrefs t
   "Enable CodeQL xref support for database source archives in remote sessions."
   :type 'boolean
@@ -893,16 +898,15 @@ Provides backwards references into the AST buffer from the source file.")
          (stderr (generate-new-buffer (format " *%s stderr*" name))))
     (when codeql-verbose-commands
       (message "Starting CLI server with: %s" cmd))
-    (let ((proc (make-process
+    (let ((proc (codeql--make-server-process
+                 'utf-8-unix
                  :name name
                  :buffer stdout
                  :command cmd
                  :connection-type 'pipe
-                 :coding 'utf-8-unix
                  :noquery t
                  :stderr stderr
-                 :sentinel #'ignore
-                 :file-handler t)))
+                 :sentinel #'ignore)))
       (process-put proc 'codeql-stderr stderr)
       (when-let ((stderr-proc (get-buffer-process stderr)))
         (set-process-sentinel stderr-proc #'ignore))
@@ -3873,13 +3877,68 @@ Our implementation simply returns the thing at point as a candidate."
       ;; errr ... it's late
       (split-string (string-trim-right options) "\n"))))
 
+(defconst codeql--remote-server-ready-marker "CODEQL-SERVER-READY"
+  "Printed by a remote server command once its tty is in raw mode.")
+
+(defvar tramp-use-connection-share)
+(defvar tramp-use-ssh-controlmaster-options)
+
+(defun codeql--make-server-process (coding &rest args)
+  "Start a server process with `make-process' ARGS and CODING, and return it.
+
+The process is started in the remote context of `default-directory'.
+
+TRAMP ignores the :coding argument of `make-process' and uses its own
+connection coding, which encodes newlines as carriage returns when the
+remote host is Darwin.  Since `codeql--query-server-cmd' puts the
+remote tty in raw mode, those carriage returns would reach the server
+untranslated and corrupt the JSON-RPC headers, so CODING is set after
+the process is started.
+
+A remote server gets its own ssh connection.  When it shares the
+connection of TRAMP, server output that is not read while TRAMP waits
+for one of its own commands stalls that connection, and Emacs hangs.
+
+TRAMP also returns a remote process before its command has started, and
+input sent before the tty is in raw mode can be lost.  For remote
+processes, wait until `codeql--query-server-cmd' signals readiness."
+  (let* ((share (if (boundp 'tramp-use-connection-share) 'suppress nil))
+         (tramp-use-connection-share share)
+         (proc (with-suppressed-warnings
+                   ((obsolete tramp-use-ssh-controlmaster-options))
+                 ;; older TRAMP versions only know this name
+                 (let ((tramp-use-ssh-controlmaster-options share))
+                   (apply #'make-process :coding coding :file-handler t args)))))
+    (set-process-coding-system proc coding coding)
+    (when (file-remote-p default-directory)
+      (let ((filter (process-filter proc))
+            (output "")
+            (ready nil)
+            (deadline (+ (float-time) codeql-remote-server-ready-timeout)))
+        (set-process-filter
+         proc (lambda (_proc string) (setq output (concat output string))))
+        (unwind-protect
+            (while (and (not (setq ready (string-search
+                                          codeql--remote-server-ready-marker output)))
+                        (process-live-p proc)
+                        (< (float-time) deadline))
+              (accept-process-output proc 0.1 nil t))
+          (set-process-filter proc filter))
+        (if (not ready)
+            (message "Remote server process did not become ready: %s" output)
+          (let ((rest (substring output (+ ready (length codeql--remote-server-ready-marker)))))
+            (unless (string-empty-p rest)
+              (funcall filter proc rest))))))
+    proc))
+
 ;; workaround from eglot.el, disable line buffering if in remote context
 (defun codeql--query-server-cmd (contact)
   "Helper for codeql query server connection."
   (if (file-remote-p default-directory)
       (list "sh" "-c"
-            (string-join (cons "stty raw > /dev/null;"
-                               (mapcar #'shell-quote-argument contact))
+            (string-join (append (list "stty raw > /dev/null;"
+                                       "printf %s" codeql--remote-server-ready-marker ";")
+                                 (mapcar #'shell-quote-argument contact))
                          " "))
     contact))
 
@@ -3931,15 +3990,13 @@ Our implementation simply returns the thing at point as a candidate."
                (let* ((default-directory default-directory)
                       (cmd (codeql--query-server-cmd cmd)))
                  (message "Starting query server with: %s" cmd)
-                 (make-process
+                 (codeql--make-server-process
+                  'utf-8-emacs-unix
                   :name name
                   :command cmd
                   :connection-type 'pipe
-                  :coding 'utf-8-emacs-unix
                   :noquery t
-                  :stderr (get-buffer-create (format "*%s stderr*" name))
-                  ;; enable tramp contexts
-                  :file-handler t))
+                  :stderr (get-buffer-create (format "*%s stderr*" name))))
                :name name
                :events-buffer-scrollback-size codeql-query-server-events-buffer-size
                :notification-dispatcher #'codeql--query-server-handle-notification

@@ -258,6 +258,8 @@ Recently visited pages are cached per results buffer, so going back to them is n
 
 On emacs 28.1+, TRAMP version (2.5.2+) provides a fairly trouble free experience on Linux even with the LSP enabled, at least in my experience. On emacs 27.2, with the older version of TRAMP, I've had less luck with the LSP experience, but the query server performs fine over TRAMP. `emacs-codeql` will ask for confirmation to enable the LSP when it detects it is running in a remote context. When in doubt, keep it disabled.
 
+The remote query server and CLI server each get their own ssh connection, separate from the one TRAMP uses for file access, so expect an extra login (or password prompt, if you don't use ssh keys) when they start. Sharing TRAMP's connection lets unread server output stall TRAMP and freeze emacs. Startup waits up to `codeql-remote-server-ready-timeout` seconds for a remote server to come up.
+
 For optimal performance over TRAMP, especially if you're expecting very large (multiple thousands) of result sets, I recommend the following settings:
 
 ```elisp
