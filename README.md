@@ -14,6 +14,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Query performance summaries from evaluator logs
 - Database history for the global session
 - Result browsing
+- Jumping to result locations with completion, with optional [consult](https://github.com/minad/consult) preview and [embark](https://github.com/oantolin/embark) actions
 - Source archive location opening
 - Buffer local query server state with concurrent remote|local project, database and query support
 - Automatic database selection deconfliction
@@ -226,6 +227,12 @@ The rows only found in the first run and those only found in the second run are 
 Each query run writes a structured evaluator log next to its results (set `codeql-evaluator-log` to `nil` to turn this off; it needs query-server2). `codeql-query-performance` (`t` in the query server transient) summarizes the log of a run from the query history with `codeql generate log-summary` and lists the predicates that were computed, the slowest first, in an org table with their time, tuple count, number of iterations and evaluation strategy. The header shows the total evaluation time and how many predicates came from the cache. Predicate names link to their definitions, `C-c C-a` shows the relational algebra of the predicate at point together with its iteration deltas, and the table can be sorted by any column with `org-table-sort-lines` (`C-c ^`). Only the `codeql-performance-max-predicates` (default: 300) slowest predicates are listed.
 
 `codeql-query-performance-compare` (`T`) matches the computed predicates of two runs by name and lists the time and tuples of each run, the largest difference in time first. Predicates that were taken from the cache in one of the runs show `-` for that run.
+
+#### Jumping to result locations
+
+`codeql-results-goto-location` offers every source location in the current results buffer (or page of results) for completion, each with the text of the result it belongs to, and visits the chosen one like following its link. Bind it in `org-mode-map`, or call it with `M-x`.
+
+There are no extra dependencies, but when [consult](https://github.com/minad/consult) is installed the locations are grouped by file and previewed as you move between them. When [embark](https://github.com/oantolin/embark) is loaded, `codeql:` links at point and the completion candidates are `codeql-location` targets, with the actions in `codeql-location-map`: `o` (or `RET`) visits the location, and `w` copies it as `FILE:LINE:COLUMN`.
 
 ### Database source archive Xref support
 
