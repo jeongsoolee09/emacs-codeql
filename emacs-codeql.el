@@ -1457,9 +1457,38 @@ as obtained from `codeql--bqrs-info' pagination offsets."
 
 (defun codeql--escape-org-description (description)
   "Replace [] with something harmless in org link descriptions."
-  (replace-regexp-in-string "\\[\\|\\]\\|=\\|~\\|_\\|/\\|+"
+  (replace-regexp-in-string "\\[\\|\\]\\|=\\|~\\|_\\|/\\|+\\|\\*"
                             ;; this wraps with a zero width space ;)
                             (lambda (x) (format "​%s​" x)) description))
+
+(defun codeql--printable-label (label)
+  "Return LABEL in a form that is visible and safe to render as org text.
+
+Empty and whitespace-only labels get a placeholder, so their links remain
+clickable, line breaks are collapsed and other control characters are shown
+as their Unicode control pictures."
+  (let ((label (replace-regexp-in-string "[ \t]*\r?\n[ \t]*" " " (format "%s" (or label "")))))
+    (cond
+     ((string-empty-p label) "[empty string]")
+     ((string-match-p "\\`[[:space:]]+\\'" label)
+      (format "[whitespace: \"%s\"]" label))
+     (t
+      (replace-regexp-in-string
+       "[\0-\x1f\x7f]"
+       (lambda (c) (string (if (eq (aref c 0) ?\x7f) ?␡ (+ ?␀ (aref c 0)))))
+       label t t)))))
+
+(defun codeql--encode-link-path (path)
+  "Percent encode the characters of PATH that org links in tables can't contain."
+  (replace-regexp-in-string
+   "[%|]" (lambda (c) (format "%%%02X" (aref c 0))) path t t))
+
+(defun codeql--decode-link-path (path)
+  "Reverse `codeql--encode-link-path' for PATH."
+  (replace-regexp-in-string
+   "%\\(25\\|7C\\)"
+   (lambda (c) (if (string= (match-string 1 c) "25") "%" "|"))
+   path t t))
 
 (defun codeql--result-node-to-org (node &optional custom-description)
   "Transform a result node into an org compatible link|string representation."
@@ -1468,21 +1497,21 @@ as obtained from `codeql--bqrs-info' pagination offsets."
       (progn
         (cl-assert codeql--database-source-archive-zip t)
         (cl-assert (codeql--file-exists-p codeql--database-source-archive-root) t)
-        (let ((filename (codeql--result-node-filename node)))
-          ;; we implement a custom org link type so we can add extra sauce on link follow
-          (when filename (cl-assert (not (string-match ":" filename)))))
         ;; since we have our own link type, also add in a column
-        (let ((link (format "codeql:%s%s::%s:%s"
+        (let ((link (format "codeql:%s::%s:%s"
                             ;; we've extracted to the expected location
-                            (codeql--tramp-wrap codeql--database-source-archive-root)
-                            (codeql--result-node-filename node)
+                            (codeql--encode-link-path
+                             (concat (codeql--tramp-wrap codeql--database-source-archive-root)
+                                     (codeql--result-node-filename node)))
                             (codeql--result-node-line node)
                             (codeql--result-node-column node)))
-              (desc (codeql--result-node-label node)))
+              (desc (codeql--printable-label (or custom-description
+                                                 (codeql--result-node-label node)))))
           (format "[[%s][%s]]" (org-link-escape link)
-                  (codeql--escape-org-description (or custom-description desc)))))
+                  (codeql--escape-org-description desc))))
     ;; not visitable, just return the label
-    (format "%s" (codeql--result-node-label node))))
+    (codeql--escape-org-description
+     (codeql--printable-label (codeql--result-node-label node)))))
 
 (defun codeql--org-list-from-nodes (parent-buffer nodes &optional header)
   "Turn a given list of PARENT-BUFFER context location NODES into an org-list.
@@ -2521,37 +2550,40 @@ Our implementation simply returns the thing at point as a candidate."
           (setq buffer-read-only t))
         (switch-to-buffer-other-window value)))))
 
-(defun codeql--org-open-file-link (filename)
-  (cl-multiple-value-bind (filename line-column) (split-string filename "::")
-    (cl-multiple-value-bind (line column) (split-string line-column ":")
+(defun codeql--org-open-file-link (link)
+  (let* ((parsed (string-match "\\`\\(.*\\)::\\([0-9]+\\):\\([0-9]+\\)\\'" link))
+         (filename (codeql--decode-link-path
+                    (if parsed (match-string 1 link) (car (split-string link "::")))))
+         (line (when parsed (match-string 2 link)))
+         (column (when parsed (match-string 3 link))))
 
-      ;; XXX: hrmmm ... we probably want to force unique file visits
-      ;; XXX: since we don't want to use a cross-query state when there
-      ;; XXX: concurrent query buffers operating on the same database
-      ;; XXX: although this re-associates to the correct query buffer
-      ;; XXX: pending which results are being navigated, so this is
-      ;; XXX: probably ok in practice
+    ;; XXX: hrmmm ... we probably want to force unique file visits
+    ;; XXX: since we don't want to use a cross-query state when there
+    ;; XXX: concurrent query buffers operating on the same database
+    ;; XXX: although this re-associates to the correct query buffer
+    ;; XXX: pending which results are being navigated, so this is
+    ;; XXX: probably ok in practice
 
-      (let ((query-buffer codeql--org-query-buffer))
-        (when-let ((src-buffer (codeql--find-file-other-window filename)))
-          (with-current-buffer src-buffer
-            ;; this will be nil for org history, which means we lose any
-            ;; dynamic xref capabilities and things of that nature ...
-            ;; we could restore the state for the org-file on find-file
-            ;; but that's making the assumption that the active database
-            ;; is still related to the query history I suppose?
-            (unless query-buffer
-              (message "No active query buffer for these results, opened from history?"))
-            (setq codeql--org-query-buffer query-buffer)
-            (widen)
-            ;; codeql is 1 based, eglot calcs are 0 based, adjust accordingly
-            (when (and column line)
-              (goto-char (codeql--eglot--lsp-position-to-point
-                          `(;; align
-                            :line ,(1- (string-to-number line))
-                            :character ,(1- (string-to-number column))))))
-            ;; enable our xref backend, this kicks in templated queries for refs and defs
-            (codeql-xref-backend)))))))
+    (let ((query-buffer codeql--org-query-buffer))
+      (when-let ((src-buffer (codeql--find-file-other-window filename)))
+        (with-current-buffer src-buffer
+          ;; this will be nil for org history, which means we lose any
+          ;; dynamic xref capabilities and things of that nature ...
+          ;; we could restore the state for the org-file on find-file
+          ;; but that's making the assumption that the active database
+          ;; is still related to the query history I suppose?
+          (unless query-buffer
+            (message "No active query buffer for these results, opened from history?"))
+          (setq codeql--org-query-buffer query-buffer)
+          (widen)
+          ;; codeql is 1 based, eglot calcs are 0 based, adjust accordingly
+          (when (and column line)
+            (goto-char (codeql--eglot--lsp-position-to-point
+                        `(;; align
+                          :line ,(1- (string-to-number line))
+                          :character ,(1- (string-to-number column))))))
+          ;; enable our xref backend, this kicks in templated queries for refs and defs
+          (codeql-xref-backend))))))
 
 (org-link-set-parameters "codeql" :follow #'codeql--org-open-file-link)
 
