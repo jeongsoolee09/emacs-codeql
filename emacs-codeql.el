@@ -517,8 +517,9 @@ Leave nil for default.")
       (let ((remote-path
              (string-trim-right
               (or (executable-find "codeql" t)
-                  (read-file-name "Need remote path to codeql cli bin: "
-                                  nil default-directory t)))))
+                  (expand-file-name
+                   (read-file-name "Need remote path to codeql cli bin: "
+                                   nil default-directory t))))))
         (message "Setting remote codeql cli path: %s" remote-path)
         (setq codeql--cli-buffer-local (list (codeql--tramp-unwrap remote-path))))))
 
