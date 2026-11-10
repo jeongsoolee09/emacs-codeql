@@ -222,6 +222,14 @@ The `e` (quick eval) transient command, `codeql-query-server-quick-eval`, always
 
 Results are rendered through `org-mode` buffers, which allows you to save results as normal text files and even read them in other editors. This approach also allows you to turn a result buffer into a living audit document, take notes, and do all the things that `org-mode` allows you to do.
 
+Results buffers use `codeql-results-mode`, a major mode derived from `org-mode`. Everything from `org-mode` keeps working, including `org-mode-hook` and the bindings in `org-mode-map`, while `codeql-results-mode-hook` and `codeql-results-mode-map` let you customize results buffers without touching other org files. Results saved by the query history (`*.bqrs.org` files) open in `codeql-results-mode` as well. For example:
+
+```elisp
+(with-eval-after-load 'emacs-codeql
+  (define-key codeql-results-mode-map (kbd "C-c C-g") #'codeql-results-goto-location)
+  (define-key codeql-results-mode-map (kbd "C-c C-d") #'codeql-results-diagnostics-mode))
+```
+
 The following query "kinds" are supported: `path-problem`, `problem`, and raw tuple results.
 
 kind: `problem` and `path-problem` are rendered as org trees, raw tuple results are rendered as org tables.
@@ -248,7 +256,7 @@ Each query run writes a structured evaluator log next to its results (set `codeq
 
 #### Jumping to result locations
 
-`codeql-results-goto-location` offers every source location in the current results buffer (or page of results) for completion, each with the text of the result it belongs to, and visits the chosen one like following its link. Bind it in `org-mode-map`, or call it with `M-x`.
+`codeql-results-goto-location` offers every source location in the current results buffer (or page of results) for completion, each with the text of the result it belongs to, and visits the chosen one like following its link. Bind it in `codeql-results-mode-map`, or call it with `M-x`.
 
 There are no extra dependencies, but when [consult](https://github.com/minad/consult) is installed the locations are grouped by file and previewed as you move between them. When [embark](https://github.com/oantolin/embark) is loaded, `codeql:` links at point and the completion candidates are `codeql-location` targets, with the actions in `codeql-location-map`: `o` (or `RET`) visits the location, and `w` copies it as `FILE:LINE:COLUMN`.
 
