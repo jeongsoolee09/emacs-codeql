@@ -228,17 +228,23 @@ Otherwise hidden features such as max path depths for path queries are unobtrusi
 
 ### Paginated raw results
 
-Raw (table) result sets with more tuples than `codeql-max-raw-results` (default: 200) are rendered one page at a time, using the pagination support of `codeql bqrs info --paginate-rows` and `codeql bqrs decode --rows --start-at`. Paginated results buffers enable `codeql-results-pagination-mode`, which shows the current page in the header line and provides the following bindings:
+Raw (table) result sets with more tuples than `codeql-max-raw-results` (default: 200) are rendered one page at a time, using the pagination support of `codeql bqrs info --paginate-rows` and `codeql bqrs decode --rows --start-at`. Raw results buffers enable `codeql-results-pagination-mode`, which shows the current result set, sort order and page in the header line and provides the following bindings:
 
-| Binding   | Command                       |
-|-----------|-------------------------------|
-| `C-c C-n` | `codeql-results-next-page`     |
-| `C-c C-p` | `codeql-results-previous-page` |
-| `C-c C-j` | `codeql-results-goto-page`     |
-| `C-c <`   | `codeql-results-first-page`    |
-| `C-c >`   | `codeql-results-last-page`     |
+| Binding   | Command                            |
+|-----------|------------------------------------|
+| `C-c C-n` | `codeql-results-next-page`          |
+| `C-c C-p` | `codeql-results-previous-page`      |
+| `C-c C-j` | `codeql-results-goto-page`          |
+| `C-c <`   | `codeql-results-first-page`         |
+| `C-c >`   | `codeql-results-last-page`          |
+| `C-c C-s` | `codeql-results-sort`               |
+| `C-c C-r` | `codeql-results-select-result-set`  |
 
-Loading a page that isn't cached requires the query buffer that produced the results to still be live. Paginated results are re-rendered from the BQRS file when loaded from query history.
+`codeql-results-sort` sorts the whole result set by a column, in ascending or descending order, or restores the original order. Sorting is done by `codeql bqrs decode --sort-key --sort-direction`, which writes a sorted copy of the result set next to the BQRS file that is reused when sorting by the same column again.
+
+Queries can produce more than one result set, e.g. through `query predicate` declarations. The `#select` result set is shown by default, and `codeql-results-select-result-set` switches to another one.
+
+Loading a page that isn't cached requires the query buffer that produced the results to still be live. Paginated results, and results with more than one result set, are re-rendered from the BQRS file when loaded from query history.
 
 Recently visited pages are cached per results buffer, so going back to them is near instant. The number of cached pages is controlled by `codeql-results-page-cache-size` (default: 50, set to 0 to disable).
 
