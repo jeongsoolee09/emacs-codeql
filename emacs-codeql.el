@@ -3187,7 +3187,17 @@ See `codeql-highlight-visited-location'."
   (when (< beg end)
     (pcase codeql-highlight-visited-location
       ('pulse
-       (pulse-momentary-highlight-region beg end))
+       ;; a freshly visited file may not have been displayed yet, and the
+       ;; pulse could fade out before its window is first drawn
+       (let ((beg (copy-marker beg)) (end (copy-marker end)))
+         (run-with-idle-timer
+          0 nil
+          (lambda ()
+            (when (buffer-live-p (marker-buffer beg))
+              (with-current-buffer (marker-buffer beg)
+                (pulse-momentary-highlight-region beg end)))
+            (set-marker beg nil)
+            (set-marker end nil)))))
       ('region
        (push-mark end t t)
        (goto-char beg)))))
