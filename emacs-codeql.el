@@ -3241,6 +3241,239 @@ See `codeql-highlight-visited-location'."
 
 (org-link-set-parameters "codeql" :follow #'codeql--org-open-file-link)
 
+;;; Jumping to result locations, with optional consult and embark support
+
+(declare-function consult--read "ext:consult")
+(declare-function consult--temporary-files "ext:consult")
+(declare-function consult--jump-preview "ext:consult")
+(declare-function consult--lookup-member "ext:consult")
+(defvar embark-target-finders)
+(defvar embark-keymap-alist)
+
+(defconst codeql--org-link-regexp
+  "\\[\\[codeql:\\([^]]+\\)\\]\\(?:\\[\\([^]]*\\)\\]\\)?\\]"
+  "Regexp matching a codeql: org link, with its path and description as groups.")
+
+(defun codeql--location-line-context (line)
+  "Return the text of a results buffer LINE, with links as their descriptions."
+  (let ((text (replace-regexp-in-string
+               codeql--org-link-regexp
+               (lambda (link)
+                 (or (match-string 2 link) ""))
+               line t t)))
+    (setq text (replace-regexp-in-string "\u200b" "" text t t))
+    (setq text (replace-regexp-in-string "\\`\\*+ +\\|\\`[ \t]*\\(?:[-+]\\|[0-9]+[.)]\\) +" "" text))
+    (setq text (replace-regexp-in-string "[ \t]*|[ \t|]*" "  " text))
+    (string-trim (replace-regexp-in-string "[ \t]\\{3,\\}" "  " text))))
+
+(defun codeql--results-location-candidates ()
+  "Return a completion candidate for each codeql: link in the current buffer.
+
+A candidate looks like FILE:LINE:COLUMN followed by the text of the line
+the link is on, and by the description of the link when the line has more
+than one.  FILE is relative to the directory that all locations share.  A
+candidate has the `codeql-link' and `codeql-results-buffer' properties,
+and `codeql-file' holding the length of its FILE part."
+  (let ((buffer (current-buffer))
+        (seen (make-hash-table :test #'equal))
+        links candidates)
+    (save-excursion
+      (save-restriction
+        (widen)
+        (goto-char (point-min))
+        (while (re-search-forward codeql--org-link-regexp nil t)
+          (let ((link (match-string-no-properties 1))
+                (description (match-string-no-properties 2))
+                (line (buffer-substring-no-properties (line-beginning-position)
+                                                      (line-end-position))))
+            (push (list link description line
+                        (car (codeql--parse-link-location link)))
+                  links)))))
+    (setq links (seq-remove (lambda (link) (directory-name-p (nth 3 link)))
+                            (nreverse links)))
+    (let* ((files (delete-dups (mapcar (lambda (link) (nth 3 link)) links)))
+           (prefix (if (cdr files)
+                       (file-name-directory (try-completion "" files))
+                     (and files (file-name-directory (car files))))))
+      (pcase-dolist (`(,link ,description ,line ,filename) links)
+        (pcase-let* ((`(,_ ,line-number ,column) (codeql--parse-link-location link))
+                     (file (if (and prefix (string-prefix-p prefix filename))
+                               (substring filename (length prefix))
+                             filename))
+                     (context (codeql--location-line-context line))
+                     (several (> (length (split-string line "\\[\\[codeql:")) 2))
+                     (cand (format "%s:%s:%s  %s%s"
+                                   file (or line-number 0) (or column 0)
+                                   (if (and several description)
+                                       (concat (replace-regexp-in-string
+                                                "\u200b" "" description t t)
+                                               ": ")
+                                     "")
+                                   context)))
+          (unless (gethash cand seen)
+            (puthash cand t seen)
+            (add-text-properties 0 (length cand)
+                                 `(codeql-link ,link
+                                   codeql-results-buffer ,buffer
+                                   codeql-file ,(length file))
+                                 cand)
+            (when (facep 'consult-file)
+              (add-face-text-property 0 (length file) 'consult-file nil cand))
+            (push cand candidates)))))
+    (nreverse candidates)))
+
+(defvar codeql--location-candidates (make-hash-table :test #'equal)
+  "The candidates of the last `codeql-results-goto-location', by their text.
+
+Completion UIs and embark don't always keep the text properties of a
+candidate, so its location is looked up here as well.")
+
+(defun codeql--location-candidate-link (cand)
+  "Return the codeql: link path and results buffer of the location CAND.
+
+CAND is a candidate of `codeql-results-goto-location', or a codeql: org link."
+  (cond ((and (stringp cand) (get-text-property 0 'codeql-link cand))
+         (cons (get-text-property 0 'codeql-link cand)
+               (get-text-property 0 'codeql-results-buffer cand)))
+        ((and (stringp cand) (gethash (substring-no-properties cand) codeql--location-candidates)))
+        ((and (stringp cand) (string-match "\\`\\(?:\\[\\[\\)?codeql:\\([^]]+\\)" cand))
+         (cons (match-string 1 cand) (current-buffer)))))
+
+(defun codeql--location-preview-position (cand open)
+  "Return the consult preview position of the location CAND.
+
+The file of CAND is opened with OPEN.  The position is a marker, along
+with the span of the location on its first line."
+  (when-let* ((location (car (codeql--location-candidate-link cand))))
+    (pcase-let ((`(,filename ,line ,column ,end-line ,end-column)
+                 (codeql--parse-link-location location)))
+      (when-let* (((file-exists-p filename))
+                  (buffer (funcall open filename)))
+        (with-current-buffer buffer
+          (save-restriction
+            (widen)
+            (if (not (and line column (> line 0)))
+                (cons (copy-marker (point-min)) nil)
+              (let* ((start (codeql--eglot--lsp-position-to-point
+                             `(:line ,(1- line) :character ,(1- column))))
+                     (end (if (and end-line end-column)
+                              (codeql--eglot--lsp-position-to-point
+                               `(:line ,(1- end-line) :character ,end-column))
+                            start))
+                     (end (min end (save-excursion (goto-char start) (line-end-position)))))
+                (cons (copy-marker start)
+                      (when (< start end)
+                        (list (cons 0 (- end start)))))))))))))
+
+(defun codeql--location-consult-state ()
+  "Return a consult state function that previews the location candidates."
+  (let ((open (consult--temporary-files))
+        (preview (consult--jump-preview)))
+    (lambda (action cand)
+      (unless cand
+        (funcall open))
+      (funcall preview action
+               (and cand (eq action 'preview)
+                    (codeql--location-preview-position cand open))))))
+
+(defun codeql--location-group (cand transform)
+  "Return the file of the location CAND, or CAND without it if TRANSFORM.
+
+This groups the candidates of `codeql-results-goto-location' by file."
+  (let ((file-length (or (get-text-property 0 'codeql-file cand)
+                         (string-match-p ":[0-9]+:[0-9]+  " cand)
+                         0)))
+    (if transform
+        (substring cand (min (length cand) (1+ file-length)))
+      (substring cand 0 file-length))))
+
+(defun codeql-location-open (cand)
+  "Visit the result location CAND, like following its codeql: org link."
+  (interactive (list (codeql--read-results-location)))
+  (pcase-let ((`(,link . ,buffer) (or (codeql--location-candidate-link cand)
+                                      (user-error "Not a result location: %s" cand))))
+    (with-current-buffer (if (buffer-live-p buffer) buffer (current-buffer))
+      (codeql--org-open-file-link link))))
+
+(defun codeql-location-copy (cand)
+  "Copy the result location CAND as FILE:LINE:COLUMN to the kill ring."
+  (interactive (list (codeql--read-results-location)))
+  (pcase-let* ((`(,link . ,_) (or (codeql--location-candidate-link cand)
+                                  (user-error "Not a result location: %s" cand)))
+               (`(,filename ,line ,column) (codeql--parse-link-location link))
+               (text (if (and line (> line 0))
+                         (format "%s:%s:%s" filename line column)
+                       filename)))
+    (kill-new text)
+    (message "Copied %s" text)))
+
+(defun codeql--read-results-location ()
+  "Read one of the result locations in the current buffer."
+  (let ((candidates (or (codeql--results-location-candidates)
+                        (user-error "No result locations in this buffer"))))
+    (clrhash codeql--location-candidates)
+    (dolist (cand candidates)
+      (puthash (substring-no-properties cand)
+               (cons (get-text-property 0 'codeql-link cand)
+                     (get-text-property 0 'codeql-results-buffer cand))
+               codeql--location-candidates))
+    (if (require 'consult nil t)
+        (consult--read candidates
+                       :prompt "Go to result location: "
+                       :category 'codeql-location
+                       :require-match t
+                       :sort nil
+                       :group #'codeql--location-group
+                       :lookup #'consult--lookup-member
+                       :state (codeql--location-consult-state))
+      (let ((cand (completing-read
+                   "Go to result location: "
+                   (lambda (string predicate action)
+                     (if (eq action 'metadata)
+                         '(metadata (category . codeql-location)
+                                    (display-sort-function . identity))
+                       (complete-with-action action candidates string predicate)))
+                   nil t)))
+        (or (seq-find (lambda (candidate) (string= candidate cand)) candidates)
+            cand)))))
+
+(defun codeql-results-goto-location ()
+  "Go to one of the result locations in the current results buffer.
+
+The locations are offered for completion along with the text they appear
+in.  With consult installed, they are grouped by file and previewed as
+you move between them.  The chosen location is visited like following
+its codeql: org link."
+  (interactive)
+  (codeql-location-open (codeql--read-results-location)))
+
+(defun codeql-embark-target-location ()
+  "Return the codeql: org link at point as an embark target."
+  (when (and (derived-mode-p 'org-mode) (not (use-region-p)))
+    (let ((pos (point)))
+      (save-excursion
+        (beginning-of-line)
+        (catch 'found
+          (while (re-search-forward codeql--org-link-regexp (line-end-position) t)
+            (when (and (<= (match-beginning 0) pos) (< pos (match-end 0)))
+              (throw 'found
+                     `(codeql-location
+                       ,(concat "codeql:" (match-string-no-properties 1))
+                       ,(match-beginning 0) . ,(match-end 0)))))
+          nil)))))
+
+(defvar codeql-location-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'codeql-location-open)
+    (define-key map (kbd "o") #'codeql-location-open)
+    (define-key map (kbd "w") #'codeql-location-copy)
+    map)
+  "Embark actions for CodeQL result locations.")
+
+(with-eval-after-load 'embark
+  (add-to-list 'embark-target-finders #'codeql-embark-target-location)
+  (add-to-list 'embark-keymap-alist '(codeql-location . codeql-location-map)))
+
 ;;; Flymake diagnostics for the locations in a results buffer
 
 (defvar codeql-results-diagnostics-mode)

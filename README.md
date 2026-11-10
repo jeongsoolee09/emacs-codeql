@@ -12,6 +12,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Query history for the local session
 - Database history for the global session
 - Result browsing
+- Jumping to result locations with completion, with optional [consult](https://github.com/minad/consult) preview and [embark](https://github.com/oantolin/embark) actions
 - Source archive location opening
 - Buffer local query server state with concurrent remote|local project, database and query support
 - Automatic database selection deconfliction
@@ -210,6 +211,12 @@ Visiting a location briefly flashes the code it spans. Set `codeql-highlight-vis
 Locations that span a whole file open that file at the top, and locations without a source file are shown as plain text.
 
 `emacs-codeql` will resolve file paths into the project snapshot source code archive included with the database archive.
+
+#### Jumping to result locations
+
+`codeql-results-goto-location` offers every source location in the current results buffer (or page of results) for completion, each with the text of the result it belongs to, and visits the chosen one like following its link. Bind it in `org-mode-map`, or call it with `M-x`.
+
+There are no extra dependencies, but when [consult](https://github.com/minad/consult) is installed the locations are grouped by file and previewed as you move between them. When [embark](https://github.com/oantolin/embark) is loaded, `codeql:` links at point and the completion candidates are `codeql-location` targets, with the actions in `codeql-location-map`: `o` (or `RET`) visits the location, and `w` copies it as `FILE:LINE:COLUMN`.
 
 ### Database source archive Xref support
 
