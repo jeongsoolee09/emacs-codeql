@@ -226,7 +226,7 @@ This interface is self-documenting and allows you to start/stop query servers, s
 
 Otherwise hidden features such as max path depths for path queries are unobtrusively surfaced to the user.
 
-### Paginated raw results
+### Paginated results
 
 Raw (table) result sets with more tuples than `codeql-max-raw-results` (default: 200) are rendered one page at a time, using the pagination support of `codeql bqrs info --paginate-rows` and `codeql bqrs decode --rows --start-at`. Raw results buffers enable `codeql-results-pagination-mode`, which shows the current result set, sort order and page in the header line and provides the following bindings:
 
@@ -243,6 +243,8 @@ Raw (table) result sets with more tuples than `codeql-max-raw-results` (default:
 `codeql-results-sort` sorts the whole result set by a column, in ascending or descending order, or restores the original order. Sorting is done by `codeql bqrs decode --sort-key --sort-direction`, which writes a sorted copy of the result set next to the BQRS file that is reused when sorting by the same column again.
 
 Queries can produce more than one result set, e.g. through `query predicate` declarations. The `#select` result set is shown by default, and `codeql-results-select-result-set` switches to another one.
+
+Problem and path-problem queries are paginated as well: when they produce more alerts than `codeql-max-sarif-results` (default: 100), the interpreted SARIF results of all runs are kept in the results buffer and rendered `codeql-max-sarif-results` alerts at a time. The page commands above work the same way; sorting and result set selection are only available for raw results.
 
 Loading a page that isn't cached requires the query buffer that produced the results to still be live. Paginated results, and results with more than one result set, are re-rendered from the BQRS file when loaded from query history.
 

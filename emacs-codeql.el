@@ -216,11 +216,20 @@ page holding at most this many tuples.  See `codeql-results-pagination-mode'."
   :type 'integer
   :group 'emacs-codeql)
 
-(defcustom codeql-results-page-cache-size 50
-  "The max amount of rendered raw result pages to keep per results buffer.
+(defcustom codeql-max-sarif-results 100
+  "The max amount of problem or path-problem results to render at once.
 
-Revisiting a cached page skips decoding and org-table rendering.  Each cached
-page holds up to `codeql-max-raw-results' rendered rows.  Set to 0 to disable
+Queries that report more results than this are paginated, with each page
+holding at most this many results.  See `codeql-results-pagination-mode'."
+  :type 'integer
+  :group 'emacs-codeql)
+
+(defcustom codeql-results-page-cache-size 50
+  "The max amount of rendered result pages to keep per results buffer.
+
+Revisiting a cached page skips decoding and org rendering.  Each cached page
+holds up to `codeql-max-raw-results' rendered rows, or
+`codeql-max-sarif-results' rendered problem results.  Set to 0 to disable
 caching."
   :type 'integer
   :group 'emacs-codeql)
@@ -1658,7 +1667,8 @@ Sets an optional HEADER."
   "Turn QUERY-RESULTS of RESULTS-TYPE into an org data."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (let ((parent-buffer (current-buffer))
-        (codeql--source-link-prefix-box (list nil)))
+        ;; reuse the cache of an enclosing rendering pass, if any
+        (codeql--source-link-prefix-box (or codeql--source-link-prefix-box (list nil))))
     (with-temp-buffer
       (goto-char (point-min))
       (pcase results-type
@@ -1765,12 +1775,20 @@ columns of tables aligned by character width."
       (buffer-string))))
 
 (defvar-local codeql--raw-results-pagination nil
-  "Pagination state of a raw results buffer.
+  "Pagination state of a results buffer.
 
-A plist with the keys :bqrs-path, :result-set, :offsets, :page, :page-size,
-:total-rows and :footer.  :offsets is the vector of page byte offsets as
-computed by `codeql bqrs info --paginate-rows', and :page is the 0-based
-current page.")
+A plist whose :kind is either `raw' for result set tables, or `sarif' for
+problem and path-problem results.  Both kinds have the keys :page, the
+0-based current page, :page-size, :total-rows and :footer.
+
+Raw results also have :source-bqrs-path, the bqrs the query produced, and
+:bqrs-path, the bqrs pages are decoded from, which is a sorted copy when
+:sort is a (COLUMN . DIRECTION) pair.  :result-sets holds the alists of
+all result sets as reported by `codeql bqrs info', :result-set the name of
+the shown one, and :offsets the vector of page byte offsets as computed by
+`codeql bqrs info --paginate-rows', or nil for a single page.
+
+SARIF results have :results, the vector of all parsed SARIF results.")
 
 (defvar-local codeql--raw-results-page-cache nil
   "Rendered org data of recently visited pages, as (PAGE . ORG-DATA) entries.
@@ -1832,7 +1850,37 @@ Prefers #select, otherwise the first result set that holds any rows."
 
 (defun codeql--raw-results-pages (pagination)
   "Return the number of pages described by PAGINATION."
-  (max 1 (length (plist-get pagination :offsets))))
+  (if-let ((offsets (plist-get pagination :offsets)))
+      (max 1 (length offsets))
+    (max 1 (ceiling (or (plist-get pagination :total-rows) 0)
+                    (max 1 (or (plist-get pagination :page-size) 1))))))
+
+(defun codeql--sarif-results-p (pagination)
+  "Return non-nil if PAGINATION describes problem or path-problem results."
+  (eq (plist-get pagination :kind) 'sarif))
+
+(defun codeql--sarif-results-to-org (results start end)
+  "Return org data for the SARIF RESULTS vector from index START below END."
+  (let ((codeql--source-link-prefix-box (list nil))
+        (n (length results)))
+    (mapconcat
+     #'identity
+     (cl-loop for i from start below (min end n)
+              for result = (aref results i)
+              for code-flows = (json-pointer-get result "/codeFlows")
+              do (when (zerop (% (- i start) 50))
+                   (message "Rendering SARIF results ... %s/%s" (1+ i) n))
+              collect
+              (codeql--query-results-to-org
+               (list (codeql--issue-with-nodes
+                      code-flows
+                      (json-pointer-get result "/locations")
+                      (json-pointer-get result "/relatedLocations")
+                      (json-pointer-get result "/message/text")
+                      (json-pointer-get result "/ruleId")))
+               (if code-flows 'path-problem 'problem)
+               nil))
+     "")))
 
 (defun codeql--raw-results-cache-get (page)
   "Return cached org data for PAGE in the current results buffer, or nil.
@@ -1880,17 +1928,21 @@ A hit marks PAGE as most recently used."
          (first-row (car rows))
          (last-row (cdr rows)))
     (concat (or (plist-get pagination :footer) "")
-            (format
-             (mapconcat
-              #'identity
-              '("#+RESULT_SET: %s"
-                "#+RESULTS_SORT: %s"
-                "#+RESULTS_PAGE: %d/%d"
-                "#+RESULTS_ROWS: %d-%d of %d" "") "\n")
-             (plist-get pagination :result-set)
-             (codeql--raw-results-sort-description pagination)
-             (1+ page) (codeql--raw-results-pages pagination)
-             first-row last-row total-rows))))
+            (if (codeql--sarif-results-p pagination)
+                (format "#+RESULTS_PAGE: %d/%d\n#+RESULTS_ALERTS: %d-%d of %d\n"
+                        (1+ page) (codeql--raw-results-pages pagination)
+                        first-row last-row total-rows)
+              (format
+               (mapconcat
+                #'identity
+                '("#+RESULT_SET: %s"
+                  "#+RESULTS_SORT: %s"
+                  "#+RESULTS_PAGE: %d/%d"
+                  "#+RESULTS_ROWS: %d-%d of %d" "") "\n")
+               (plist-get pagination :result-set)
+               (codeql--raw-results-sort-description pagination)
+               (1+ page) (codeql--raw-results-pages pagination)
+               first-row last-row total-rows)))))
 
 (defun codeql--raw-results-header-line ()
   "Return a header line describing the current results page."
@@ -1903,17 +1955,25 @@ A hit marks PAGE as most recently used."
                     (format "\\<codeql-results-pagination-mode-map>\\[%s]" command))))
             ;; the header line is a mode line construct, so escape any %
             (text (lambda (s) (replace-regexp-in-string "%" "%%" s t t))))
-        (format " %s, %s: page %d/%d (rows %d-%d of %d)   %s next, %s previous, %s jump, %s sort, %s result set"
-                (funcall text (plist-get pagination :result-set))
-                (funcall text (codeql--raw-results-sort-description pagination))
-                (1+ page) (codeql--raw-results-pages pagination)
-                (car rows) (cdr rows)
-                (plist-get pagination :total-rows)
-                (funcall key 'codeql-results-next-page)
-                (funcall key 'codeql-results-previous-page)
-                (funcall key 'codeql-results-goto-page)
-                (funcall key 'codeql-results-sort)
-                (funcall key 'codeql-results-select-result-set))))))
+        (if (codeql--sarif-results-p pagination)
+            (format " Alerts page %d/%d (results %d-%d of %d)   %s next, %s previous, %s jump"
+                    (1+ page) (codeql--raw-results-pages pagination)
+                    (car rows) (cdr rows)
+                    (plist-get pagination :total-rows)
+                    (funcall key 'codeql-results-next-page)
+                    (funcall key 'codeql-results-previous-page)
+                    (funcall key 'codeql-results-goto-page))
+          (format " %s, %s: page %d/%d (rows %d-%d of %d)   %s next, %s previous, %s jump, %s sort, %s result set"
+                  (funcall text (plist-get pagination :result-set))
+                  (funcall text (codeql--raw-results-sort-description pagination))
+                  (1+ page) (codeql--raw-results-pages pagination)
+                  (car rows) (cdr rows)
+                  (plist-get pagination :total-rows)
+                  (funcall key 'codeql-results-next-page)
+                  (funcall key 'codeql-results-previous-page)
+                  (funcall key 'codeql-results-goto-page)
+                  (funcall key 'codeql-results-sort)
+                  (funcall key 'codeql-results-select-result-set)))))))
 
 (defun codeql--raw-tuples-to-query-results (tuples)
   "Transform raw result TUPLES into a list of result node rows."
@@ -2028,7 +2088,8 @@ and the org data of its first page, or nil when there is nothing to show."
     (when (> total-rows 0)
       (when-let ((org-data (codeql--raw-results-page-to-org
                             decode-path name offsets 0 page-size)))
-        (cons (list :source-bqrs-path bqrs-path
+        (cons (list :kind 'raw
+                    :source-bqrs-path bqrs-path
                     :bqrs-path decode-path
                     :result-sets result-sets
                     :result-set name
@@ -2056,12 +2117,17 @@ and the org data of its first page, or nil when there is nothing to show."
                    (user-error "The query buffer for these results is no longer live"))
                  (message "Loading results page %d/%d ..." (1+ page) pages)
                  (with-current-buffer query-buffer
-                   (codeql--raw-results-page-to-org
-                    (plist-get pagination :bqrs-path)
-                    (plist-get pagination :result-set)
-                    (plist-get pagination :offsets)
-                    page
-                    (plist-get pagination :page-size)))))))
+                   (if (codeql--sarif-results-p pagination)
+                       (let ((page-size (plist-get pagination :page-size)))
+                         (codeql--sarif-results-to-org
+                          (plist-get pagination :results)
+                          (* page page-size) (* (1+ page) page-size)))
+                     (codeql--raw-results-page-to-org
+                      (plist-get pagination :bqrs-path)
+                      (plist-get pagination :result-set)
+                      (plist-get pagination :offsets)
+                      page
+                      (plist-get pagination :page-size))))))))
       (unless org-data
         (user-error "Failed to load results page %d" (1+ page)))
       (codeql--raw-results-cache-put page org-data)
@@ -2109,9 +2175,12 @@ and the org data of its first page, or nil when there is nothing to show."
   (codeql--raw-results-show-page (1- page)))
 
 (defun codeql--raw-results-state ()
-  "Return the results state of the current buffer, or signal a user error."
-  (or codeql--raw-results-pagination
-      (user-error "Not a CodeQL raw results buffer")))
+  "Return the raw results state of the current buffer, or signal a user error."
+  (let ((state (or codeql--raw-results-pagination
+                   (user-error "Not a CodeQL raw results buffer"))))
+    (when (codeql--sarif-results-p state)
+      (user-error "Problem results can't be sorted or switched to another result set"))
+    state))
 
 (defun codeql--raw-results-column-names (result-set)
   "Return display names for the columns of the RESULT-SET alist."
@@ -3213,54 +3282,43 @@ Our implementation simply returns the thing at point as a candidate."
               query-id))
         (when-let ((json (json-parse-string (codeql--bqrs-to-sarif bqrs-path query-id query-kind)
                                             :object-type 'alist)))
-          ;; render any available runs
-          (cl-loop
-           with runs = (json-pointer-get json "/runs")
-           ;; runs is a vector
-           for run across runs
-           for run-id below (length runs)
-           for results = (json-pointer-get run "/results")
-           for artifacts = (json-pointer-get run "/artifacts")
-           do (message "Rendering results for run %s" run-id)
-           ;; check if we have any artifact contents, TODO: do something with 'm?
-           (cl-loop for artifact across artifacts
-                    for contents = (json-pointer-get artifact "/contents")
-                    when contents
-                    do
-                    (message "Found artifact contents.")
-                    (cl-return t))
-           ;; alrighty, let's start processing some results into org data
-           (if-let ((org-results
-                     (cl-loop for result across results
-                              with n = (length results)
-                              for i below n
-                              for message = (json-pointer-get result "/message/text")
-                              for rule-id = (json-pointer-get result "/ruleId")
-                              for code-flows = (json-pointer-get result "/codeFlows")
-                              for related-locations = (json-pointer-get result "/relatedLocations")
-                              for locations = (json-pointer-get result "/locations")
-                              do (message "Rendering SARIF results ... %s/%s" (1+ i) n)
-                              collect
-                              ;; each result gets collected as its resulting org-data
-                              (let* ((codeql--query-results (list (codeql--issue-with-nodes
-                                                                   code-flows
-                                                                   locations
-                                                                   related-locations
-                                                                   message
-                                                                   rule-id)))
-                                     (kind (if code-flows 'path-problem 'problem)))
-                                (codeql--query-results-to-org codeql--query-results kind nil)))))
-               ;; save off our results so we don't have to re-render for history
-               (with-temp-buffer
-                 (cl-loop for org-data in org-results do (insert org-data))
-                 (let ((rendered
-                        (codeql--org-render-sarif-results
-                         (buffer-string) query-buffer
-                         footer (file-name-nondirectory query-path))))
-                   ;; save off the fully rendered version for speedy re-loads
-                   (with-temp-file (format "%s.org" bqrs-path)
-                     (insert rendered))))
-             (message "No results found.")))))
+          ;; results of all runs are shown together, one page of
+          ;; `codeql-max-sarif-results' results at a time
+          (let* ((runs (json-pointer-get json "/runs"))
+                 (results
+                  (apply #'vconcat
+                         (cl-loop for run across runs
+                                  for run-id below (length runs)
+                                  do (message "Rendering results for run %s" run-id)
+                                  ;; check if we have any artifact contents, TODO: do something with 'm?
+                                  (cl-loop for artifact across (json-pointer-get run "/artifacts")
+                                           when (json-pointer-get artifact "/contents")
+                                           do (message "Found artifact contents.")
+                                           (cl-return t))
+                                  collect (or (json-pointer-get run "/results") []))))
+                 (total (length results))
+                 (page-size (max 1 codeql-max-sarif-results)))
+            (if (zerop total)
+                (message "No results found.")
+              (let* ((org-data (codeql--sarif-results-to-org results 0 page-size))
+                     (marker (file-name-nondirectory query-path)))
+                (if (<= total page-size)
+                    (let ((rendered (codeql--org-render-sarif-results
+                                     org-data query-buffer footer marker)))
+                      ;; save off the fully rendered version for speedy re-loads
+                      (with-temp-file (format "%s.org" bqrs-path)
+                        (insert rendered)))
+                  (codeql--org-render-raw-query-results
+                   org-data query-buffer footer marker
+                   (list :kind 'sarif
+                         :results results
+                         :page 0
+                         :page-size page-size
+                         :total-rows total
+                         :footer footer))
+                  ;; paginated results are re-rendered from the bqrs on reload
+                  (when (file-exists-p (format "%s.org" bqrs-path))
+                    (delete-file (format "%s.org" bqrs-path)))))))))
        ;; fall through to raw results parsing
        (t
         ;; raw results are decoded one page of `codeql-max-raw-results' rows at a
