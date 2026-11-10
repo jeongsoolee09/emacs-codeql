@@ -4013,6 +4013,40 @@ See also `codeql-results-diagnostics'."
   ;; we need to get at the request id, so we use our own wrapper
   (apply #'jsonrpc--async-request-1 connection method params args))
 
+(defun codeql--run-kind-label (quick-eval)
+  "Describe a query run with QUICK-EVAL, see `codeql--query-target'."
+  (pcase quick-eval
+    ('nil "full-query")
+    ('count "quick-eval count")
+    (_ "quick-eval")))
+
+(defun codeql--query-target (query-path quick-eval)
+  "Return the query server target for running QUERY-PATH.
+
+When QUICK-EVAL is nil the whole query runs.  Otherwise the active
+region, or point when there is none, is quick evaluated: the query
+server evaluates the predicate or expression found there.  When
+QUICK-EVAL is `count', only the number of results is computed."
+  (if quick-eval
+      (let* ((bounds (if (use-region-p)
+                         (car (region-bounds))
+                       (cons (point) (point))))
+             (min (car bounds))
+             (max (cdr bounds)))
+        ;; positions in CodeQL are 1-based
+        `(:quickEval
+          (:quickEvalPos
+           (;; align
+            :fileName ,(codeql--tramp-unwrap query-path)
+            :line ,(line-number-at-pos min)
+            :column ,(save-excursion (goto-char min) (codeql--lsp-abiding-column))
+            :endLine ,(line-number-at-pos max)
+            :endColumn ,(save-excursion (goto-char max) (codeql--lsp-abiding-column)))
+           ,@(when (eq quick-eval 'count)
+               '(:countOnly t)))))
+    ;; any non-null value will trigger a full query run
+    `(:query (:xx ""))))
+
 (defun codeql--query-server-request-run (buffer-context
                                          qlo-path
                                          bqrs-path
@@ -4084,7 +4118,7 @@ See also `codeql-results-diagnostics'."
                                   (format "[%s] %s (%s) [%s]"
                                           timestamp
                                           (file-name-nondirectory query-path)
-                                          (if quick-eval "quick-eval" "full-query")
+                                          (codeql--run-kind-label quick-eval)
                                           (codeql-query-server-active-database))
                                   `(;; align
                                     :quick-eval ,quick-eval
@@ -4123,24 +4157,7 @@ See also `codeql-results-diagnostics'."
      ;; query-server2
      ((string= codeql-query-server "query-server2")
       (let* ((query-target
-              (if quick-eval
-                  ;; set a quick eval position if need be, otherwise run the entire query
-                  (cl-destructuring-bind (min . max) (car (region-bounds))
-                    ;; positions in CodeQL are 1-based
-                    (let ((start-line (line-number-at-pos min))
-                          (end-line (line-number-at-pos max))
-                          (start-col (save-excursion (goto-char min) (codeql--lsp-abiding-column)))
-                          (end-col (save-excursion (goto-char max) (codeql--lsp-abiding-column))))
-                      `(:quickEval
-                        (:quickEvalPos
-                         (;; align
-                          :fileName ,(codeql--tramp-unwrap query-path)
-                          :line ,start-line
-                          :column ,start-col
-                          :endLine ,end-line
-                          :endColumn ,end-col)))))
-                ;; any non-null value will trigger a full query run
-                `(:query (:xx ""))))
+              (codeql--query-target query-path quick-eval))
              (run-query-params
               `(:body
                 (;; align
@@ -4195,7 +4212,7 @@ See also `codeql-results-diagnostics'."
                                   (format "[%s] %s (%s) [%s]"
                                           timestamp
                                           (file-name-nondirectory query-path)
-                                          (if quick-eval "quick-eval" "full-query")
+                                          (codeql--run-kind-label quick-eval)
                                           (codeql-query-server-active-database))
                                   `(;; align
                                     :quick-eval ,quick-eval
@@ -4249,24 +4266,7 @@ See also `codeql-results-diagnostics'."
   (with-current-buffer buffer-context
     (let*
         ((query-target
-          (if quick-eval
-              ;; set a quick eval position if need be, otherwise run the entire query
-              (cl-destructuring-bind (min . max) (car (region-bounds))
-                ;; positions in CodeQL are 1-based
-                (let ((start-line (line-number-at-pos min))
-                      (end-line (line-number-at-pos max))
-                      (start-col (save-excursion (goto-char min) (codeql--lsp-abiding-column)))
-                      (end-col (save-excursion (goto-char max) (codeql--lsp-abiding-column))))
-                  `(:quickEval
-                    (:quickEvalPos
-                     (;; align
-                      :fileName ,(codeql--tramp-unwrap query-path)
-                      :line ,start-line
-                      :column ,start-col
-                      :endLine ,end-line
-                      :endColumn ,end-col)))))
-            ;; any non-null value will trigger a full query run
-            `(:query (:xx ""))))
+          (codeql--query-target query-path quick-eval))
          (compile-query-params
           `(:body
             (:compilationOptions
@@ -4292,7 +4292,7 @@ See also `codeql-results-diagnostics'."
       (cond
        ;; legacy query-server
        ((string= codeql-query-server "query-server")
-        (message "Compiling query (%s) ..." (if quick-eval "quick-eval" "full-query"))
+        (message "Compiling query (%s) ..." (codeql--run-kind-label quick-eval))
         (cl-multiple-value-bind (id timer)
             (codeql--jsonrpc-async-request
              (codeql--query-server-current-or-error)
@@ -4399,8 +4399,11 @@ See also `codeql-results-diagnostics'."
      src-filename
      src-buffer)))
 
-(defun codeql-query-server-run-query ()
-  "Run a query or quick eval a query region."
+(defun codeql-query-server-run-query (&optional quick-eval)
+  "Run a query or quick eval a query region.
+
+With QUICK-EVAL, quick evaluate the region or what is at point even when
+no region is active, see `codeql--query-target'."
   (interactive)
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   ;; init the query history if need be
@@ -4408,7 +4411,10 @@ See also `codeql-results-diagnostics'."
     (setq codeql--completed-query-history (make-hash-table :test #'equal)))
   (if codeql--query-server
       (let* ((query-path (buffer-file-name))
-             (quick-eval (if (use-region-p) t nil)))
+             (quick-eval (or quick-eval (if (use-region-p) t nil))))
+        (when (and (eq quick-eval 'count)
+                   (string= codeql-query-server "query-server"))
+          (user-error "Quick evaluation counts need query-server2"))
         ;; make sure we save the query before running it
         (when (or codeql--run-query-always-save
                   (and (buffer-modified-p)
@@ -4416,6 +4422,21 @@ See also `codeql-results-diagnostics'."
           (save-buffer))
         (codeql--query-server-run-query-from-path query-path quick-eval))
     (message "No query server started.")))
+
+(defun codeql-query-server-quick-eval ()
+  "Quick evaluate the active region, or the predicate or expression at point.
+
+To evaluate a predicate, put point on its name."
+  (interactive)
+  (codeql-query-server-run-query t))
+
+(defun codeql-query-server-quick-eval-count ()
+  "Count the results of quick evaluating the region or what is at point.
+
+This is faster than `codeql-query-server-quick-eval' for predicates
+with many results, as their tuples aren't decoded and rendered."
+  (interactive)
+  (codeql-query-server-run-query 'count))
 
 (defun codeql-query-history ()
   "Offer query history selection to the user."
@@ -4750,6 +4771,8 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
            ("k" "known" codeql-database-history)]
           ["Query"
            ("r" "run" codeql-query-server-run-query)
+           ("e" "quick eval" codeql-query-server-quick-eval)
+           ("n" "quick eval count" codeql-query-server-quick-eval-count)
            ("h" "history" codeql-query-history)
            ("c" "cancel" codeql-query-server-cancel-query)]
           ["Config"
