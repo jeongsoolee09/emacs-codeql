@@ -12,7 +12,8 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Query history for the local session
 - Comparing the results of two query runs
 - Query performance summaries from evaluator logs
-- Database history for the global session
+- Persistent per-project database history, with optional consult narrowing and embark actions
+- Registration of zipped database archives
 - Result browsing
 - Jumping to result locations with completion, with optional [consult](https://github.com/minad/consult) preview and [embark](https://github.com/oantolin/embark) actions
 - Source archive location opening
@@ -172,9 +173,21 @@ On Emacs 29 and above `emacs-codeql` also comes with an Emacs 29+ specific versi
 
 #### Database selection
 
-You can register a database for your current project via `M-x codeql-transient-query-server-interact` and selecting `d` to register an active database. Ensure you have started a query server first by using `s` from the same menu. If a database is active in another query buffer, it will automatically be deregistered there and registered for your current buffer. If a database has been registered in the global emacs session before, you can fetch it more rapidly via selecting `k` for known database history.
+You can register a database for your current project via `M-x codeql-transient-query-server-interact` and selecting `d` to register an active database. Ensure you have started a query server first by using `s` from the same menu. If a database is active in another query buffer, it will automatically be deregistered there and registered for your current buffer.
 
-Database selection is buffer-local per query file and you can run as many concurrent query projects as you have resources available. Database history allows you to rapidly register/unregister databases that were seen across all sessions.
+Database selection is buffer-local per query file and you can run as many concurrent query projects as you have resources available.
+
+#### Database history
+
+Every database you register is remembered per project, across Emacs sessions. The project is the version-controlled project that contains the query file, or the CodeQL pack root when the query is not under version control. Select `k` (known databases) to pick one from the history. Databases of the current project come first, most recently used on top, followed by databases used in other projects. Each candidate is annotated with its language, when it was last used, its project, and whether it no longer exists on disk.
+
+When [consult](https://github.com/minad/consult) is installed the picker uses it, and you can narrow to the current project with `p` or to other projects with `o`. With [embark](https://github.com/oantolin/embark), the candidates offer the actions in `codeql-database-map`: `r` to register, `k` to forget the database (`codeql-database-history-remove`), `d` to open it in dired, and `w` to copy its path.
+
+After a query server starts, the most recently used database of the project is registered automatically. Set `codeql-register-last-database` to `nil` to disable this.
+
+The history is stored in `database-history.eld` inside `codeql-state-dir`; customize `codeql-database-history-file` to put it elsewhere. It always lives on the local machine; entries for TRAMP databases keep their remote paths and are offered only to query buffers on the same host.
+
+You can also register a zipped database archive (`.zip`) with `d`. It is unpacked with `codeql database unbundle` into the `databases` directory of `codeql-state-dir`, and an already unpacked copy is reused.
 
 `emacs-codeql` buffer-local approach means you can work on e.g. a `cpp` and `javascript` project concurrently, and you can an arbitrary amount of concurrent results buffers as you toggle between your query buffers.
 
