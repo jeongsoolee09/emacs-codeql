@@ -3801,6 +3801,15 @@ See also `codeql-results-diagnostics'."
       (string-match-p "/printAst\\.ql$" query-path)))
 
 ;; abandon hope, all ye who enter here ...
+(defvar codeql--results-marker-suffix nil
+  "When non-nil, a description added to the names of new results buffers.")
+
+(defun codeql--results-marker (query-path)
+  "Return the marker that names the results buffer of QUERY-PATH."
+  (concat (file-name-nondirectory query-path)
+          (when codeql--results-marker-suffix
+            (format " (%s)" codeql--results-marker-suffix))))
+
 (defun codeql-load-bqrs (bqrs-path
                          query-path
                          db-path
@@ -3919,7 +3928,7 @@ See also `codeql-results-diagnostics'."
             (if (zerop total)
                 (message "No results found.")
               (let* ((org-data (codeql--sarif-results-to-org results 0 page-size))
-                     (marker (file-name-nondirectory query-path)))
+                     (marker (codeql--results-marker query-path)))
                 (if (<= total page-size)
                     (let ((rendered (codeql--org-render-sarif-results
                                      org-data query-buffer footer marker)))
@@ -3952,7 +3961,7 @@ See also `codeql-results-diagnostics'."
                    (rendered
                     (codeql--org-render-raw-query-results
                      (cdr setup) query-buffer footer
-                     (file-name-nondirectory query-path)
+                     (codeql--results-marker query-path)
                      state)))
               ;; results that can be paged, sorted or switched to other result
               ;; sets are re-rendered from the bqrs on reload so that they
@@ -4472,6 +4481,164 @@ with many results, as their tuples aren't decoded and rendered."
     ;; XXX: do we want to serialize query history state to disk?
     (message "No query history available yet in this session.")))
 
+;;; Comparing the results of two query runs
+
+(defun codeql--history-entry-label (data)
+  "Return a short label for the query history entry DATA."
+  (cl-destructuring-bind (&key query-path timestamp quick-eval &allow-other-keys) data
+    (format "%s%s@%s"
+            (file-name-nondirectory query-path)
+            (if quick-eval " quick-eval" "")
+            ;; the time of day of a `current-time-string' timestamp
+            (if (and timestamp (>= (length timestamp) 19)) (substring timestamp 11 19) "?"))))
+
+(defun codeql--history-entry-interpreted-p (data)
+  "Return non-nil if the history entry DATA has problem or path-problem results."
+  (and (member (plist-get data :kind) '("problem" "path-problem"))
+       (plist-get data :id)
+       t))
+
+(defun codeql--bqrs-row-counts (bqrs-path)
+  "Return an alist of the result set names and row counts of BQRS-PATH."
+  (when-let ((info (codeql--bqrs-info bqrs-path)))
+    (cl-loop for result-set across (alist-get 'result-sets info)
+             collect (cons (alist-get 'name result-set)
+                           (or (alist-get 'rows result-set) 0)))))
+
+(defun codeql--bqrs-column-counts (bqrs-path)
+  "Return an alist of the result set names and column counts of BQRS-PATH."
+  (when-let ((info (codeql--bqrs-info bqrs-path)))
+    (cl-loop for result-set across (alist-get 'result-sets info)
+             collect (cons (alist-get 'name result-set)
+                           (length (alist-get 'columns result-set))))))
+
+(defun codeql--check-comparable-result-sets (from-bqrs to-bqrs)
+  "Signal a `user-error' unless FROM-BQRS and TO-BQRS can be compared.
+
+They must have result sets of the same names, and those must have the
+same number of columns."
+  (let ((from-columns (codeql--bqrs-column-counts from-bqrs))
+        (to-columns (codeql--bqrs-column-counts to-bqrs)))
+    (unless (and from-columns to-columns)
+      (user-error "Could not read the result sets to compare"))
+    (unless (equal (sort (mapcar #'car from-columns) #'string<)
+                   (sort (mapcar #'car to-columns) #'string<))
+      (user-error "The queries have different result sets: %s and %s"
+                  (mapconcat #'car from-columns ", ")
+                  (mapconcat #'car to-columns ", ")))
+    (cl-loop for (name . columns) in from-columns
+             for to = (cdr (assoc name to-columns))
+             unless (= columns to)
+             do (user-error "The columns of %s do not match: %d and %d"
+                            name columns to))))
+
+(defun codeql--compared-rows (counts)
+  "Return the number of compared result rows in the alist of row COUNTS.
+
+Path graph result sets are copied rather than compared by `codeql bqrs
+diff', so this is the size of #select when there is one."
+  (or (alist-get "#select" counts nil nil #'equal)
+      (apply #'+ (mapcar #'cdr counts))))
+
+(defun codeql-query-history-compare (from to)
+  "Compare the results of the query history entries FROM and TO.
+
+The rows only found in the results of FROM, and those only found in the
+results of TO, are shown side by side in two results buffers that work
+like any other.  Both runs must be on the active database, and must have
+compatible result sets, e.g. be runs of two versions of a query.
+
+Interactively, prompt for FROM and then for TO."
+  (interactive
+   (progn
+     (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+     (unless (and codeql--completed-query-history
+                  (> (hash-table-count codeql--completed-query-history) 1))
+       (user-error "Comparing needs at least two queries in the query history"))
+     (let* ((keys (reverse (hash-table-keys codeql--completed-query-history)))
+            (from (completing-read "Compare query results of: " keys nil t))
+            (from-db (plist-get (gethash from codeql--completed-query-history) :db-path))
+            (others (seq-filter
+                     (lambda (key)
+                       (and (not (equal key from))
+                            (equal (plist-get (gethash key codeql--completed-query-history)
+                                              :db-path)
+                                   from-db)))
+                     keys)))
+       (unless others
+         (user-error "No other query in the history ran on the same database"))
+       (list from (completing-read (format "Compare %s with: " from) others nil t)))))
+  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (let ((from-data (gethash from codeql--completed-query-history))
+        (to-data (gethash to codeql--completed-query-history)))
+    (unless (and from-data to-data)
+      (user-error "Unknown query history entry"))
+    (unless (equal (plist-get from-data :db-path) (plist-get to-data :db-path))
+      (user-error "Only results of queries on the same database can be compared"))
+    (unless (and codeql--active-database
+                 (equal (directory-file-name (plist-get from-data :db-path))
+                        (directory-file-name codeql--active-database)))
+      (user-error "Register %s to compare the results of its queries"
+                  (plist-get from-data :db-path)))
+    (unless (eq (codeql--history-entry-interpreted-p from-data)
+                (codeql--history-entry-interpreted-p to-data))
+      (user-error "Problem results can only be compared with problem results"))
+    (codeql--check-comparable-result-sets (plist-get from-data :bqrs-path)
+                                          (plist-get to-data :bqrs-path))
+    (let* ((left (let ((temporary-file-directory (codeql--tramp-wrap codeql-results-dir)))
+                   (make-temp-file "bqrs" nil ".bqrs")))
+           (right (let ((temporary-file-directory (codeql--tramp-wrap codeql-results-dir)))
+                    (make-temp-file "bqrs" nil ".bqrs")))
+           (from-label (codeql--history-entry-label from-data))
+           (to-label (codeql--history-entry-label to-data)))
+      (message "Comparing %s with %s ..." from-label to-label)
+      (unless (codeql--cli-command-to-string
+               (list "bqrs" "diff"
+                     (format "--left=%s" (codeql--tramp-unwrap left))
+                     (format "--right=%s" (codeql--tramp-unwrap right))
+                     "--"
+                     (codeql--tramp-unwrap (plist-get from-data :bqrs-path))
+                     (codeql--tramp-unwrap (plist-get to-data :bqrs-path))))
+        (user-error "Could not compare the results, are their result sets compatible?"))
+      (let* ((from-rows (codeql--compared-rows
+                         (codeql--bqrs-row-counts (plist-get from-data :bqrs-path))))
+             (to-rows (codeql--compared-rows
+                       (codeql--bqrs-row-counts (plist-get to-data :bqrs-path))))
+             (left-rows (codeql--compared-rows (codeql--bqrs-row-counts left)))
+             (right-rows (codeql--compared-rows (codeql--bqrs-row-counts right)))
+             (buffers
+              (cl-loop for (bqrs rows label data) in
+                       `((,left ,left-rows ,(format "only in %s" from-label) ,from-data)
+                         (,right ,right-rows ,(format "only in %s" to-label) ,to-data))
+                       when (> rows 0)
+                       collect
+                       (let ((before (buffer-list))
+                             (codeql--results-marker-suffix label))
+                         (cl-destructuring-bind (&key query-path db-path name kind id
+                                                      &allow-other-keys)
+                             data
+                           (save-window-excursion
+                             (codeql-load-bqrs bqrs query-path db-path name kind id
+                                               (current-buffer))))
+                         (seq-find (lambda (buffer)
+                                     (and (not (memq buffer before))
+                                          (string-prefix-p "* codeql-org-results:"
+                                                           (buffer-name buffer))))
+                                   (buffer-list))))))
+        (setq buffers (delq nil buffers))
+        (when buffers
+          (let ((window (display-buffer (car buffers) '(nil (inhibit-same-window . t)))))
+            (when (cadr buffers)
+              (set-window-buffer (split-window window nil 'right) (cadr buffers)))))
+        (message "%s: %d of %d rows only in %s, %d of %d rows only in %s%s"
+                 (if (and (zerop left-rows) (zerop right-rows))
+                     "The results are the same"
+                   "Compared results")
+                 left-rows from-rows from-label right-rows to-rows to-label
+                 (if (and (> left-rows 0) (= left-rows from-rows) (= right-rows to-rows))
+                     ", no rows in common"
+                   ""))))))
+
 (defun codeql-database-history ()
   "Offer global database history selection to the user."
   (interactive)
@@ -4774,6 +4941,7 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
            ("e" "quick eval" codeql-query-server-quick-eval)
            ("n" "quick eval count" codeql-query-server-quick-eval-count)
            ("h" "history" codeql-query-history)
+           ("C" "compare" codeql-query-history-compare)
            ("c" "cancel" codeql-query-server-cancel-query)]
           ["Config"
            ("p" codeql-set-max-paths

@@ -10,6 +10,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Query execution
 - Quick query evaluation of regions or of the predicate at point, and quick evaluation counts
 - Query history for the local session
+- Comparing the results of two query runs
 - Database history for the global session
 - Result browsing
 - Source archive location opening
@@ -212,6 +213,12 @@ Visiting a location briefly flashes the code it spans. Set `codeql-highlight-vis
 Locations that span a whole file open that file at the top, and locations without a source file are shown as plain text.
 
 `emacs-codeql` will resolve file paths into the project snapshot source code archive included with the database archive.
+
+#### Comparing query results
+
+`codeql-query-history-compare` (`C` in the query server transient) compares the results of two runs from the query history, e.g. of two versions of the same query. It prompts for the two runs, which must be on the active database and have result sets with the same names and number of columns. Problem and path-problem results can only be compared with each other.
+
+The rows only found in the first run and those only found in the second run are computed by `codeql bqrs diff` and shown side by side in two results buffers, named after the runs they came from. These work like any other results buffer, so problem results are rendered as org trees and raw results as tables that can be sorted and paged. The echo area summarizes how many rows each side has to itself.
 
 ### Database source archive Xref support
 
