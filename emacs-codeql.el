@@ -1527,17 +1527,21 @@ avoids the cost of parsing and measuring a table in an org buffer."
 
 (defun codeql--escape-org-description (description)
   "Neutralize characters in DESCRIPTION that org would treat as markup."
-  (replace-regexp-in-string "[][=~_/+*<^\\]"
-                            ;; this wraps with a zero width space ;)
-                            (lambda (x) (format "​%s​" x)) description t t))
+  (if (string-match-p "[][=~_/+*<^\\]" description)
+      (replace-regexp-in-string "[][=~_/+*<^\\]"
+                                ;; this wraps with a zero width space ;)
+                                (lambda (x) (format "​%s​" x)) description t t)
+    description))
 
 (defun codeql--printable-text (text)
   "Return TEXT on a single line, with control characters made visible."
-  (replace-regexp-in-string
-   "[\0-\x1f\x7f]"
-   (lambda (c) (string (if (eq (aref c 0) ?\x7f) ?␡ (+ ?␀ (aref c 0)))))
-   (replace-regexp-in-string "[ \t]*\r?\n[ \t]*" " " text)
-   t t))
+  (if (string-match-p "[\0-\x1f\x7f]" text)
+      (replace-regexp-in-string
+       "[\0-\x1f\x7f]"
+       (lambda (c) (string (if (eq (aref c 0) ?\x7f) ?␡ (+ ?␀ (aref c 0)))))
+       (replace-regexp-in-string "[ \t]*\r?\n[ \t]*" " " text)
+       t t)
+    text))
 
 (defun codeql--printable-label (label)
   "Return LABEL in a form that is visible and safe to render as org text.
@@ -1558,8 +1562,10 @@ as their Unicode control pictures."
 
 (defun codeql--encode-link-path (path)
   "Percent encode the characters of PATH that org links in tables can't contain."
-  (replace-regexp-in-string
-   "[%|]" (lambda (c) (format "%%%02X" (aref c 0))) path t t))
+  (if (string-match-p "[%|]" path)
+      (replace-regexp-in-string
+       "[%|]" (lambda (c) (format "%%%02X" (aref c 0))) path t t)
+    path))
 
 (defun codeql--decode-link-path (path)
   "Reverse `codeql--encode-link-path' for PATH."
@@ -1568,25 +1574,41 @@ as their Unicode control pictures."
    (lambda (c) (if (string= (match-string 1 c) "25") "%" "|"))
    path t t))
 
+(defvar codeql--source-link-prefix-box nil
+  "When non-nil, a cons whose car caches `codeql--source-link-prefix'.
+
+Bound around a rendering pass, so the source archive is located and
+checked once rather than for every result node.")
+
+(defun codeql--source-link-prefix ()
+  "Return the encoded source archive root that result links point into."
+  (or (car codeql--source-link-prefix-box)
+      (progn
+        (cl-assert codeql--database-source-archive-zip t)
+        (cl-assert (codeql--file-exists-p codeql--database-source-archive-root) t)
+        (let ((prefix (codeql--encode-link-path
+                       ;; we've extracted to the expected location
+                       (codeql--tramp-wrap codeql--database-source-archive-root))))
+          (when codeql--source-link-prefix-box
+            (setcar codeql--source-link-prefix-box prefix))
+          prefix))))
+
 (defun codeql--result-node-to-org (node &optional custom-description)
   "Transform a result node into an org compatible link|string representation."
   ;; https://orgmode.org/guide/Hyperlinks.html
   (if (codeql--result-node-visitable node)
-      (progn
-        (cl-assert codeql--database-source-archive-zip t)
-        (cl-assert (codeql--file-exists-p codeql--database-source-archive-root) t)
-        ;; since we have our own link type, also add in a column
-        (let ((link (format "codeql:%s::%s:%s"
-                            ;; we've extracted to the expected location
-                            (codeql--encode-link-path
-                             (concat (codeql--tramp-wrap codeql--database-source-archive-root)
-                                     (codeql--result-node-filename node)))
-                            (codeql--result-node-line node)
-                            (codeql--result-node-column node)))
-              (desc (codeql--printable-label (or custom-description
-                                                 (codeql--result-node-label node)))))
-          (format "[[%s][%s]]" (org-link-escape link)
-                  (codeql--escape-org-description desc))))
+      ;; since we have our own link type, also add in a column
+      (let ((link (format "codeql:%s%s::%s:%s"
+                          (codeql--source-link-prefix)
+                          (codeql--encode-link-path (codeql--result-node-filename node))
+                          (codeql--result-node-line node)
+                          (codeql--result-node-column node)))
+            (desc (codeql--printable-label (or custom-description
+                                               (codeql--result-node-label node)))))
+        (format "[[%s][%s]]"
+                ;; escaping only affects brackets and backslashes
+                (if (string-match-p "[][\\]" link) (org-link-escape link) link)
+                (codeql--escape-org-description desc)))
     ;; not visitable, just return the label
     (codeql--org-text (codeql--result-node-label node))))
 
@@ -1632,7 +1654,8 @@ Sets an optional HEADER."
 (defun codeql--query-results-to-org (query-results results-type &optional columns)
   "Turn QUERY-RESULTS of RESULTS-TYPE into an org data."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (let ((parent-buffer (current-buffer)))
+  (let ((parent-buffer (current-buffer))
+        (codeql--source-link-prefix-box (list nil)))
     (with-temp-buffer
       (goto-char (point-min))
       (pcase results-type
@@ -2865,8 +2888,9 @@ Our implementation simply returns the thing at point as a candidate."
            (codeql--render-node node (concat level "*") buffer-context)))
 
 (defun codeql--render-tree (tree &optional buffer-context)
-  (cl-loop for root across tree do
-           (codeql--render-node root "*" buffer-context)))
+  (let ((codeql--source-link-prefix-box (list nil)))
+    (cl-loop for root across tree do
+             (codeql--render-node root "*" buffer-context))))
 
 (defun codeql--sort-node (node)
   ;; sort this node's children
