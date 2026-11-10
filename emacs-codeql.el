@@ -633,8 +633,20 @@ Leave nil for default.")
     ;; no LSP for us due to error
     (error (message "Ignoring failed LSP initialization and plowing ahead!"))))
 
+(defun codeql--maybe-buffer-local-init ()
+  "Run `codeql--buffer-local-init-hook' in buffers that visit a file.
+Other buffers in CodeQL mode, such as those org uses to fontify and
+edit source blocks, only get the major mode."
+  (when (buffer-file-name)
+    (codeql--buffer-local-init-hook)))
+
 ;; add a hook that sets up all the things we need to be available in the buffer-local context
-(add-hook 'ql-tree-sitter-mode-hook #'codeql--buffer-local-init-hook)
+(remove-hook 'ql-tree-sitter-mode-hook #'codeql--buffer-local-init-hook)
+(add-hook 'ql-tree-sitter-mode-hook #'codeql--maybe-buffer-local-init)
+
+;; #+begin_src codeql finds codeql-mode by name, ql needs a mapping
+(with-eval-after-load 'org-src
+  (add-to-list 'org-src-lang-modes '("ql" . codeql)))
 
 ;; backup formatting utilities for when ql-tree-sitter is not available
 (defun codeql-format (&optional min max)

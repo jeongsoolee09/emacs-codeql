@@ -174,6 +174,8 @@ On Emacs 29 and above `emacs-codeql` also comes with an Emacs 29+ specific versi
 
 The major mode is called `ql-tree-sitter-mode`, and `emacs-codeql` makes it available as `codeql-mode` too. `codeql-mode-map`, `codeql-mode-hook`, `codeql-mode-syntax-table`, `codeql-mode-abbrev-table` and `codeql-mode-indent-offset` are aliases of the corresponding `ql-tree-sitter-mode` variables, so either name can be used in your configuration, and on Emacs 30 and above `(derived-mode-p 'codeql-mode)` holds in CodeQL buffers. The value of `major-mode` stays `ql-tree-sitter-mode`.
 
+In org documents, `#+begin_src codeql` and `#+begin_src ql` blocks use this mode for highlighting and for editing with `C-c '`. Source block buffers don't visit a file, so they don't get a query server, language server or search paths.
+
 #### Database selection
 
 You can register a database for your current project via `M-x codeql-transient-query-server-interact` and selecting `d` to register an active database. Ensure you have started a query server first by using `s` from the same menu. If a database is active in another query buffer, it will automatically be deregistered there and registered for your current buffer.
