@@ -1942,6 +1942,8 @@ PAGE-SIZE rows.  When OFFSETS is nil the whole result set is decoded."
             (format "Results page (1-%d): "
                     (codeql--raw-results-pages codeql--raw-results-pagination))
             (1+ (plist-get codeql--raw-results-pagination :page))))))
+  (unless (integerp page)
+    (user-error "Results page must be a whole number, not %s" page))
   (codeql--raw-results-show-page (1- page)))
 
 (defvar codeql-results-pagination-mode-map
