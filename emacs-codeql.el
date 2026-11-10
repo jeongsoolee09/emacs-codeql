@@ -2295,34 +2295,6 @@ original order of the results."
   (message ":url %s" (codeql--result-node-url node))
   (message "-- NODE SNIP STOP ---"))
 
-;; from markdown-mode: https://github.com/jrblevin/markdown-mode/blob/master/LICENSE.md
-(defconst codeql--markdown-regex-link-inline
-  "\\(?1:!\\)?\\(?2:\\[\\)\\(?3:\\^?\\(?:\\\\\\]\\|[^]]\\)*\\|\\)\\(?4:\\]\\)\\(?5:(\\)\\s-*\\(?6:[^)]*?\\)\\(?:\\s-+\\(?7:\"[^\"]*\"\\)\\)?\\s-*\\(?8:)\\)"
-  "Regular expression for a [text](file) or an image link ![text](file).
-Group 1 matches the leading exclamation point (optional).
-Group 2 matches the opening square bracket.
-Group 3 matches the text inside the square brackets.
-Group 4 matches the closing square bracket.
-Group 5 matches the opening parenthesis.
-Group 6 matches the URL.
-Group 7 matches the title (optional).
-Group 8 matches the closing parenthesis.")
-
-;; SARIF v2.0 3.11.6
-(defun codeql--parse-sarif-links (message)
-  "Parse all [text](id) links out of a message text."
-  (let ((links
-         (with-temp-buffer
-           (insert message)
-           (goto-char (point-min))
-           (cl-loop until (not (re-search-forward
-                                codeql--markdown-regex-link-inline nil t))
-                    collect
-                    (list (match-string 3)
-                          (string-to-number
-                           (match-string 6)))))))
-    links))
-
 (defun codeql--related-link-to-org-link (related-link related-locations)
   "Turn a SARIF markdown link into an org link."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
