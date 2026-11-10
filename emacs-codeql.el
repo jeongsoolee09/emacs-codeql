@@ -4543,6 +4543,14 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
               (funcall filter proc rest))))))
     proc))
 
+(defun codeql--jsonrpc-events-buffer-args ()
+  "Initargs that bound the size of a query server's jsonrpc events buffer."
+  ;; newer jsonrpc replaced :events-buffer-scrollback-size and warns about it
+  (if (slot-exists-p 'jsonrpc-process-connection '-events-buffer-config)
+      (list :events-buffer-config
+            (list :size codeql-query-server-events-buffer-size))
+    (list :events-buffer-scrollback-size codeql-query-server-events-buffer-size)))
+
 ;; workaround from eglot.el, disable line buffering if in remote context
 (defun codeql--query-server-cmd (contact)
   "Helper for codeql query server connection."
@@ -4595,7 +4603,8 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
         (message "Starting query server.")
         ;; manage these buffer local
         (setq codeql--query-server
-              (make-instance
+              (apply
+               #'make-instance
                'jsonrpc-process-connection
                :process
                ;; spawn in the remote context if need be
@@ -4610,13 +4619,13 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
                   :noquery t
                   :stderr (get-buffer-create (format "*%s stderr*" name))))
                :name name
-               :events-buffer-scrollback-size codeql-query-server-events-buffer-size
                :notification-dispatcher #'codeql--query-server-handle-notification
                :request-dispatcher #'codeql--query-server-handle-request
                :on-shutdown
                (let ((buffer-context (current-buffer)))
                  (lambda (obj)
-                   (codeql--query-server-on-shutdown obj buffer-context)))))
+                   (codeql--query-server-on-shutdown obj buffer-context)))
+               (codeql--jsonrpc-events-buffer-args)))
         ;; created up front so that buffers sharing this server share it too
         (unless codeql--completed-query-history
           (setq codeql--completed-query-history (make-hash-table :test #'equal)))
