@@ -182,13 +182,17 @@ Database selection is buffer-local per query file and you can run as many concur
 
 Every database you register is remembered per project, across Emacs sessions. The project is the version-controlled project that contains the query file, or the CodeQL pack root when the query is not under version control. Select `k` (known databases) to pick one from the history. Databases of the current project come first, most recently used on top, followed by databases used in other projects. Each candidate is annotated with its language, when it was last used, its project, and whether it no longer exists on disk.
 
-When [consult](https://github.com/minad/consult) is installed the picker uses it, and you can narrow to the current project with `p` or to other projects with `o`. With [embark](https://github.com/oantolin/embark), the candidates offer the actions in `codeql-database-map`: `r` to register, `k` to forget the database (`codeql-database-history-remove`), `d` to open it in dired, and `w` to copy its path.
+When [consult](https://github.com/minad/consult) is installed the picker uses it, and you can narrow to the current project with `p` or to other projects with `o`. With [embark](https://github.com/oantolin/embark), the candidates offer the actions in `codeql-database-map`: `r` to register, `k` to forget the database (`codeql-database-history-remove`), `d` to open it in dired, `w` to copy its path, and `u` to delete its lock.
 
 After a query server starts, the most recently used database of the project is registered automatically. Set `codeql-register-last-database` to `nil` to disable this.
 
 The history is stored in `database-history.eld` inside `codeql-state-dir`; customize `codeql-database-history-file` to put it elsewhere. It always lives on the local machine; entries for TRAMP databases keep their remote paths and are offered only to query buffers on the same host.
 
 You can also register a zipped database archive (`.zip`) with `d`. It is unpacked with `codeql database unbundle` into the `databases` directory of `codeql-state-dir`, and an already unpacked copy is reused.
+
+#### Deleting a stale database lock
+
+A query server that crashed or was killed can leave its database locked, so that other query servers fail to evaluate queries against it. Select `u` (unlock), or `M-x codeql-database-delete-lock`, to delete the evaluation cache lock (`db-<language>/default/cache/.lock`) of the active database. With a prefix argument, or without an active database, you pick the database from the history instead. You are asked to confirm first, and warned when a query server in this Emacs still uses the database, or when another process (as reported by `lsof`) still has the lock open.
 
 `emacs-codeql` buffer-local approach means you can work on e.g. a `cpp` and `javascript` project concurrently, and you can an arbitrary amount of concurrent results buffers as you toggle between your query buffers.
 

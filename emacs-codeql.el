@@ -5877,6 +5877,83 @@ An archive that was unbundled before is reused."
   (kill-new (expand-file-name database-path))
   (message "Copied %s" (expand-file-name database-path)))
 
+(defun codeql--database-lock-files (database-path)
+  "Return the evaluation cache lock files of the database at DATABASE-PATH."
+  (seq-filter #'file-exists-p
+              (file-expand-wildcards
+               (expand-file-name "db-*/default/cache/.lock" database-path))))
+
+(defun codeql--database-users (database-path)
+  "Return the QL buffers whose running query server uses DATABASE-PATH."
+  (let ((database (file-name-as-directory (expand-file-name database-path))))
+    (seq-filter
+     (lambda (buffer)
+       (with-current-buffer buffer
+         (and (eq major-mode 'ql-tree-sitter-mode)
+              codeql--active-database
+              codeql--query-server
+              (jsonrpc-running-p codeql--query-server)
+              (equal (file-name-as-directory
+                      (expand-file-name (codeql--tramp-wrap codeql--active-database)))
+                     database))))
+     (buffer-list))))
+
+(defun codeql--lock-file-holders (file)
+  "Return the PIDs of the processes that have FILE open, if that can be told."
+  (when (and (not (file-remote-p file)) (executable-find "lsof"))
+    (with-temp-buffer
+      (when (eql 0 (call-process "lsof" nil t nil "-t" "--" file))
+        (split-string (buffer-string) nil t)))))
+
+(defun codeql-database-delete-lock (database-path)
+  "Delete the evaluation cache lock files of the database at DATABASE-PATH.
+
+A query server that crashed or was killed can leave its database locked,
+so that other query servers fail to evaluate queries against it.  This
+deletes the db-LANGUAGE/default/cache/.lock files of the database, after
+confirmation.
+
+Interactively, this is the active database of the current QL buffer.
+With a prefix argument, or without an active database, the database is
+read from the database history, or as a directory when it's empty."
+  (interactive
+   (list (if (and (not current-prefix-arg)
+                  (eq major-mode 'ql-tree-sitter-mode)
+                  codeql--active-database)
+             (codeql--tramp-wrap codeql--active-database)
+           (if (or (car (codeql--database-history-entries))
+                   (cadr (codeql--database-history-entries)))
+               (codeql--read-database "Delete the lock of database: ")
+             (read-directory-name "Delete the lock of database: " nil nil t)))))
+  (let* ((database (expand-file-name database-path))
+         (locks (codeql--database-lock-files database))
+         (users (codeql--database-users database))
+         (holders (delete-dups (mapcan #'codeql--lock-file-holders locks))))
+    (unless (file-exists-p (expand-file-name "codeql-database.yml" database))
+      (user-error "Not a CodeQL database: %s" database))
+    (if (not locks)
+        (message "No lock files in %s" database)
+      (when (yes-or-no-p
+             (concat
+              (format "Delete %s? "
+                      (mapconcat (lambda (lock) (file-relative-name lock database))
+                                 locks ", "))
+              (cond
+               (users
+                (format "The query server of %s uses this database, deleting its lock \
+can corrupt the cache.  Delete anyway? "
+                        (mapconcat #'buffer-name users ", ")))
+               (holders
+                (format "Process%s %s still %s it open.  Delete anyway? "
+                        (if (cdr holders) "es" "")
+                        (string-join holders ", ")
+                        (if (cdr holders) "have" "has")))
+               (t ""))))
+        (dolist (lock locks)
+          (delete-file lock))
+        (message "Deleted %d lock file%s of %s"
+                 (length locks) (if (cdr locks) "s" "") database)))))
+
 (defvar codeql-database-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") #'codeql-query-server-register-database)
@@ -5884,6 +5961,7 @@ An archive that was unbundled before is reused."
     (define-key map (kbd "k") #'codeql-database-history-remove)
     (define-key map (kbd "d") #'codeql-database-dired)
     (define-key map (kbd "w") #'codeql-database-copy-path)
+    (define-key map (kbd "u") #'codeql-database-delete-lock)
     map)
   "Embark actions for databases in the database history.")
 
@@ -6161,7 +6239,8 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
             (lambda ()
               (codeql-query-server-active-database)))
            ("f" "file" codeql-database-open-source-archive-file)
-           ("k" "known" codeql-database-history)]
+           ("k" "known" codeql-database-history)
+           ("u" "unlock" codeql-database-delete-lock)]
           ["Query"
            ("r" "run" codeql-query-server-run-query)
            ("e" "quick eval" codeql-query-server-quick-eval)
