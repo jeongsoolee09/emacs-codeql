@@ -184,6 +184,16 @@ Users may cancel queries instead through the transient UI."
   :type 'boolean
   :group 'emacs-codeql)
 
+(defcustom codeql-highlight-visited-location 'pulse
+  "How to highlight the location a result link points to when it is visited.
+
+`pulse' briefly flashes the location, `region' leaves it marked as the
+active region, with point at its start, and nil doesn't highlight it."
+  :type '(choice (const :tag "Flash the location" pulse)
+                 (const :tag "Mark the location as the region" region)
+                 (const :tag "Don't highlight" nil))
+  :group 'emacs-codeql)
+
 (defcustom codeql-xref-resolve-on-visit nil
   "Whether to resolve xrefs as soon as a source archive file is visited.
 
@@ -3114,8 +3124,21 @@ are nil when LINK doesn't have them."
                     '(2 3 4 5)))
     (list (codeql--decode-link-path (car (split-string link "::"))) nil nil nil nil)))
 
+(defun codeql--highlight-location (beg end)
+  "Highlight the visited location from BEG to END in the current buffer.
+
+See `codeql-highlight-visited-location'."
+  (when (< beg end)
+    (pcase codeql-highlight-visited-location
+      ('pulse
+       (pulse-momentary-highlight-region beg end))
+      ('region
+       (push-mark end t t)
+       (goto-char beg)))))
+
 (defun codeql--org-open-file-link (link)
-  (pcase-let ((`(,filename ,line ,column) (codeql--parse-link-location link)))
+  (pcase-let ((`(,filename ,line ,column ,end-line ,end-column)
+               (codeql--parse-link-location link)))
 
     ;; XXX: hrmmm ... we probably want to force unique file visits
     ;; XXX: since we don't want to use a cross-query state when there
@@ -3141,7 +3164,13 @@ are nil when LINK doesn't have them."
             (goto-char (codeql--eglot--lsp-position-to-point
                         `(;; align
                           :line ,(1- line)
-                          :character ,(1- column)))))
+                          :character ,(1- column))))
+            (when (and end-line end-column)
+              (codeql--highlight-location
+               (point)
+               ;; an inclusive 1-based end column is an exclusive 0-based one
+               (codeql--eglot--lsp-position-to-point
+                `(:line ,(1- end-line) :character ,end-column)))))
           ;; enable our xref backend, this kicks in templated queries for refs and defs
           (codeql-xref-backend))))))
 
