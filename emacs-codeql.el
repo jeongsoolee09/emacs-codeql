@@ -2059,6 +2059,7 @@ columns of tables aligned by character width."
       (goto-char (point-min))
       (setq buffer-read-only t)
       (setq codeql--org-query-buffer query-buffer)
+      (setq-local next-error-function #'codeql--results-next-error)
       (when codeql-results-diagnostics
         (codeql-results-diagnostics-mode 1))
       (save-excursion
@@ -2124,6 +2125,7 @@ PAGINATION is an optional plist describing a paginated result set, see
        org-data
        (if pagination (codeql--raw-results-pagination-footer) footer))
       (setq buffer-read-only t)
+      (setq-local next-error-function #'codeql--results-next-error)
       (when codeql-results-diagnostics
         (codeql-results-diagnostics-mode 1))
       (save-excursion
@@ -3192,6 +3194,9 @@ Our implementation simply returns the thing at point as a candidate."
 (add-to-list 'xref-backend-functions #'codeql-xref-backend)
 
 ;; custom org link so we can do voodoo when C-c C-o on a codeql: link
+(defvar codeql--find-file-same-window nil
+  "Non-nil to have `codeql--find-file-other-window' use the selected window.")
+
 (defun codeql--find-file-other-window (filename &optional wildcards)
   (interactive
    (find-file-read-args "Find file in other window: "
@@ -3200,14 +3205,17 @@ Our implementation simply returns the thing at point as a candidate."
   (cl-letf (((symbol-function #'eglot-ensure)
              (lambda ()
                (message "Disabled eglot for codeql org link."))))
-    (let ((value (find-file-noselect filename nil nil wildcards)))
+    (let ((value (find-file-noselect filename nil nil wildcards))
+          (show (if codeql--find-file-same-window
+                    #'pop-to-buffer-same-window
+                  #'switch-to-buffer-other-window)))
       (if (listp value)
 	  (progn
 	    (setq value (nreverse value))
             ;; prevent folks from editing database source code
             (with-current-buffer (car value)
               (setq buffer-read-only t))
-	    (switch-to-buffer-other-window (car value))
+	    (funcall show (car value))
             (mapc (lambda (buf)
                     (with-current-buffer buf
                       (setq buffer-read-only t))
@@ -3217,7 +3225,7 @@ Our implementation simply returns the thing at point as a candidate."
         ;; prevent folks from editing database source code
         (with-current-buffer value
           (setq buffer-read-only t))
-        (switch-to-buffer-other-window value)))))
+        (funcall show value)))))
 
 (defun codeql--parse-link-location (link)
   "Parse the path of a codeql: LINK into a list of its location parts.
@@ -3281,6 +3289,7 @@ See `codeql-highlight-visited-location'."
     (unless (file-exists-p filename)
       (user-error "Source file not found: %s" filename))
 
+    (codeql--alerts-note-visit link)
     (let ((query-buffer codeql--org-query-buffer))
       (when-let ((src-buffer (codeql--find-file-other-window filename)))
         (with-current-buffer src-buffer
@@ -3817,6 +3826,407 @@ See also `codeql-results-diagnostics'."
           (delq (current-buffer) codeql--diagnostics-results-buffers))
     (setq codeql--results-diagnostics nil)
     (codeql--diagnostics-refresh))))
+
+;;; Navigating between alerts and their locations
+
+(cl-defstruct (codeql--alert (:constructor codeql--alert-create)
+                             (:copier nil))
+  "An alert of a results buffer: a problem, or a row of a raw results table.
+
+START and END delimit it in the results buffer and MESSAGE describes it.
+LOCATIONS is a vector of (LINK DESCRIPTION POSITION) entries, holding the
+path of a codeql: link, its description, and where it is in the results
+buffer.  The location of the alert comes first, followed by its related
+locations and path steps in the order they are listed."
+  start end message locations)
+
+(defvar-local codeql--results-alerts-cache nil
+  "The alerts of a results buffer, as (MODIFICATION-TICK . ALERTS).")
+
+(defvar codeql--current-alert nil
+  "The last visited alert location, as a plist.
+
+Its keys are :buffer, the results buffer, :tick, the modification tick of
+its contents, :alert, the index of the alert, and :location, the index of
+the location within the alert.")
+
+(defun codeql--line-links ()
+  "Return the codeql: links on the current line, see `codeql--alert'."
+  (let (links)
+    (save-excursion
+      (beginning-of-line)
+      (while (re-search-forward org-link-bracket-re (line-end-position) t)
+        (let ((link (org-link-unescape (match-string-no-properties 1)))
+              (description (or (match-string-no-properties 2) ""))
+              (start (match-beginning 0)))
+          (when (string-prefix-p "codeql:" link)
+            (setq link (substring link (length "codeql:")))
+            ;; locations with no source file
+            (unless (directory-name-p (car (codeql--parse-link-location link)))
+              (push (list link (codeql--diagnostics-text description) start)
+                    links))))))
+    (nreverse links)))
+
+(defun codeql--alert-finish (start end message links)
+  "Return an alert from START to END described by MESSAGE, or nil.
+
+LINKS are its locations, see `codeql--alert', duplicates are dropped."
+  (let ((seen (make-hash-table :test #'equal))
+        locations)
+    (dolist (link links)
+      (unless (gethash (car link) seen)
+        (puthash (car link) t seen)
+        (push link locations)))
+    (when locations
+      (codeql--alert-create :start start :end end :message message
+                            :locations (vconcat (nreverse locations))))))
+
+(defun codeql--results-collect-alerts ()
+  "Return a vector of the alerts in the current results buffer.
+
+Each top level heading is an alert of a problem query, its last link is
+the location of the problem.  Each table row with links is an alert of
+a raw results table, its first link is its location."
+  (let (alerts heading)
+    (save-excursion
+      (save-restriction
+        (widen)
+        (goto-char (point-min))
+        (cl-flet ((finish-heading ()
+                    (when heading
+                      (pcase-let ((`(,start ,message ,links) heading))
+                        (when-let ((alert (codeql--alert-finish
+                                           start (line-beginning-position)
+                                           message (nreverse links))))
+                          (push alert alerts)))
+                      (setq heading nil))))
+          (while (not (eobp))
+            (let ((line (buffer-substring-no-properties
+                         (line-beginning-position) (line-end-position))))
+              (cond
+               ((string-match-p "\\`\\* " line)
+                (finish-heading)
+                (let ((links (codeql--line-links)))
+                  ;; the location of a problem comes after its message
+                  (unless (string-suffix-p "[location unknown]" line)
+                    (setq links (append (last links) (butlast links))))
+                  (setq heading (list (line-beginning-position)
+                                      (codeql--diagnostics-problem-text line)
+                                      (reverse links)))))
+               (heading
+                (setf (nth 2 heading)
+                      (append (reverse (codeql--line-links)) (nth 2 heading))))
+               ((string-match-p "\\`[ \t]*|" line)
+                (when-let ((alert (codeql--alert-finish
+                                   (line-beginning-position)
+                                   (min (point-max) (1+ (line-end-position)))
+                                   (codeql--location-line-context line)
+                                   (codeql--line-links))))
+                  (push alert alerts)))))
+            (forward-line 1))
+          (finish-heading))))
+    (vconcat (nreverse alerts))))
+
+(defun codeql--results-alerts ()
+  "Return the alerts of the current results buffer, see `codeql--alert'."
+  (let ((tick (buffer-chars-modified-tick)))
+    (unless (eq (car codeql--results-alerts-cache) tick)
+      (setq codeql--results-alerts-cache
+            (cons tick (codeql--results-collect-alerts))))
+    (cdr codeql--results-alerts-cache)))
+
+(defun codeql--results-buffer-p (buffer)
+  "Return non-nil if BUFFER is a live buffer of CodeQL results.
+
+These are the rendered results buffers, and the saved results of query
+history.  Other buffers with codeql: links, like the AST viewer, are not."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (derived-mode-p 'org-mode)
+              (or (eq next-error-function #'codeql--results-next-error)
+                  (and buffer-file-name
+                       (string-suffix-p ".bqrs.org" buffer-file-name)))))))
+
+(defun codeql--alerts-results-buffer ()
+  "Return the results buffer to navigate the alerts of."
+  (or (cl-find-if #'codeql--results-buffer-p
+                  (list (current-buffer)
+                        (plist-get codeql--current-alert :buffer)
+                        next-error-last-buffer))
+      (cl-find-if #'codeql--results-buffer-p codeql--diagnostics-results-buffers)
+      (cl-find-if #'codeql--results-buffer-p (mapcar #'window-buffer (window-list)))
+      (cl-find-if (lambda (buffer)
+                    (and (string-prefix-p "* codeql-org-results" (buffer-name buffer))
+                         (codeql--results-buffer-p buffer)))
+                  (buffer-list))
+      (user-error "No CodeQL results buffer")))
+
+(defun codeql--alert-at (alerts position)
+  "Return the index of the last of ALERTS starting at or before POSITION."
+  (cl-loop with found = -1
+           for alert across alerts
+           for i from 0
+           while (<= (codeql--alert-start alert) position)
+           do (setq found i)
+           finally return found))
+
+(defun codeql--alert-location-at (alert position)
+  "Return the index of the location of ALERT on the line of POSITION, or nil."
+  (save-excursion
+    (goto-char position)
+    (let ((bol (line-beginning-position))
+          (eol (line-end-position)))
+      (cl-position-if (lambda (location)
+                        (<= bol (nth 2 location) eol))
+                      (codeql--alert-locations alert)))))
+
+(defun codeql--alert-location-at-point (alert)
+  "Return the index of the location of ALERT that point is in, or nil.
+
+The current buffer is a source file."
+  (when buffer-file-name
+    (let ((key (codeql--diagnostics-file-key buffer-file-name)))
+      (cl-position-if
+       (lambda (location)
+         (pcase-let ((`(,file ,line ,column ,end-line ,end-column)
+                      (codeql--parse-link-location (car location))))
+           (when (and line (equal (codeql--diagnostics-file-key file) key))
+             (when-let ((region (codeql--diagnostics-region
+                                 line column end-line end-column)))
+               (<= (car region) (point) (cdr region))))))
+       (codeql--alert-locations alert)))))
+
+(defun codeql--alerts-visited (results alerts)
+  "Return the last visited (ALERT . LOCATION) indices into ALERTS of RESULTS.
+
+Return nil when no alert of the current contents of RESULTS was visited."
+  (and (eq (plist-get codeql--current-alert :buffer) results)
+       (eql (plist-get codeql--current-alert :tick)
+            (car (buffer-local-value 'codeql--results-alerts-cache results)))
+       (< (plist-get codeql--current-alert :alert) (length alerts))
+       (cons (plist-get codeql--current-alert :alert)
+             (plist-get codeql--current-alert :location))))
+
+(defun codeql--alerts-position (results alerts)
+  "Return the current (ALERT . LOCATION) indices into ALERTS of RESULTS.
+
+In the window of RESULTS this is the alert at point, in a source file it
+is the last visited alert, or else an alert with a location at point.
+The indices are -1 when there is no current alert."
+  (let ((current (codeql--alerts-visited results alerts))
+        (selected (window-buffer)))
+    (cond
+     ((eq selected results)
+      (with-current-buffer results
+        (let ((alert (codeql--alert-at alerts (window-point))))
+          (cons alert
+                (if (< alert 0)
+                    -1
+                  (or (codeql--alert-location-at (aref alerts alert) (window-point))
+                      (and (eql alert (car current)) (cdr current))
+                      0))))))
+     ((buffer-local-value 'buffer-file-name selected)
+      (with-current-buffer selected
+        (or (and current
+                 (when-let ((location (codeql--alert-location-at-point
+                                       (aref alerts (car current)))))
+                   (cons (car current) location)))
+            current
+            (cl-loop for alert across alerts
+                     for i from 0
+                     for location = (codeql--alert-location-at-point alert)
+                     when location return (cons i location))
+            (cons -1 -1))))
+     (t (or current (cons -1 -1))))))
+
+(defun codeql--alerts-note-visit (link)
+  "Remember the alert location of LINK as the current one.
+
+The current buffer is the results buffer LINK is followed from, and the
+alert at point is preferred when it has the location of LINK."
+  (when (codeql--results-buffer-p (current-buffer))
+    (let* ((alerts (codeql--results-alerts))
+           (link (org-link-unescape link))
+           (find (lambda (i)
+                   (and (<= 0 i) (< i (length alerts))
+                        (when-let ((location (cl-position
+                                              link (codeql--alert-locations (aref alerts i))
+                                              :key #'car :test #'equal)))
+                          (cons i location)))))
+           (found (or (funcall find (codeql--alert-at alerts (point)))
+                      (cl-loop for i below (length alerts)
+                               thereis (funcall find i)))))
+      (when found
+        (setq codeql--current-alert
+              (list :buffer (current-buffer)
+                    :tick (car codeql--results-alerts-cache)
+                    :alert (car found)
+                    :location (cdr found)))
+        (setq next-error-last-buffer (current-buffer))))))
+
+(defun codeql--alert-location-text (alert index)
+  "Describe the location at INDEX of ALERT."
+  (pcase-let ((`(,_ ,description ,position) (aref (codeql--alert-locations alert) index)))
+    (if (zerop index)
+        (codeql--alert-message alert)
+      (let ((line (save-excursion
+                    (goto-char position)
+                    (buffer-substring-no-properties (line-beginning-position)
+                                                    (line-end-position)))))
+        (cond
+         ((string-match-p "\\`\\* " line)
+          (format "Related location \"%s\"" description))
+         ((string-match "\\`[ \t]*\\([0-9]+\\)\\. +\\(?:src\\|snk\\|\\.\\.\\.\\|→\\)? *" line)
+          (format "Path step %s: %s" (match-string 1 line)
+                  (codeql--location-line-context (substring line (match-end 0)))))
+         (t (codeql--location-line-context line)))))))
+
+(defun codeql--alert-visit (results alert-index location-index)
+  "Visit the location at LOCATION-INDEX of the alert at ALERT-INDEX of RESULTS."
+  (with-current-buffer results
+    (let* ((alerts (codeql--results-alerts))
+           (alert (aref alerts alert-index))
+           (locations (codeql--alert-locations alert))
+           (position (nth 2 (aref locations location-index)))
+           (window (get-buffer-window results)))
+      ;; follow along in the results buffer, like `next-error' does
+      (goto-char position)
+      (when (invisible-p position)
+        (org-reveal))
+      (when window
+        (set-window-point window position))
+      (let ((codeql--find-file-same-window (not (eq (window-buffer) results))))
+        (codeql--org-open-file-link (car (aref locations location-index))))
+      (setq codeql--current-alert (list :buffer results
+                                        :tick (car codeql--results-alerts-cache)
+                                        :alert alert-index
+                                        :location location-index))
+      (setq next-error-last-buffer results)
+      (message "Alert %d/%d%s: %s"
+               (1+ alert-index) (length alerts)
+               (if (> (length locations) 1)
+                   (format ", location %d/%d" (1+ location-index) (length locations))
+                 "")
+               (with-current-buffer results
+                 (codeql--alert-location-text alert location-index))))))
+
+(defun codeql--alerts-boundary-hint (results)
+  "Return a hint about the other result pages of RESULTS, if any."
+  (with-current-buffer results
+    (if (and codeql--raw-results-pagination
+             (> (codeql--raw-results-pages codeql--raw-results-pagination) 1))
+        (format " on this page, see %s and %s"
+                (substitute-command-keys
+                 "\\<codeql-results-pagination-mode-map>\\[codeql-results-next-page]")
+                (substitute-command-keys
+                 "\\<codeql-results-pagination-mode-map>\\[codeql-results-previous-page]"))
+      "")))
+
+(defun codeql-next-alert (&optional n)
+  "Visit the location of the Nth next alert of a CodeQL results buffer.
+
+Alerts are the results of problem queries and the rows of raw results,
+in the order the results buffer lists them.  Following a link of the
+results buffer, or visiting the location of an alert with any of the
+alert commands, makes its alert the current one.  Point in the results
+buffer moves along.  Use `codeql-next-alert-location' to visit the
+other locations of the current alert.
+
+The results buffer is the current one, the one of the current alert,
+or one that shows Flymake diagnostics.  Results buffers also work with
+`next-error' and `previous-error'."
+  (interactive "p")
+  (let* ((n (or n 1))
+         (results (codeql--alerts-results-buffer))
+         (alerts (with-current-buffer results (codeql--results-alerts)))
+         (current (car (codeql--alerts-position results alerts)))
+         (target
+          (cond
+           ((eq (window-buffer) results)
+            ;; like in compilation buffers, point between alerts or on an
+            ;; alert that wasn't visited yet is before the next alert
+            (let ((between (or (< current 0)
+                               (>= (window-point)
+                                   (codeql--alert-end (aref alerts current)))))
+                  (visited (eql current (car (codeql--alerts-visited results alerts)))))
+              (cond ((or visited (and between (> n 0))) (+ current n))
+                    (between (+ current n 1))
+                    ((> n 0) (+ current n -1))
+                    (t (+ current n)))))
+           ;; with no current alert, start from either end
+           ((< current 0) (if (> n 0) (1- n) (+ (length alerts) n)))
+           (t (+ current n)))))
+    (cond
+     ((zerop (length alerts))
+      (user-error "No alerts in %s" (buffer-name results)))
+     ((>= target (length alerts))
+      (user-error "No more alerts%s" (codeql--alerts-boundary-hint results)))
+     ((< target 0)
+      (user-error "No previous alerts%s" (codeql--alerts-boundary-hint results))))
+    (codeql--alert-visit results target 0)))
+
+(defun codeql-previous-alert (&optional n)
+  "Visit the location of the Nth previous alert of a CodeQL results buffer.
+
+See `codeql-next-alert'."
+  (interactive "p")
+  (codeql-next-alert (- (or n 1))))
+
+(defun codeql-next-alert-location (&optional n)
+  "Visit the Nth next location of the current alert of CodeQL results.
+
+The locations of an alert are its own location, followed by the related
+locations of its message and the steps of its paths, from source to
+sink.  Moving past either end wraps around.  See `codeql-next-alert'
+for the current alert."
+  (interactive "p")
+  (let* ((n (or n 1))
+         (results (codeql--alerts-results-buffer))
+         (alerts (with-current-buffer results (codeql--results-alerts)))
+         (position (codeql--alerts-position results alerts))
+         (alert (car position)))
+    (when (< alert 0)
+      (user-error "No current alert, visit one with `codeql-next-alert' first"))
+    (let ((count (length (codeql--alert-locations (aref alerts alert)))))
+      (codeql--alert-visit results alert (mod (+ (max 0 (cdr position)) n) count)))))
+
+(defun codeql-previous-alert-location (&optional n)
+  "Visit the Nth previous location of the current alert of CodeQL results.
+
+See `codeql-next-alert-location'."
+  (interactive "p")
+  (codeql-next-alert-location (- (or n 1))))
+
+(defun codeql--results-next-error (n &optional reset)
+  "Visit the Nth next alert of the current results buffer, for `next-error'.
+
+With RESET, count from the first alert."
+  (if (not reset)
+      (codeql-next-alert n)
+    (let ((alerts (codeql--results-alerts)))
+      (unless (< 0 n (1+ (length alerts)))
+        (user-error "No alert %d%s" n (codeql--alerts-boundary-hint (current-buffer))))
+      (codeql--alert-visit (current-buffer) (1- n) 0))))
+
+(defvar codeql-alert-navigation-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "n") #'codeql-next-alert)
+    (define-key map (kbd "p") #'codeql-previous-alert)
+    (define-key map (kbd "f") #'codeql-next-alert-location)
+    (define-key map (kbd "b") #'codeql-previous-alert-location)
+    map)
+  "Keymap of the commands navigating the alerts of CodeQL results.
+
+Bind it to a prefix key, for example:
+
+  (keymap-global-set \"C-c n\" codeql-alert-navigation-map)
+
+It's also a `repeat-mode' map, so with `repeat-mode' enabled the
+commands can be repeated without the prefix key.")
+
+(dolist (command '(codeql-next-alert codeql-previous-alert
+                   codeql-next-alert-location codeql-previous-alert-location))
+  (put command 'repeat-map 'codeql-alert-navigation-map))
 
 (defun codeql--process-defs (json src-filename src-root _src-buffer)
   (puthash src-filename (list json src-root) codeql--definitions-cache)
@@ -4752,7 +5162,8 @@ with many results, as their tuples aren't decoded and rendered."
                 ;; since we render results in a flat text format
                 ;; we store it to disk on first render
                 (if (file-exists-p org-results)
-                    (find-file org-results)
+                    (with-current-buffer (find-file org-results)
+                      (setq-local next-error-function #'codeql--results-next-error))
                   (codeql-load-bqrs
                    bqrs-path
                    query-path
