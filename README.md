@@ -8,7 +8,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 
 - [Tree-sitter](https://tree-sitter.github.io/tree-sitter/) based syntax highlighting and indentation for the CodeQL query language
 - Query execution
-- Quick query evaluation
+- Quick query evaluation of regions or of the predicate at point, and quick evaluation counts
 - Query history for the local session
 - Database history for the global session
 - Result browsing
@@ -194,6 +194,8 @@ You can find existing databases for a ton of open source projects on [LGTM.com](
 If there is an active region, `emacs-codeql` will attempt to quick-eval that region. Note that to quick-eval an entire predicate, you should mark the predicate name itself as opposed to the entire predicate definition. This follows the same semantics as quick-evaluation in the vscode extension.
 
 If there is no active region, `emacs-codeql` will attempt to run the full query by default.
+
+The `e` (quick eval) transient command, `codeql-query-server-quick-eval`, always quick evaluates: the active region if there is one, and otherwise the predicate or expression at point, e.g. with point on the name of a predicate. The `n` (quick eval count) command, `codeql-query-server-quick-eval-count`, does the same but only counts the results, which is much faster for predicates with many tuples. The counts are shown as a table of the total number of tuples and the distinct values of each column. Quick evaluation counts need the `query-server2` query server.
 
 #### Result rendering
 
