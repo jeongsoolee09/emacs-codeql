@@ -267,17 +267,32 @@ results buffer for the first time."
   :type 'number
   :group 'emacs-codeql)
 
-(defcustom codeql-share-query-server nil
-  "Share one query server and database across all QL buffers.
+(defcustom codeql-share-query-server 'project
+  "Which QL buffers share a query server and database.
 
-When nil, every QL buffer has its own query server and database, and you can
-share them on demand with `codeql-query-server-inherit'.
+When `project', the default, QL buffers of the same project, on the same
+host and with the same CodeQL CLI, use one query server, active database
+and query history, much like eglot manages one language server per
+project.  A server started in one of them is used by all others,
+including ones opened later.  A project is a version controlled
+directory tree, or else a CodeQL pack.
 
-When non-nil, QL buffers on the same host and with the same CodeQL CLI use one
-query server, active database and query history: a server started in one of
-them is used by all others, including ones opened later.  This is convenient
-when developing a query together with its library files."
-  :type 'boolean
+When t, all QL buffers on the same host and with the same CodeQL CLI
+share one query server, whatever their project.
+
+When nil, every QL buffer has its own query server and database, and you
+can share them on demand with `codeql-query-server-inherit'.
+
+Use `codeql-query-servers' to list, restart and shut down the running
+query servers."
+  :type '(choice (const :tag "Per project" project)
+                 (const :tag "Across projects" t)
+                 (const :tag "Per buffer" nil))
+  :group 'emacs-codeql)
+
+(defcustom codeql-query-server-default-args '("--threads=0" "--quiet" "--log-to-stderr")
+  "Arguments that `codeql-query-server-start' starts a query server with."
+  :type '(repeat string)
   :group 'emacs-codeql)
 
 (defcustom codeql-remote-server-ready-timeout 60
@@ -1041,9 +1056,26 @@ Provides backwards references into the AST buffer from the source file.")
                           (eq (buffer-local-value 'codeql--query-server buffer) server)))
                    (codeql--ql-buffers))))
 
-(defun codeql--query-server-share-key ()
-  "Return what QL buffers need in common to share a query server."
+(defun codeql--query-server-host-key ()
+  "Return what QL buffers need in common to use the same query server at all."
   (list (file-remote-p default-directory) codeql--cli-buffer-local))
+
+(defun codeql--query-server-project ()
+  "Return the project that the query server of the current buffer belongs to."
+  (codeql--database-history-project))
+
+(defun codeql--query-server-share-key ()
+  "Return what QL buffers need in common to share a query server automatically.
+
+This depends on `codeql-share-query-server'."
+  (append (codeql--query-server-host-key)
+          (when (eq codeql-share-query-server 'project)
+            (list (codeql--query-server-project)))))
+
+(defvar codeql--query-servers (make-hash-table :test #'eq)
+  "The running query server connections, and what they were started with.
+
+The values are plists with :project, :remote, :args and :started.")
 
 (defun codeql--query-server-copy-state (source)
   "Copy the shared query server state of buffer SOURCE to the current buffer."
@@ -1072,17 +1104,10 @@ Only applies when `codeql-share-query-server' is non-nil."
 
 (defun codeql--query-server-adopt ()
   "Use the query server of another QL buffer, if `codeql-share-query-server'."
-  (when (and codeql-share-query-server (not codeql--query-server))
-    (let ((key (codeql--query-server-share-key)))
-      (when-let ((source (seq-find (lambda (buffer)
-                                     (and (not (eq buffer (current-buffer)))
-                                          (buffer-local-value 'codeql--query-server buffer)
-                                          (equal (with-current-buffer buffer
-                                                   (codeql--query-server-share-key))
-                                                 key)))
-                                   (codeql--ql-buffers))))
-        (codeql--query-server-copy-state source)
-        (message "Using the query server of %s." (buffer-name source))))))
+  (unless codeql--query-server
+    (when-let ((source (codeql--query-server-shareable)))
+      (codeql--query-server-copy-state source)
+      (message "Using the query server of %s." (buffer-name source)))))
 
 (defun codeql-query-server-inherit (buffer)
   "Use the query server, database and query history of QL BUFFER."
@@ -1091,14 +1116,14 @@ Only applies when `codeql-share-query-server' is non-nil."
      (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
      (when codeql--query-server
        (user-error "This buffer already has a query server, stop it first"))
-     (let* ((key (codeql--query-server-share-key))
+     (let* ((key (codeql--query-server-host-key))
             (candidates
              (mapcar #'buffer-name
                      (seq-filter (lambda (buffer)
                                    (and (not (eq buffer (current-buffer)))
                                         (buffer-local-value 'codeql--query-server buffer)
                                         (equal (with-current-buffer buffer
-                                                 (codeql--query-server-share-key))
+                                                 (codeql--query-server-host-key))
                                                key)))
                                  (codeql--ql-buffers)))))
        (unless candidates
@@ -1116,6 +1141,7 @@ Only applies when `codeql-share-query-server' is non-nil."
 
 (defun codeql--query-server-on-shutdown (obj buffer-context)
   "Clear the server and database state of the buffers that used server OBJ."
+  (remhash obj codeql--query-servers)
   (let ((buffers (codeql--query-server-buffers obj)))
     (when (and (buffer-live-p buffer-context) (not (memq buffer-context buffers)))
       (push buffer-context buffers))
@@ -6073,6 +6099,250 @@ can corrupt the cache.  Delete anyway? "
 (with-eval-after-load 'embark
   (add-to-list 'embark-keymap-alist '(codeql-database . codeql-database-map)))
 
+;;; Query server connections
+
+(defun codeql--query-server-live ()
+  "Return the running query servers, with what they were started with."
+  (let (servers)
+    (maphash (lambda (server info)
+               (if (jsonrpc-running-p server)
+                   (push (cons server info) servers)
+                 (remhash server codeql--query-servers)))
+             codeql--query-servers)
+    servers))
+
+(defun codeql--query-server-annotation (server info)
+  "Return the completion annotation of query SERVER, started with INFO."
+  (let* ((buffers (codeql--query-server-buffers server))
+         (database (and buffers
+                        (buffer-local-value 'codeql--active-database (car buffers))))
+         (minutes (round (- (float-time) (plist-get info :started)) 60)))
+    (concat
+     (propertize " " 'display '(space :align-to (max 50 (+ left 2))))
+     (propertize (format "%-24s" (if database
+                                     (file-name-base (directory-file-name database))
+                                   "no database"))
+                 'face (if database 'font-lock-type-face 'shadow))
+     (propertize (format "%-11s" (format "%d buffer%s" (length buffers)
+                                         (if (= (length buffers) 1) "" "s")))
+                 'face 'completions-annotations)
+     (propertize (if (< minutes 60)
+                     (format "up %dm" minutes)
+                   (format "up %dh%02dm" (/ minutes 60) (% minutes 60)))
+                 'face 'completions-annotations)
+     (when (and buffers (memq (current-buffer) buffers))
+       (propertize "  this buffer" 'face 'success)))))
+
+(defun codeql--read-query-server (prompt)
+  "Read a running query server with PROMPT, and return its connection.
+
+The servers of the current project come first, and the server of the
+current buffer first of all.  With consult installed, the servers of
+the current project and of other projects can be narrowed to with p
+and o."
+  (let* ((current (and (eq major-mode 'ql-tree-sitter-mode) codeql--query-server))
+         (project (codeql--database-history-project))
+         (remote (file-remote-p default-directory))
+         (servers (seq-sort-by
+                   (lambda (entry)
+                     (list (if (eq (car entry) current) 0 1)
+                           (- (plist-get (cdr entry) :started))))
+                   (lambda (a b) (or (< (car a) (car b))
+                                     (and (= (car a) (car b)) (< (cadr a) (cadr b)))))
+                   (codeql--query-server-live)))
+         (servers (append (seq-filter (lambda (entry)
+                                        (or (eq (car entry) current)
+                                            (and (equal (plist-get (cdr entry) :project) project)
+                                                 (equal (plist-get (cdr entry) :remote) remote))))
+                                      servers)
+                          (seq-remove (lambda (entry)
+                                        (or (eq (car entry) current)
+                                            (and (equal (plist-get (cdr entry) :project) project)
+                                                 (equal (plist-get (cdr entry) :remote) remote))))
+                                      servers)))
+         (lookup (make-hash-table :test #'equal))
+         (annotations (make-hash-table :test #'equal))
+         (groups (make-hash-table :test #'equal))
+         (candidates
+          (mapcar
+           (lambda (entry)
+             (pcase-let* ((`(,server . ,info) entry)
+                          (ours (or (eq server current)
+                                    (and (equal (plist-get info :project) project)
+                                         (equal (plist-get info :remote) remote))))
+                          (label (concat (or (plist-get info :remote) "")
+                                         (plist-get info :project)))
+                          (buffers (codeql--query-server-buffers server)))
+               ;; per buffer servers can share a project
+               (when (and (gethash label lookup) buffers)
+                 (setq label (format "%s [%s]" label (buffer-name (car buffers)))))
+               (let ((base label) (n 1))
+                 (while (gethash label lookup)
+                   (setq label (format "%s <%d>" base (cl-incf n)))))
+               (puthash label server lookup)
+               (puthash label (codeql--query-server-annotation server info) annotations)
+               (puthash label (if ours ?p ?o) groups)
+               (propertize label 'consult--type (if ours ?p ?o))))
+           servers))
+         (annotate (lambda (cand) (gethash cand annotations)))
+         (types '((?p . "This project") (?o . "Other projects"))))
+    (unless candidates
+      (user-error "No query servers are running"))
+    (gethash
+     (if (require 'consult nil t)
+         (consult--read candidates
+                        :prompt prompt
+                        :category 'codeql-query-server
+                        :require-match t
+                        :sort nil
+                        :annotate annotate
+                        :group (consult--type-group types)
+                        :narrow (consult--type-narrow types))
+       (completing-read
+        prompt
+        (lambda (string predicate action)
+          (if (eq action 'metadata)
+              `(metadata (category . codeql-query-server)
+                         (display-sort-function . identity)
+                         (annotation-function . ,annotate)
+                         (group-function
+                          . ,(lambda (cand transform)
+                               (if transform
+                                   cand
+                                 (alist-get (gethash cand groups) types)))))
+            (complete-with-action action candidates string predicate)))
+        nil t))
+     lookup)))
+
+(defun codeql--query-server-buffers-or-error (server)
+  "Return the QL buffers that use query SERVER, or signal an error."
+  (or (codeql--query-server-buffers server)
+      (user-error "No QL buffer uses this query server")))
+
+(defun codeql-query-server-switch-to-buffer (server)
+  "Switch to a QL buffer that uses query SERVER."
+  (interactive (list (codeql--read-query-server "Switch to a buffer of query server: ")))
+  (let ((buffers (codeql--query-server-buffers-or-error server)))
+    (pop-to-buffer-same-window
+     (if (cdr buffers)
+         (read-buffer "Buffer: " (car buffers) t
+                      (lambda (cand)
+                        (memq (get-buffer (if (consp cand) (car cand) cand)) buffers)))
+       (car buffers)))))
+
+(defun codeql-query-server-shutdown (server)
+  "Shut down query SERVER, for all the QL buffers that use it."
+  (interactive (list (codeql--read-query-server "Shut down query server: ")))
+  (jsonrpc-shutdown server))
+
+(defun codeql-query-server-shutdown-all ()
+  "Shut down all running query servers."
+  (interactive)
+  (let ((servers (mapcar #'car (codeql--query-server-live))))
+    (if (not servers)
+        (message "No query servers are running")
+      (when (y-or-n-p (format "Shut down %d query server%s? "
+                              (length servers) (if (cdr servers) "s" "")))
+        (mapc #'jsonrpc-shutdown servers)))))
+
+(defun codeql-query-server-restart (server)
+  "Restart query SERVER with the options it was started with.
+
+The QL buffers that used it use the new server, keep their query history
+and get their active database registered again."
+  (interactive (list (codeql--read-query-server "Restart query server: ")))
+  (let* ((info (gethash server codeql--query-servers))
+         (buffers (codeql--query-server-buffers-or-error server))
+         (buffer (car buffers))
+         (database (buffer-local-value 'codeql--active-database buffer)))
+    (jsonrpc-shutdown server)
+    (with-current-buffer buffer
+      (let ((codeql-register-last-database (and (not database)
+                                                codeql-register-last-database)))
+        (codeql--query-server-start (plist-get info :args)))
+      (dolist (other (cdr buffers))
+        (when (buffer-live-p other)
+          (with-current-buffer other
+            (unless codeql--query-server
+              (codeql--query-server-copy-state buffer)))))
+      (when database
+        (codeql-query-server-register-database (codeql--tramp-wrap database))))))
+
+(defun codeql-query-server-events-buffer (server)
+  "Display the JSON-RPC events buffer of query SERVER."
+  (interactive (list (codeql--read-query-server "Events of query server: ")))
+  (display-buffer (jsonrpc-events-buffer server)))
+
+(defun codeql-query-server-stderr-buffer (server)
+  "Display the standard error buffer of query SERVER."
+  (interactive (list (codeql--read-query-server "Stderr of query server: ")))
+  (display-buffer
+   (or (and (fboundp 'jsonrpc-stderr-buffer)
+            (buffer-live-p (jsonrpc-stderr-buffer server))
+            (jsonrpc-stderr-buffer server))
+       ;; jsonrpc hides the stderr buffer that the server was started with
+       (get-buffer (format " *%s stderr*" (jsonrpc-name server)))
+       (get-buffer (format "*%s stderr*" (jsonrpc-name server)))
+       (user-error "Query server %s has no stderr buffer" (jsonrpc-name server)))))
+
+(defun codeql-query-server-use (server)
+  "Use query SERVER, its database and query history in the current QL buffer."
+  (interactive
+   (progn
+     (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+     (list (codeql--read-query-server "Use query server: "))))
+  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (cond
+   ((eq server codeql--query-server)
+    (message "This buffer already uses that query server"))
+   (codeql--query-server
+    (user-error "This buffer already has a query server, stop it first"))
+   (t
+    (codeql-query-server-inherit (car (codeql--query-server-buffers-or-error server))))))
+
+(defun codeql-query-servers ()
+  "Pick a running query server and act on it.
+
+The servers of the current project come first, annotated with their
+active database, the number of QL buffers that use them, and how long
+they have been running.  Then choose to switch to one of its buffers,
+restart it, shut it down, show its JSON-RPC events or stderr, or use
+it in the current QL buffer.  With embark, the same actions are in
+`codeql-query-server-map'."
+  (interactive)
+  (let* ((server (codeql--read-query-server "Query server: "))
+         (choices `((?b "buffer" "switch to one of its buffers")
+                    (?r "restart" "restart it, keeping the database")
+                    (?k "kill" "shut it down")
+                    (?e "events" "show its JSON-RPC events")
+                    (?l "log" "show its stderr")
+                    ,@(when (and (eq major-mode 'ql-tree-sitter-mode)
+                                 (not codeql--query-server))
+                        '((?u "use" "use it in this buffer")))))
+         (choice (car (read-multiple-choice (format "%s: " (jsonrpc-name server)) choices))))
+    (pcase choice
+      (?b (codeql-query-server-switch-to-buffer server))
+      (?r (codeql-query-server-restart server))
+      (?k (codeql-query-server-shutdown server))
+      (?e (codeql-query-server-events-buffer server))
+      (?l (codeql-query-server-stderr-buffer server))
+      (?u (codeql-query-server-use server)))))
+
+(defvar codeql-query-server-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'codeql-query-server-switch-to-buffer)
+    (define-key map (kbd "b") #'codeql-query-server-switch-to-buffer)
+    (define-key map (kbd "r") #'codeql-query-server-restart)
+    (define-key map (kbd "k") #'codeql-query-server-shutdown)
+    (define-key map (kbd "e") #'codeql-query-server-events-buffer)
+    (define-key map (kbd "l") #'codeql-query-server-stderr-buffer)
+    (define-key map (kbd "u") #'codeql-query-server-use)
+    map)
+  "Embark actions for running query servers.")
+
+(with-eval-after-load 'embark
+  (add-to-list 'embark-keymap-alist '(codeql-query-server . codeql-query-server-map)))
+
 ;;; transient ui for buffer-local server state management
 
 (transient-define-argument codeql-transient-query-server:--threads ()
@@ -6187,6 +6457,122 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
                          " "))
     contact))
 
+(defun codeql--query-server-start (args)
+  "Start a query server for the current buffer with the user ARGS.
+
+The server is shared with the buffers that `codeql-share-query-server'
+says should share it."
+  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (let* ((ram-options (codeql--query-server-resolve-ram codeql--query-server-max-ram))
+         (server-args (append
+                       args
+                       ram-options
+                       ;; non-user arguments go here
+                       (cond
+                        ;; old query-server options
+                        ((string= codeql-query-server "query-server")
+                         '("--require-db-registration"))
+                        ;; new query-server options
+                        ((string= codeql-query-server "query-server2")
+                         nil))))
+         (project (codeql--query-server-project)))
+    (cl-assert ram-options t)
+    ;; spawn the server process
+    (let* ((name (format "CODEQL Query Server (%s%s)"
+                         ;; add remote prefix if its there to dedicate event buffer
+                         (or (file-remote-p default-directory) "")
+                         (if codeql-share-query-server
+                             ;; name shared servers after what they are shared by
+                             (if (eq codeql-share-query-server 'project)
+                                 (file-name-nondirectory (directory-file-name project))
+                               "shared")
+                           ;; show query file name for this server if available
+                           (format "%s -> %s"
+                                   (file-name-base (directory-file-name default-directory))
+                                   (or (file-name-nondirectory (buffer-file-name))
+                                       "(no file name)")))))
+           (cmd (append
+                 codeql--cli-buffer-local
+                 (list "execute"
+                       ;; determine which query server to use
+                       ;; prefer query-server2 when available
+                       ;; don't confuse this with codeql--query-server, which is the rpc connection
+                       (or codeql-query-server
+                           (setq codeql-query-server
+                                 (codeql--resolve-query-server))))
+                 server-args)))
+      (message "Starting query server.")
+      ;; manage these buffer local
+      (setq codeql--query-server
+            (apply
+             #'make-instance
+             'jsonrpc-process-connection
+             :process
+             ;; spawn in the remote context if need be
+             (let* ((default-directory default-directory)
+                    (cmd (codeql--query-server-cmd cmd)))
+               (message "Starting query server with: %s" cmd)
+               (codeql--make-server-process
+                'utf-8-emacs-unix
+                :name name
+                :command cmd
+                :connection-type 'pipe
+                :noquery t
+                :stderr (get-buffer-create (format "*%s stderr*" name))))
+             :name name
+             :notification-dispatcher #'codeql--query-server-handle-notification
+             :request-dispatcher #'codeql--query-server-handle-request
+             :on-shutdown
+             (let ((buffer-context (current-buffer)))
+               (lambda (obj)
+                 (codeql--query-server-on-shutdown obj buffer-context)))
+             (codeql--jsonrpc-events-buffer-args)))
+      (puthash codeql--query-server
+               (list :project project
+                     :remote (file-remote-p default-directory)
+                     :args args
+                     :started (float-time))
+               codeql--query-servers)
+      ;; created up front so that buffers sharing this server share it too
+      (unless codeql--completed-query-history
+        (setq codeql--completed-query-history (make-hash-table :test #'equal)))
+      (codeql--query-server-share)
+      (message "Started query server.")
+      (when codeql-register-last-database
+        (codeql--register-last-database)))))
+
+(defun codeql--query-server-shareable ()
+  "Return a QL buffer whose query server the current buffer should share."
+  (when codeql-share-query-server
+    (let ((key (codeql--query-server-share-key)))
+      (seq-find (lambda (buffer)
+                  (and (not (eq buffer (current-buffer)))
+                       (buffer-local-value 'codeql--query-server buffer)
+                       (equal (with-current-buffer buffer
+                                (codeql--query-server-share-key))
+                              key)))
+                (codeql--ql-buffers)))))
+
+(defun codeql-query-server-start (&optional arg)
+  "Start a query server for the current QL buffer.
+
+The server is started with `codeql-query-server-default-args'.  With a
+prefix ARG, pick the server options in a transient instead.
+
+When another buffer of the same project already has a query server, and
+`codeql-share-query-server' says to share it, that server is used."
+  (interactive "P")
+  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (cond
+   (codeql--query-server
+    (message "There is already a query server running"))
+   ((codeql--query-server-shareable)
+    (codeql--query-server-adopt))
+   (arg
+    (transient-setup 'codeql-transient-query-server-init-start))
+   (t
+    (codeql--query-server-start codeql-query-server-default-args))))
+
 (transient-define-suffix codeql-transient-query-server-start ()
   "Start a CodeQL query server."
   :description "start"
@@ -6195,69 +6581,7 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (if codeql--query-server
       (message "There is already a query server running")
-    (let* ((ram-options (codeql--query-server-resolve-ram codeql--query-server-max-ram))
-           (args (append
-                  (transient-args transient-current-command)
-                  ram-options
-                  ;; non-user arguments go here
-                  (cond
-                   ;; old query-server options
-                   ((string= codeql-query-server "query-server")
-                    '("--require-db-registration"))
-                   ;; new query-server options
-                   ((string= codeql-query-server "query-server2")
-                    nil)))))
-      (cl-assert ram-options t)
-      ;; spawn the server process
-      (let* ((name (format "CODEQL Query Server (%s%s -> %s)"
-                           ;; add remote prefix if its there to dedicate event buffer
-                           (or (file-remote-p default-directory) "")
-                           ;; show query file name for this server if available
-                           (file-name-base (directory-file-name default-directory))
-                           (or (file-name-nondirectory (buffer-file-name)) "(no file name)")))
-             (cmd (append
-                   codeql--cli-buffer-local
-                   (list "execute"
-                         ;; determine which query server to use
-                         ;; prefer query-server2 when available
-                         ;; don't confuse this with codeql--query-server, which is the rpc connection
-                         (or codeql-query-server
-                             (setq codeql-query-server
-                                   (codeql--resolve-query-server))))
-                   args)))
-        (message "Starting query server.")
-        ;; manage these buffer local
-        (setq codeql--query-server
-              (apply
-               #'make-instance
-               'jsonrpc-process-connection
-               :process
-               ;; spawn in the remote context if need be
-               (let* ((default-directory default-directory)
-                      (cmd (codeql--query-server-cmd cmd)))
-                 (message "Starting query server with: %s" cmd)
-                 (codeql--make-server-process
-                  'utf-8-emacs-unix
-                  :name name
-                  :command cmd
-                  :connection-type 'pipe
-                  :noquery t
-                  :stderr (get-buffer-create (format "*%s stderr*" name))))
-               :name name
-               :notification-dispatcher #'codeql--query-server-handle-notification
-               :request-dispatcher #'codeql--query-server-handle-request
-               :on-shutdown
-               (let ((buffer-context (current-buffer)))
-                 (lambda (obj)
-                   (codeql--query-server-on-shutdown obj buffer-context)))
-               (codeql--jsonrpc-events-buffer-args)))
-        ;; created up front so that buffers sharing this server share it too
-        (unless codeql--completed-query-history
-          (setq codeql--completed-query-history (make-hash-table :test #'equal)))
-        (codeql--query-server-share)
-        (message "Started query server.")
-        (when codeql-register-last-database
-          (codeql--register-last-database))))))
+    (codeql--query-server-start (transient-args transient-current-command))))
 
 (transient-define-suffix codeql-transient-query-server-stop ()
   "Stop a CodeQL query server."
@@ -6337,7 +6661,8 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
                     ((codeql--query-server-buffers codeql--query-server (current-buffer))
                      "stop (shared)")
                     (t "stop"))))
-           ("i" "inherit" codeql-query-server-inherit)]
+           ("i" "inherit" codeql-query-server-inherit)
+           ("m" "manage" codeql-query-servers)]
           ["Database"
            ("d" codeql-query-server-register-database
             :description

@@ -180,7 +180,7 @@ In org documents, `#+begin_src codeql` and `#+begin_src ql` blocks use this mode
 
 You can register a database for your current project via `M-x codeql-transient-query-server-interact` and selecting `d` to register an active database. Ensure you have started a query server first by using `s` from the same menu. If a database is active in another query buffer, it will automatically be deregistered there and registered for your current buffer.
 
-Database selection is buffer-local per query file and you can run as many concurrent query projects as you have resources available.
+Database selection is per project by default (see [Sharing a query server](#sharing-a-query-server-across-query-and-library-files)), and you can run as many concurrent query projects as you have resources available.
 
 #### Database history
 
@@ -198,19 +198,31 @@ You can also register a zipped database archive (`.zip`) with `d`. It is unpacke
 
 A query server that crashed or was killed can leave its database locked, so that other query servers fail to evaluate queries against it. Select `u` (unlock), or `M-x codeql-database-delete-lock`, to delete the evaluation cache lock (`db-<language>/default/cache/.lock`) of the active database. With a prefix argument, or without an active database, you pick the database from the history instead. You are asked to confirm first, and warned when a query server in this Emacs still uses the database, or when another process (as reported by `lsof`) still has the lock open.
 
-`emacs-codeql` buffer-local approach means you can work on e.g. a `cpp` and `javascript` project concurrently, and you can an arbitrary amount of concurrent results buffers as you toggle between your query buffers.
+`emacs-codeql`'s per-project approach means you can work on e.g. a `cpp` and `javascript` project concurrently, and you can an arbitrary amount of concurrent results buffers as you toggle between your query buffers.
 
 #### Sharing a query server across query and library files
 
-When a query grows into helper `.qll` files, you'll want those buffers to use the same query server and database, e.g. to quick-eval a library predicate. Select `i` (inherit) in the transient of a buffer without a query server to share the server, active database and query history of another query buffer on the same host.
+When a query grows into helper `.qll` files, you'll want those buffers to use the same query server and database, e.g. to quick-eval a library predicate. By default, query servers are per project, much like eglot manages one language server per project: all query buffers of the same project, on the same host and with the same CodeQL CLI, share a single query server, database and query history. A project is a version-controlled directory tree, or else a CodeQL pack. A server started in one of them is picked up by the others, including buffers you open later, and registering a database in any of them makes it active in all of them. Stopping the server stops it for all of them. Killing a buffer only shuts the server down when no other buffer uses it.
 
-To share them automatically, set `codeql-share-query-server`:
+`codeql-share-query-server` controls this:
 
 ```elisp
-(setq codeql-share-query-server t)
+(setq codeql-share-query-server 'project) ; the default: one server per project
+(setq codeql-share-query-server t)        ; one server across projects, as in the VS Code extension
+(setq codeql-share-query-server nil)      ; one server per buffer
 ```
 
-All query buffers on the same host that use the same CodeQL CLI then share a single query server, database and query history, as in the VS Code extension. A server started in one of them is picked up by the others, including buffers you open later, and registering a database in any of them makes it active in all of them. Stopping the server stops it for all of them. Killing a buffer only shuts the server down when no other buffer uses it.
+Select `i` (inherit) in the transient of a buffer without a query server to share the server, active database and query history of any other query buffer on the same host, whatever its project.
+
+`M-x codeql-query-server-start` starts a query server without the transient, with the options in `codeql-query-server-default-args`; with a prefix argument it opens the transient to pick the options.
+
+#### Managing query servers
+
+`M-x codeql-query-servers` (`m` in the transient) lists the running query servers, those of the current project first and the one of the current buffer first of all. Each is annotated with its active database, the number of query buffers that use it and how long it has been running. After picking one, choose an action: `b` to switch to one of its buffers, `r` to restart it, `k` to shut it down, `e` for its JSON-RPC events, `l` for its stderr, or `u` to use it in the current buffer. The actions are also commands of their own: `codeql-query-server-switch-to-buffer`, `codeql-query-server-restart`, `codeql-query-server-shutdown`, `codeql-query-server-events-buffer`, `codeql-query-server-stderr-buffer` and `codeql-query-server-use`. `codeql-query-server-shutdown-all` shuts down all of them.
+
+Restarting a server starts a new one with the same options, used by the same buffers, which keep their query history, and registers their database again.
+
+When [consult](https://github.com/minad/consult) is installed the picker uses it, and you can narrow to the current project with `p` or to other projects with `o`. With [embark](https://github.com/oantolin/embark), the candidates offer the actions in `codeql-query-server-map`, with the same keys.
 
 You can find existing databases for a ton of open source projects on [LGTM.com](https://codeql.github.com/docs/codeql-cli/creating-codeql-databases/#obtaining-databases-from-lgtm-com), or you can [create your own](https://codeql.github.com/docs/codeql-cli/creating-codeql-databases/#creating-codeql-databases) using the codeql cli.
 
