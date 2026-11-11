@@ -290,6 +290,20 @@ query servers."
                  (const :tag "Per buffer" nil))
   :group 'emacs-codeql)
 
+(defcustom codeql-query-server-autoshutdown nil
+  "Whether to shut down a query server when no QL buffer uses it anymore.
+
+When nil, the default, a query server keeps running, with its database
+and query history, after the last QL buffer that used it is killed, as
+with `eglot-autoshutdown'.  QL buffers of its project that are opened
+later use it again, see `codeql-share-query-server'.  Shut it down with
+`codeql-query-servers' or `codeql-query-server-shutdown'.
+
+When non-nil, the query server is shut down with the last QL buffer that
+uses it."
+  :type 'boolean
+  :group 'emacs-codeql)
+
 (defcustom codeql-query-server-default-args '("--threads=0" "--quiet" "--log-to-stderr")
   "Arguments that `codeql-query-server-start' starts a query server with."
   :type '(repeat string)
@@ -1107,6 +1121,7 @@ Only applies when `codeql-share-query-server' is non-nil."
   (unless codeql--query-server
     (when-let ((source (codeql--query-server-shareable)))
       (codeql--query-server-copy-state source)
+      (codeql--query-server-kill-holders codeql--query-server)
       (message "Using the query server of %s." (buffer-name source)))))
 
 (defun codeql-query-server-inherit (buffer)
@@ -1137,7 +1152,11 @@ Only applies when `codeql-share-query-server' is non-nil."
       (setq codeql--completed-query-history (make-hash-table :test #'equal))
       (codeql--query-server-sync-state)))
   (codeql--query-server-copy-state buffer)
-  (message "Using the query server of %s." (buffer-name buffer)))
+  (message "Using the query server of %s." (buffer-name buffer))
+  (codeql--query-server-kill-holders codeql--query-server))
+
+(defvar codeql--query-server-restarting nil
+  "Non-nil while a query server is restarted, to keep its hidden buffer.")
 
 (defun codeql--query-server-on-shutdown (obj buffer-context)
   "Clear the server and database state of the buffers that used server OBJ."
@@ -1153,21 +1172,77 @@ Only applies when `codeql-share-query-server' is non-nil."
         ;; clear out the buffer-local server and database state
         (setq codeql--query-server nil)
         (codeql--reset-database-state)))
+    (unless codeql--query-server-restarting
+      (dolist (buffer buffers)
+        (when (and (buffer-live-p buffer)
+                   (buffer-local-value 'codeql--query-server-holder buffer))
+          (kill-buffer buffer))))
     (message "Shut down query server and cleared active database.")))
 
+(defvar-local codeql--query-server-holder nil
+  "Non-nil in the hidden buffer that keeps a query server without QL buffers.")
+
+(defun codeql--query-server-user-buffers (server &optional except)
+  "Return the QL buffers that use query SERVER, other than EXCEPT and hidden ones."
+  (seq-remove (lambda (buffer) (buffer-local-value 'codeql--query-server-holder buffer))
+              (codeql--query-server-buffers server except)))
+
+(defun codeql--query-server-hand-over (buffer)
+  "Make BUFFER the owner of the active database of the current buffer."
+  (when (and codeql--database-dataset-folder
+             (eq (codeql--active-datasets-get codeql--database-dataset-folder)
+                 (current-buffer)))
+    (codeql--active-datasets-add codeql--database-dataset-folder buffer)))
+
+(defun codeql--query-server-detach ()
+  "Keep the query server of the current buffer running in a hidden buffer.
+
+The hidden buffer keeps the database and query history of the server,
+so that QL buffers can use the server again later."
+  (let* ((source (current-buffer))
+         (server codeql--query-server)
+         (holder (generate-new-buffer (format " *%s*" (jsonrpc-name server)))))
+    (with-current-buffer holder
+      (setq default-directory (buffer-local-value 'default-directory source))
+      (setq major-mode 'ql-tree-sitter-mode)
+      (setq codeql--query-server-holder t)
+      (dolist (variable '(codeql--cli-buffer-local
+                          codeql--search-paths-buffer-local
+                          codeql--path-problem-max-paths))
+        (set (make-local-variable variable) (buffer-local-value variable source)))
+      (codeql--query-server-copy-state source))
+    (codeql--query-server-hand-over holder)
+    (setq codeql--query-server nil)
+    (codeql--reset-database-state)
+    (message "%s keeps running, shut it down with `codeql-query-servers'."
+             (jsonrpc-name server))))
+
+(defun codeql--query-server-kill-holders (server)
+  "Kill the hidden buffers that kept query SERVER, now that a QL buffer uses it."
+  (dolist (buffer (codeql--query-server-buffers server))
+    (when (buffer-local-value 'codeql--query-server-holder buffer)
+      (kill-buffer buffer))))
+
 (defun codeql--query-server-release ()
-  "Detach the current buffer from its query server, shutting it down if unused."
+  "Detach the current buffer from its query server.
+
+When no other QL buffer uses the server, it is shut down if
+`codeql-query-server-autoshutdown' is non-nil, and kept running otherwise."
   (when codeql--query-server
-    (if-let ((others (codeql--query-server-buffers codeql--query-server (current-buffer))))
-        (progn
-          ;; hand the database over to a buffer that keeps using it
-          (when (and codeql--database-dataset-folder
-                     (eq (codeql--active-datasets-get codeql--database-dataset-folder)
-                         (current-buffer)))
-            (codeql--active-datasets-add codeql--database-dataset-folder (car others)))
-          (setq codeql--query-server nil)
-          (codeql--reset-database-state))
-      (jsonrpc-shutdown codeql--query-server))))
+    (let* ((others (codeql--query-server-buffers codeql--query-server (current-buffer)))
+           (users (seq-remove (lambda (buffer)
+                                (buffer-local-value 'codeql--query-server-holder buffer))
+                              others)))
+      (cond
+       ;; hand the database over to a buffer that keeps using it
+       ((or users (and others (not codeql-query-server-autoshutdown)))
+        (codeql--query-server-hand-over (car (or users others)))
+        (setq codeql--query-server nil)
+        (codeql--reset-database-state))
+       ((or codeql-query-server-autoshutdown codeql--query-server-holder)
+        (jsonrpc-shutdown codeql--query-server))
+       (t
+        (codeql--query-server-detach))))))
 
 (defun codeql--query-server-next-client-id ()
   (setq codeql--query-server-client-id
@@ -6113,9 +6188,9 @@ can corrupt the cache.  Delete anyway? "
 
 (defun codeql--query-server-annotation (server info)
   "Return the completion annotation of query SERVER, started with INFO."
-  (let* ((buffers (codeql--query-server-buffers server))
-         (database (and buffers
-                        (buffer-local-value 'codeql--active-database (car buffers))))
+  (let* ((all (codeql--query-server-buffers server))
+         (buffers (codeql--query-server-user-buffers server))
+         (database (and all (buffer-local-value 'codeql--active-database (car all))))
          (minutes (round (- (float-time) (plist-get info :started)) 60)))
     (concat
      (propertize " " 'display '(space :align-to (max 50 (+ left 2))))
@@ -6123,9 +6198,11 @@ can corrupt the cache.  Delete anyway? "
                                      (file-name-base (directory-file-name database))
                                    "no database"))
                  'face (if database 'font-lock-type-face 'shadow))
-     (propertize (format "%-11s" (format "%d buffer%s" (length buffers)
-                                         (if (= (length buffers) 1) "" "s")))
-                 'face 'completions-annotations)
+     (if buffers
+         (propertize (format "%-11s" (format "%d buffer%s" (length buffers)
+                                             (if (= (length buffers) 1) "" "s")))
+                     'face 'completions-annotations)
+       (propertize (format "%-11s" "detached") 'face 'warning))
      (propertize (if (< minutes 60)
                      (format "up %dm" minutes)
                    (format "up %dh%02dm" (/ minutes 60) (% minutes 60)))
@@ -6172,7 +6249,7 @@ and o."
                                          (equal (plist-get info :remote) remote))))
                           (label (concat (or (plist-get info :remote) "")
                                          (plist-get info :project)))
-                          (buffers (codeql--query-server-buffers server)))
+                          (buffers (codeql--query-server-user-buffers server)))
                ;; per buffer servers can share a project
                (when (and (gethash label lookup) buffers)
                  (setq label (format "%s [%s]" label (buffer-name (car buffers)))))
@@ -6215,14 +6292,19 @@ and o."
      lookup)))
 
 (defun codeql--query-server-buffers-or-error (server)
-  "Return the QL buffers that use query SERVER, or signal an error."
-  (or (codeql--query-server-buffers server)
+  "Return the QL buffers that use query SERVER, hidden ones last.
+Signal an error when there are none."
+  (or (append (codeql--query-server-user-buffers server)
+              (seq-filter (lambda (buffer)
+                            (buffer-local-value 'codeql--query-server-holder buffer))
+                          (codeql--query-server-buffers server)))
       (user-error "No QL buffer uses this query server")))
 
 (defun codeql-query-server-switch-to-buffer (server)
   "Switch to a QL buffer that uses query SERVER."
   (interactive (list (codeql--read-query-server "Switch to a buffer of query server: ")))
-  (let ((buffers (codeql--query-server-buffers-or-error server)))
+  (let ((buffers (or (codeql--query-server-user-buffers server)
+                     (user-error "No QL buffer uses this query server, it is detached"))))
     (pop-to-buffer-same-window
      (if (cdr buffers)
          (read-buffer "Buffer: " (car buffers) t
@@ -6255,7 +6337,8 @@ and get their active database registered again."
          (buffers (codeql--query-server-buffers-or-error server))
          (buffer (car buffers))
          (database (buffer-local-value 'codeql--active-database buffer)))
-    (jsonrpc-shutdown server)
+    (let ((codeql--query-server-restarting t))
+      (jsonrpc-shutdown server))
     (with-current-buffer buffer
       (let ((codeql-register-last-database (and (not database)
                                                 codeql-register-last-database)))

@@ -202,7 +202,13 @@ A query server that crashed or was killed can leave its database locked, so that
 
 #### Sharing a query server across query and library files
 
-When a query grows into helper `.qll` files, you'll want those buffers to use the same query server and database, e.g. to quick-eval a library predicate. By default, query servers are per project, much like eglot manages one language server per project: all query buffers of the same project, on the same host and with the same CodeQL CLI, share a single query server, database and query history. A project is a version-controlled directory tree, or else a CodeQL pack. A server started in one of them is picked up by the others, including buffers you open later, and registering a database in any of them makes it active in all of them. Stopping the server stops it for all of them. Killing a buffer only shuts the server down when no other buffer uses it.
+When a query grows into helper `.qll` files, you'll want those buffers to use the same query server and database, e.g. to quick-eval a library predicate. By default, query servers are per project, much like eglot manages one language server per project: all query buffers of the same project, on the same host and with the same CodeQL CLI, share a single query server, database and query history. A project is a version-controlled directory tree, or else a CodeQL pack. A server started in one of them is picked up by the others, including buffers you open later, and registering a database in any of them makes it active in all of them. Stopping the server stops it for all of them.
+
+Query servers are disposed of manually: killing the last buffer that uses a server keeps it running in the background, detached, with its database and query history, much like eglot keeps its language servers. A buffer of its project that you open later uses it again (or pick it with `u` in `codeql-query-servers` when sharing is off), and registering its database from another server takes the database over. Shut it down with `codeql-query-servers` or `codeql-query-server-shutdown`. To shut a server down with the last buffer that uses it instead, set `codeql-query-server-autoshutdown`:
+
+```elisp
+(setq codeql-query-server-autoshutdown t)
+```
 
 `codeql-share-query-server` controls this:
 
@@ -218,7 +224,7 @@ Select `i` (inherit) in the transient of a buffer without a query server to shar
 
 #### Managing query servers
 
-`M-x codeql-query-servers` (`m` in the transient) lists the running query servers, those of the current project first and the one of the current buffer first of all. Each is annotated with its active database, the number of query buffers that use it and how long it has been running. After picking one, choose an action: `b` to switch to one of its buffers, `r` to restart it, `k` to shut it down, `e` for its JSON-RPC events, `l` for its stderr, or `u` to use it in the current buffer. The actions are also commands of their own: `codeql-query-server-switch-to-buffer`, `codeql-query-server-restart`, `codeql-query-server-shutdown`, `codeql-query-server-events-buffer`, `codeql-query-server-stderr-buffer` and `codeql-query-server-use`. `codeql-query-server-shutdown-all` shuts down all of them.
+`M-x codeql-query-servers` (`m` in the transient) lists the running query servers, those of the current project first and the one of the current buffer first of all. Each is annotated with its active database, the number of query buffers that use it (or `detached` when none does) and how long it has been running. After picking one, choose an action: `b` to switch to one of its buffers, `r` to restart it, `k` to shut it down, `e` for its JSON-RPC events, `l` for its stderr, or `u` to use it in the current buffer. The actions are also commands of their own: `codeql-query-server-switch-to-buffer`, `codeql-query-server-restart`, `codeql-query-server-shutdown`, `codeql-query-server-events-buffer`, `codeql-query-server-stderr-buffer` and `codeql-query-server-use`. `codeql-query-server-shutdown-all` shuts down all of them.
 
 Restarting a server starts a new one with the same options, used by the same buffers, which keep their query history, and registers their database again.
 
