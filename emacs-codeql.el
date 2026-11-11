@@ -538,6 +538,46 @@ Leave nil for default.")
   ;; xrefs from the root of a codeql buffer
   (advice-add 'xref-location-marker :around #'codeql-xref-location-marker))
 
+;; The language server watches **/*.{ql,qll,dbscheme}, which also matches
+;; the lock file (.#Foo.ql) Emacs creates on the first change after a save.
+;; Hearing about it makes the server drop the pending check of the edited
+;; buffer, so the diagnostics of that edit never arrive and stale ones stay.
+
+(declare-function eglot--major-modes "eglot")
+(declare-function eglot-uri-to-path "eglot")
+
+(defun codeql--lock-file-uri-p (uri)
+  "Return non-nil if URI names an Emacs lock file.
+Eglot resolves the lock file symlink, so URI can also be its dangling
+target, which looks like USER@HOST.PID:BOOT-TIME."
+  (let* ((path (eglot-uri-to-path uri))
+         (name (file-name-nondirectory path)))
+    (or (string-prefix-p ".#" name)
+        (and (string-match-p "@.*\\.[0-9]+\\(?::[0-9]+\\)?\\'" name)
+             (not (file-exists-p path))))))
+
+(defun codeql--lsp-server-p (connection)
+  "Return non-nil if CONNECTION is an eglot server for QL buffers."
+  (and (featurep 'eglot)
+       (object-of-class-p connection 'eglot-lsp-server)
+       (memq 'ql-tree-sitter-mode
+             (ignore-errors (eglot--major-modes connection)))))
+
+(defun codeql--lsp-drop-lock-file-changes (orig-fun connection method
+                                                    &optional params)
+  "Keep lock file events out of watched file changes sent to QL servers."
+  (if (and (eq method :workspace/didChangeWatchedFiles)
+           (codeql--lsp-server-p connection))
+      (let ((changes (seq-remove (lambda (change)
+                                   (codeql--lock-file-uri-p (plist-get change :uri)))
+                                 (plist-get params :changes))))
+        (when changes
+          (funcall orig-fun connection method
+                   (plist-put (copy-sequence params) :changes (vconcat changes)))))
+    (funcall orig-fun connection method params)))
+
+(advice-add 'jsonrpc-notify :around #'codeql--lsp-drop-lock-file-changes)
+
 (defun codeql--get-cli-version ()
   ;; used in setup for ql-tree-sitter-mode so we can not assert the mode here yet.
   (codeql--cli-command-to-string (list "version")))
