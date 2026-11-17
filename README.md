@@ -236,7 +236,65 @@ Results buffers use `codeql-results-mode`, a major mode derived from `org-mode`.
 
 The following query "kinds" are supported: `path-problem`, `problem`, and raw tuple results.
 
-kind: `problem` and `path-problem` are rendered as org trees, raw tuple results are rendered as org tables.
+kind: `problem` and `path-problem` are rendered as org trees, raw tuple results are rendered as org tables. Set `codeql-raw-results-style` to `outline` to render raw tuples as one org heading per row instead, or toggle the style of a results buffer with `codeql-results-toggle-raw-style`. Tables are easier to scan and sort, headings carry properties that can be searched (see below).
+
+Every results buffer is a regular org document with the same layout:
+
+```org
+* Query Source                 ← folded when the buffer is opened
+:PROPERTIES:
+:CODEQL_KIND: query-source
+:CODEQL_EVALUATION: query      ← or quick-eval, quick-eval-count
+:CODEQL_QUERY: /path/to/query.ql
+:CODEQL_DATABASE: /path/to/db
+:END:
+** Originating Query
+[[file:/path/to/query.ql][query.ql]]
+** Evaluated Code              ← quick evaluations only
+Quick evaluation of the region at [[file:/path/to/query.ql::12][query.ql:12:5]]:
+#+begin_src ql -i
+from int x where x in [1 .. 5] select x
+#+end_src
+* Results
+:PROPERTIES:
+:CODEQL_KIND: results
+:CODEQL_QUERY_KIND: problem    ← or path-problem, raw
+:END:
+** ≔ [js/xss] Cross-site scripting ... [[codeql:...][app.js]]:3:5
+:PROPERTIES:
+:CODEQL_KIND: result
+:CODEQL_QUERY_KIND: problem
+:CODEQL_RESULT: 1
+:CODEQL_RULE_ID: js/xss
+:CODEQL_MESSAGE: Cross-site scripting vulnerability due to user-provided value.
+:CODEQL_FILE: /src/app.js
+:CODEQL_LINE: 3
+:CODEQL_COLUMN: 5
+:CODEQL_END_LINE: 3
+:CODEQL_END_COLUMN: 10
+:END:
+*** Path #0
+...
+* Results Footer
+```
+
+`Query Source` records what produced the results: a link to the query file that was run, and for quick evaluations the exact code that was submitted, captured when you ran it, so later edits to the query buffer don't change it. Expand it with `TAB` as usual. Rows of raw results rendered as headings (`outline` style) carry `CODEQL_RESULT_SET`, `CODEQL_ROW`, the location properties of their first location, and one `CODEQL_COL_<NAME>` property per column. `CODEQL_FILE` is the path of the file in the analyzed project, the links point into the source archive of the database.
+
+##### Searching results with org-ql
+
+When [org-ql](https://github.com/alphapapa/org-ql) is installed, `codeql-results-org-ql` searches the results of the current results buffer and shows the matches as a sparse tree; with a prefix argument the matches are shown in an `org-ql-search` view instead. Queries are restricted to result headings (`CODEQL_KIND` = `result`), and can be written in the org-ql string syntax or as a sexp, e.g.:
+
+```
+xss                                         ; plain text search
+(property "CODEQL_FILE" "/src/app.js")      ; exact property values
+(property "CODEQL_RULE_ID" "js/xss")
+(regexp "user-provided")
+(and (property "CODEQL_QUERY_KIND" "raw") (regexp "eval"))
+```
+
+Raw results rendered as a table are switched to the `outline` style first, since org-ql only sees headings. Results buffers are org buffers, so `org-ql-select`, `org-ql-search` and friends work on them directly, too. org-ql is an optional dependency.
+
+Only the current page of paginated results is part of the buffer, and therefore searchable.
 
 Results contain source code locations in the form of org links, which can be visited with the normal org mode operations for link handling (e.g. `org-open-at-point`)
 
@@ -474,6 +532,16 @@ Alternatively you can compile `tree-sitter` 0.19.5 from scratch on an M1 mac by 
 After building the QL artifact(s) for the architectures and platforms you need to support, you'll want to grab `bin/ql.*` and move those into `~/.emacs.d/elpa/tree-sitter-langs*/bin/` and restart emacs.
 
 QL syntax highlighting and indentation should now work fine.
+
+## Running the tests
+
+The regression tests in `test/` don't need the CodeQL CLI:
+
+```
+emacs -Q --batch -L . -l test/emacs-codeql-test.el -f ert-run-tests-batch-and-exit
+```
+
+The org-ql tests are skipped unless org-ql and its dependencies are on the `load-path` (add them with `-L`).
 
 ## Known Quirks
 
