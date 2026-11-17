@@ -100,12 +100,16 @@
 (eval-when-compile
   (require 'org)
   (require 'ol)
-  (require 'org-table))
+  (require 'org-table)
+  (require 'org-src))
 (declare-function org-at-table-p "org")
 (declare-function org-link-escape "ol")
 (declare-function org-link-set-parameters "ol")
 (declare-function org-link-unescape "ol")
 (declare-function org-reveal "org")
+(declare-function org-escape-code-in-string "org-src")
+(declare-function org-cycle-hide-drawers "org-cycle")
+(declare-function outline-hide-subtree "outline")
 (declare-function treesit-ready-p "treesit")
 (declare-function treesit-parser-list "treesit.c")
 (declare-function treesit-node-at "treesit")
@@ -129,7 +133,8 @@
   "Load the parts of org that results and other org buffers rely on."
   (require 'org)
   (require 'ol)
-  (require 'org-table))
+  (require 'org-table)
+  (require 'org-src))
 
 ;; bundled
 (require 'json-pointer)
@@ -380,6 +385,18 @@ itself is opened instead."
 Queries that report more results than this are paginated, with each page
 holding at most this many results.  See `codeql-results-pagination-mode'."
   :type 'integer
+  :group 'emacs-codeql)
+
+(defcustom codeql-raw-results-style 'table
+  "How new results buffers show the rows of raw results.
+
+`table' shows them as an org table, `outline' shows each row as an org
+heading of its own, whose properties hold its row number, location and
+the value of each column, see `codeql-results-org-ql'.  The rows of
+problem and path-problem results are always headings.  Use
+`codeql-results-toggle-raw-style' to switch a results buffer."
+  :type '(choice (const :tag "Org table" table)
+                 (const :tag "Org headings" outline))
   :group 'emacs-codeql)
 
 (defcustom codeql-results-diagnostics nil
@@ -2353,8 +2370,50 @@ Sets an optional HEADER."
     ;; return our nodes as org list
     (buffer-string)))
 
-(defun codeql--query-results-to-org (query-results results-type &optional columns)
-  "Turn QUERY-RESULTS of RESULTS-TYPE into an org data."
+(defun codeql--raw-row-to-org-heading (row columns index result-set)
+  "Return an org heading for the raw results ROW, a list of result nodes.
+
+The heading lists the cells of ROW like a table row does, and its
+properties hold the 0-based INDEX of ROW in the result set named
+RESULT-SET, the location of its first cell that has one, and the value
+of each cell under the name of its column in COLUMNS.  The current
+buffer is the query buffer."
+  (let ((seen (make-hash-table :test #'equal)))
+    (concat
+     (codeql--org-safe-heading
+      (format "** %d. %s" (1+ index)
+              (mapconcat (lambda (node)
+                           (codeql--org-table-cell (codeql--result-node-to-org node)))
+                         row " | ")))
+     "\n"
+     (codeql--org-property-drawer
+      `(("CODEQL_KIND" . "result")
+        ("CODEQL_QUERY_KIND" . "raw")
+        ("CODEQL_RESULT_SET" . ,result-set)
+        ("CODEQL_ROW" . ,(1+ index))
+        ,@(codeql--result-location-properties
+           (seq-find #'codeql--result-node-visitable row))
+        ,@(cl-loop for node in row
+                   for i from 1
+                   for column = (and columns (< (1- i) (length columns)) (aref columns (1- i)))
+                   for name = (codeql--org-property-name
+                               (or (and column (json-pointer-get column "/name"))
+                                   (format "col%d" i)))
+                   for unique = (if (gethash name seen) (format "%s_%d" name i) name)
+                   do (puthash unique t seen)
+                   collect (cons (concat "CODEQL_COL_" unique)
+                                 (codeql--printable-label
+                                  (codeql--result-node-label node)))))))))
+
+(defun codeql--query-results-to-org (query-results results-type &optional columns start result-set)
+  "Turn QUERY-RESULTS of RESULTS-TYPE into an org data.
+
+RESULTS-TYPE is `raw' for an org table of raw result rows, `raw-outline'
+for raw result rows as org headings, see `codeql--raw-row-to-org-heading',
+and `problem' or `path-problem' for problem results, which are org
+headings.  The 0-based index of the first result is START, and the raw
+results are from RESULT-SET, a result set name.  COLUMNS is the vector of
+the columns of raw results, as decoded from the bqrs."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (let ((parent-buffer (current-buffer))
         ;; reuse the cache of an enclosing rendering pass, if any
@@ -2386,10 +2445,17 @@ Sets an optional HEADER."
                          (codeql--org-table-cell
                           (format "%s" (or name kind "(unknown)")))))
                      columns)))))
+        ('raw-outline
+         (cl-loop for row-data in (reverse query-results)
+                  for index from (or start 0) do
+                  (insert (with-current-buffer parent-buffer
+                            (codeql--raw-row-to-org-heading
+                             (reverse row-data) columns index result-set)))))
         ;; kind: problem and path-problem use the exact same SARIF renderer
         ((or 'problem 'path-problem)
          ;; generate an org tree off of a list structure
          (cl-loop for issue in query-results
+                  for index from (or start 0)
                   for locations = (codeql--result-node-locations issue)
                   for related-locations = (codeql--result-node-related-locations issue)
                   for code-flows = (codeql--result-node-code-flows issue)
@@ -2401,7 +2467,7 @@ Sets an optional HEADER."
                             (concat
                              (if-let ((url (and (codeql--result-node-visitable location)
                                                 (codeql--result-node-url location))))
-                                 (format "* %s [%s] %s ... %s%s"
+                                 (format "** %s [%s] %s ... %s%s"
                                          (or (codeql--result-node-mark issue) " ")
                                          (codeql--result-node-rule-id issue)
                                          ;; swap sarif markdown links for org links if required
@@ -2415,13 +2481,23 @@ Sets an optional HEADER."
                                              (codeql--uri-to-filename
                                               (json-pointer-get url "/uri")))))
                                          (codeql--location-position-text url))
-                               (format "* %s [%s] %s ... [location unknown]"
+                               (format "** %s [%s] %s ... [location unknown]"
                                        (or (codeql--result-node-mark issue) " ")
                                        (codeql--result-node-rule-id issue)
                                        (with-current-buffer parent-buffer
                                          (codeql--swap-sarif-links-for-org-links
                                           (codeql--result-node-label issue) related-locations))))
-                             "\n"))
+                             "\n"
+                             (codeql--org-property-drawer
+                              `(("CODEQL_KIND" . "result")
+                                ("CODEQL_QUERY_KIND" . ,(symbol-name results-type))
+                                ("CODEQL_RESULT" . ,(1+ index))
+                                ("CODEQL_RULE_ID" . ,(codeql--result-node-rule-id issue))
+                                ("CODEQL_MESSAGE" . ,(codeql--sarif-message-text
+                                                      (codeql--result-node-label issue)))
+                                ,@(codeql--result-location-properties location)
+                                ("CODEQL_PATHS" . ,(and code-flows
+                                                        (apply #'+ (mapcar #'length code-flows))))))))
                            ;; add any codeflow paths and their associated nodes for this issue
                            (when code-flows
                              (cl-loop for path in code-flows
@@ -2431,7 +2507,7 @@ Sets an optional HEADER."
                                                (insert (codeql--org-list-from-nodes
                                                         parent-buffer
                                                         nodes
-                                                        (format "** Path #%s\n" i))))))))))
+                                                        (format "*** Path #%s\n" i))))))))))
       ;; return final org data
       (buffer-string))))
 
@@ -2444,6 +2520,159 @@ columns of tables aligned by character width."
               (let ((table (copy-sequence (default-value 'glyphless-char-display))))
                 (aset table #x200b 'zero-width)
                 table)))
+
+;;; The org structure of results buffers
+;;
+;; A results buffer is an org document laid out as:
+;;
+;; * Query Source           CODEQL_KIND: query-source, folded initially
+;; ** Originating Query     file: link to the query that ran
+;; ** Evaluated Code        quick evaluations: the submitted code, verbatim
+;; * Results                CODEQL_KIND: results
+;; ** <result>              CODEQL_KIND: result, one per problem or raw row
+;; *** Path #N              path-problem paths
+;; * Results Footer         #+KEYWORD: metadata
+;;
+;; Raw results shown as a table have it directly under Results instead.
+
+(defvar-local codeql--results-context nil
+  "What the results of this buffer came from, a plist.
+
+:provenance describes the CodeQL code that ran, see
+`codeql--query-provenance', :database is the database it ran on and
+:query-kind is either \"problem\", \"path-problem\" or \"raw\".")
+
+(defun codeql--org-property-value (value)
+  "Return VALUE as the text of an org property value, or nil if it is empty.
+
+Line breaks are collapsed and control characters made visible, so the
+value stays on one line.  Brackets that could start or end a link are
+separated by a zero width space."
+  (when value
+    (let ((text (string-trim (codeql--printable-text (format "%s" value)))))
+      (unless (string-empty-p text)
+        (replace-regexp-in-string "\\[\\[\\|\\]\\]"
+                                  (lambda (b) (concat (substring b 0 1) "\u200b" (substring b 1)))
+                                  text t t)))))
+
+(defun codeql--org-property-name (name)
+  "Return NAME as an org property name made of A-Z, 0-9 and _."
+  (let ((name (replace-regexp-in-string "[^A-Z0-9_]+" "_" (upcase (format "%s" name)) t t)))
+    (if (string-match-p "\\`_*\\'" name) "UNNAMED" name)))
+
+(defun codeql--org-property-drawer (properties)
+  "Return an org property drawer holding PROPERTIES.
+
+PROPERTIES is a list of (NAME . VALUE) pairs, see
+`codeql--org-property-value'.  Properties without a value are left out."
+  (concat ":PROPERTIES:\n"
+          (mapconcat (lambda (property)
+                       (when-let ((value (codeql--org-property-value (cdr property))))
+                         (format ":%s: %s\n" (car property) value)))
+                     properties "")
+          ":END:\n"))
+
+(defun codeql--org-file-link (path &optional search description)
+  "Return an org file: link to PATH, with an optional SEARCH option.
+
+DESCRIPTION defaults to the file name of PATH."
+  (codeql--require-org)
+  (format "[[%s][%s]]"
+          (org-link-escape (concat "file:" path (if search (format "::%s" search) "")))
+          (codeql--org-text (or description (file-name-nondirectory path)))))
+
+(defun codeql--org-src-block (source &optional language)
+  "Return an org src block of LANGUAGE (default: ql) that holds SOURCE.
+
+Lines that org would read as headings or keywords are escaped with a
+comma, which org removes again when the block is read or edited.  The
+-i switch keeps the indentation of SOURCE."
+  (codeql--require-org)
+  (let ((body (org-escape-code-in-string source)))
+    (concat (format "#+begin_src %s -i\n" (or language "ql"))
+            body
+            (unless (or (string-empty-p body) (string-suffix-p "\n" body)) "\n")
+            "#+end_src\n")))
+
+(defun codeql--results-query-source-org (context)
+  "Return the Query Source section for the results of CONTEXT.
+
+See `codeql--results-context'."
+  (let* ((provenance (plist-get context :provenance))
+         (path (plist-get provenance :path))
+         (quick-eval (eq (plist-get provenance :kind) 'quick-eval)))
+    (concat
+     "* Query Source\n"
+     (codeql--org-property-drawer
+      `(("CODEQL_KIND" . "query-source")
+        ("CODEQL_EVALUATION" . ,(cond ((not quick-eval) "query")
+                                      ((plist-get provenance :count) "quick-eval-count")
+                                      (t "quick-eval")))
+        ("CODEQL_QUERY" . ,path)
+        ("CODEQL_DATABASE" . ,(plist-get context :database))
+        ("VISIBILITY" . "folded")))
+     (when path
+       (concat "** Originating Query\n" (codeql--org-file-link path) "\n"))
+     (when quick-eval
+       (let ((line (plist-get provenance :line))
+             (column (plist-get provenance :column)))
+         (concat
+          "** Evaluated Code\n"
+          (format "%s%s%s:\n"
+                  (if (plist-get provenance :count) "Quick evaluation count" "Quick evaluation")
+                  (cond ((plist-get provenance :predicate) " of the enclosing predicate")
+                        ((plist-get provenance :at-point) " at point")
+                        (t " of the region"))
+                  (if (and path line)
+                      (format " at %s" (codeql--org-file-link
+                                        path line
+                                        (format "%s:%s:%s" (file-name-nondirectory path)
+                                                line (or column 1))))
+                    ""))
+          (codeql--org-src-block (or (plist-get provenance :source) ""))))))))
+
+(defun codeql--results-section-org (context)
+  "Return the heading of the Results section for the results of CONTEXT."
+  (concat "* Results\n"
+          (codeql--org-property-drawer
+           `(("CODEQL_KIND" . "results")
+             ("CODEQL_QUERY_KIND" . ,(plist-get context :query-kind))))))
+
+(defun codeql--result-location-properties (node)
+  "Return org properties describing the location of the result NODE."
+  (when (and node (codeql--result-node-visitable node))
+    (let ((url (codeql--result-node-url node)))
+      `(("CODEQL_FILE" . ,(codeql--result-node-filename node))
+        ("CODEQL_LINE" . ,(codeql--result-node-line node))
+        ("CODEQL_COLUMN" . ,(codeql--result-node-column node))
+        ("CODEQL_END_LINE" . ,(and (listp url) (alist-get 'endLine url)))
+        ("CODEQL_END_COLUMN" . ,(and (listp url) (alist-get 'endColumn url)))))))
+
+(defun codeql--sarif-message-text (message)
+  "Return SARIF MESSAGE as plain text, with links as their text."
+  (mapconcat (lambda (component) (if (stringp component) component (car component)))
+             (codeql--parse-sarif-message (or message "")) ""))
+
+(defun codeql--org-safe-heading (heading)
+  "Return HEADING so that org doesn't read the end of it as tags."
+  (if (string-match-p "[ \t]:[^ \t\n]+:[ \t]*\\'" heading)
+      (concat heading "\u200b")
+    heading))
+
+(defun codeql--results-initial-visibility ()
+  "Fold the Query Source section and the property drawers of this buffer.
+
+Everything else is left as it is, so the results remain visible."
+  (save-excursion
+    (if (fboundp 'org-fold-hide-drawer-all)
+        (org-fold-hide-drawer-all)
+      (org-cycle-hide-drawers 'all))
+    (goto-char (point-min))
+    (when (re-search-forward "^\\* Query Source[ \t]*$" nil t)
+      (beginning-of-line)
+      (if (fboundp 'org-fold-subtree)
+          (org-fold-subtree t)
+        (outline-hide-subtree)))))
 
 (defvar codeql-results-mode-map (make-sparse-keymap)
   "Keymap for `codeql-results-mode'.")
@@ -2458,25 +2687,26 @@ parent `org-mode-map' still applies, and `org-mode-hook' still runs.
 
 \{codeql-results-mode-map}"
   (codeql--hide-zero-width-spaces)
-  (setq-local next-error-function #'codeql--results-next-error))
+  (setq-local next-error-function #'codeql--results-next-error)
+  ;; saved results, rendered results are folded once they are filled in
+  (codeql--results-initial-visibility))
 
 ;; the results of query history are saved as BQRS-PATH.org
 (add-to-list 'auto-mode-alist '("\\.bqrs\\.org\\'" . codeql-results-mode))
 
-(defun codeql--org-render-sarif-results (org-data query-buffer &optional footer marker)
-  "Render ORG-DATA including an optional FOOTER."
+(defun codeql--org-render-sarif-results (org-data query-buffer &optional footer marker context)
+  "Render ORG-DATA including an optional FOOTER.
+
+CONTEXT describes where the results came from, see
+`codeql--results-context'."
   ;; sarif results are org trees
   (let ((buffer
          (generate-new-buffer
           (format "* codeql-org-results:%s *" (if marker marker "")))))
     (with-current-buffer buffer
-      (insert org-data)
       (codeql-results-mode)
-      (when footer
-        (goto-char (point-max))
-        (insert "\n* Results Footer\n")
-        (insert footer))
-      (goto-char (point-min))
+      (setq codeql--results-context context)
+      (codeql--raw-results-fill-buffer org-data footer)
       (setq buffer-read-only t)
       (setq codeql--org-query-buffer query-buffer)
       (when codeql-results-diagnostics
@@ -2496,8 +2726,9 @@ Raw results also have :source-bqrs-path, the bqrs the query produced, and
 :bqrs-path, the bqrs pages are decoded from, which is a sorted copy when
 :sort is a (COLUMN . DIRECTION) pair.  :result-sets holds the alists of
 all result sets as reported by `codeql bqrs info', :result-set the name of
-the shown one, and :offsets the vector of page byte offsets as computed by
-`codeql bqrs info --paginate-rows', or nil for a single page.
+the shown one, :offsets the vector of page byte offsets as computed by
+`codeql bqrs info --paginate-rows', or nil for a single page, and :style,
+see `codeql-raw-results-style'.
 
 SARIF results have :results, the vector of all parsed SARIF results,
 and :link-prefix, see `codeql--sarif-results-to-org'.")
@@ -2508,33 +2739,46 @@ and :link-prefix, see `codeql--sarif-results-to-org'.")
 Most recently used entries come first, see `codeql-results-page-cache-size'.")
 
 (defun codeql--raw-results-fill-buffer (org-data &optional footer)
-  "Replace the current buffer contents with raw results ORG-DATA and FOOTER.
+  "Replace the current buffer contents with results ORG-DATA and FOOTER.
 
-ORG-DATA is expected to be aligned already, see `codeql--org-table'."
+ORG-DATA is an aligned table of raw results, see `codeql--org-table', or
+result headings.  It goes into the Results section, after the Query
+Source section described by `codeql--results-context'.  Point ends up at
+the Results section."
+  (codeql--require-org)
   (let ((inhibit-read-only t))
-    (erase-buffer)
-    (insert org-data)
     (unless (derived-mode-p 'codeql-results-mode)
-      (codeql-results-mode))
-    ;; only add footer after the table
-    (when footer
-      (goto-char (point-max))
-      (insert "\n* Results Footer\n")
-      (insert footer))
-    (goto-char (point-min))
+      (let ((context codeql--results-context))
+        (codeql-results-mode)
+        (setq codeql--results-context context)))
+    (erase-buffer)
+    (insert (codeql--results-query-source-org codeql--results-context))
+    (let ((results (point)))
+      (insert (codeql--results-section-org codeql--results-context)
+              org-data)
+      (unless (bolp)
+        (insert "\n"))
+      ;; only add footer after the results
+      (when footer
+        (insert "\n* Results Footer\n")
+        (insert footer))
+      (codeql--results-initial-visibility)
+      (goto-char results))
     (codeql--diagnostics-results-changed)))
 
-(defun codeql--org-render-raw-query-results (org-data query-buffer &optional footer marker pagination)
+(defun codeql--org-render-raw-query-results (org-data query-buffer &optional footer marker pagination context)
   "Render ORG-DATA including an optional FOOTER.
 
 PAGINATION is an optional plist describing a paginated result set, see
-`codeql--raw-results-pagination'."
-  ;; raw results are org tables
+`codeql--raw-results-pagination'.  CONTEXT describes where the results
+came from, see `codeql--results-context'."
+  ;; raw results are org tables or headings
   (let ((buffer
          (generate-new-buffer
           (format "* codeql-org-results:%s *" (if marker marker "")))))
     (with-current-buffer buffer
       (codeql-results-mode)
+      (setq codeql--results-context context)
       (setq codeql--org-query-buffer query-buffer)
       (when pagination
         (setq codeql--raw-results-pagination pagination)
@@ -2597,7 +2841,8 @@ the empty string for results whose locations are files on disk."
                       (json-pointer-get result "/message/text")
                       (json-pointer-get result "/ruleId")))
                (if code-flows 'path-problem 'problem)
-               nil))
+               nil
+               i))
      "")))
 
 (defun codeql--raw-results-cache-get (page)
@@ -2732,11 +2977,13 @@ A hit marks PAGE as most recently used."
                (cl-pushnew row-data query-results)))
     query-results))
 
-(defun codeql--raw-results-page-to-org (bqrs-path result-set offsets page page-size)
+(defun codeql--raw-results-page-to-org (bqrs-path result-set offsets page page-size &optional style)
   "Return org data for PAGE of RESULT-SET in BQRS-PATH, or nil if empty.
 
 PAGE is 0-based and indexes into the byte OFFSETS vector of pages holding
-PAGE-SIZE rows.  When OFFSETS is nil the whole result set is decoded."
+PAGE-SIZE rows.  When OFFSETS is nil the whole result set is decoded.
+STYLE is either `table' (the default) or `outline', see
+`codeql-raw-results-style'."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (when-let* ((json-data (codeql--bqrs-to-json
                           bqrs-path "string,url" result-set
@@ -2750,8 +2997,10 @@ PAGE-SIZE rows.  When OFFSETS is nil the whole result set is decoded."
     (let ((codeql-max-raw-results (or (and offsets page-size) codeql-max-raw-results)))
       (codeql--query-results-to-org
        (codeql--raw-tuples-to-query-results tuples)
-       'raw
-       (alist-get 'columns json)))))
+       (if (eq style 'outline) 'raw-outline 'raw)
+       (alist-get 'columns json)
+       (if offsets (* page page-size) 0)
+       result-set))))
 
 (defun codeql--raw-results-sorted-bqrs (bqrs-path result-set sort)
   "Return a bqrs file holding RESULT-SET of BQRS-PATH sorted by SORT.
@@ -2774,13 +3023,14 @@ and reused."
                    "--" (codeql--tramp-unwrap bqrs-path)))
         sorted-path))))
 
-(defun codeql--raw-results-setup (bqrs-path result-sets result-set footer &optional sort)
+(defun codeql--raw-results-setup (bqrs-path result-sets result-set footer &optional sort style)
   "Prepare RESULT-SET of BQRS-PATH for display, optionally sorted by SORT.
 
 RESULT-SETS holds the alists of all result sets in BQRS-PATH as reported
 by `codeql bqrs info', and RESULT-SET is the alist of the one to show.
 SORT is nil or a (COLUMN . DIRECTION) pair, see
-`codeql--raw-results-sorted-bqrs'.
+`codeql--raw-results-sorted-bqrs'.  STYLE defaults to
+`codeql-raw-results-style'.
 
 Return a cons of the results state, see `codeql--raw-results-pagination',
 and the org data of its first page, or nil when there is nothing to show."
@@ -2800,13 +3050,14 @@ and the org data of its first page, or nil when there is nothing to show."
                                              :key (lambda (rs) (alist-get 'name rs))
                                              :test #'equal))))))
          (offsets (and (> (length offsets) 1) offsets))
-         (page-size (if offsets codeql-max-raw-results (max total-rows 1))))
+         (page-size (if offsets codeql-max-raw-results (max total-rows 1)))
+         (style (or style codeql-raw-results-style)))
     (when (and (> total-rows codeql-max-raw-results) (not offsets))
       (message "Could not compute result pagination offsets, rendering all %d rows."
                total-rows))
     (when (> total-rows 0)
       (when-let ((org-data (codeql--raw-results-page-to-org
-                            decode-path name offsets 0 page-size)))
+                            decode-path name offsets 0 page-size style)))
         (cons (list :kind 'raw
                     :source-bqrs-path bqrs-path
                     :bqrs-path decode-path
@@ -2817,6 +3068,7 @@ and the org data of its first page, or nil when there is nothing to show."
                     :page 0
                     :total-rows total-rows
                     :page-size page-size
+                    :style style
                     :footer footer)
               org-data)))))
 
@@ -2847,7 +3099,8 @@ and the org data of its first page, or nil when there is nothing to show."
                       (plist-get pagination :result-set)
                       (plist-get pagination :offsets)
                       page
-                      (plist-get pagination :page-size))))))))
+                      (plist-get pagination :page-size)
+                      (plist-get pagination :style))))))))
       (unless org-data
         (user-error "Failed to load results page %d" (1+ page)))
       (codeql--raw-results-cache-put page org-data)
@@ -2930,7 +3183,8 @@ SORT is nil or a (COLUMN . DIRECTION) pair, see
                     (plist-get state :result-sets)
                     result-set
                     (plist-get state :footer)
-                    sort))))
+                    sort
+                    (plist-get state :style)))))
       (unless setup
         (user-error "Failed to load result set %s" result-set-name))
       (setq codeql--raw-results-pagination (car setup)
@@ -2981,6 +3235,91 @@ original order of the results."
    (when column (cons column direction)))
   (message (if column "Sorted results by column %d (%s)." "Restored the original order.")
            (and column (1+ column)) direction))
+
+(defun codeql-results-toggle-raw-style ()
+  "Show the raw results of this buffer as org headings or as an org table.
+
+Headings can be searched with `codeql-results-org-ql', see
+`codeql-raw-results-style'."
+  (interactive)
+  (let* ((state (or codeql--raw-results-pagination
+                    (user-error "Not a CodeQL raw results buffer")))
+         (style (if (eq (plist-get state :style) 'outline) 'table 'outline)))
+    (when (codeql--sarif-results-p state)
+      (user-error "Problem results are always shown as headings"))
+    (setq codeql--raw-results-pagination (plist-put (copy-sequence state) :style style)
+          codeql--raw-results-page-cache nil)
+    (codeql--raw-results-show-page (plist-get state :page))
+    (message "Showing raw results as %s." (if (eq style 'outline) "headings" "a table"))))
+
+;;; Searching results with org-ql
+
+(declare-function org-ql-sparse-tree "ext:org-ql-search")
+(declare-function org-ql-search "ext:org-ql-search")
+(declare-function org-ql--query-string-to-sexp "ext:org-ql")
+
+(defvar codeql--results-org-ql-history nil
+  "The history of `codeql-results-org-ql' queries.")
+
+(defun codeql--results-org-ql-query (query)
+  "Return the org-ql QUERY limited to the result headings of a results buffer.
+
+QUERY is an org-ql query in sexp form, or a string holding either a sexp
+or a query in org-ql's plain string syntax.  An empty QUERY matches all
+results."
+  (let ((sexp (cond ((not (stringp query)) query)
+                    ((string-match-p "\\`[[:space:]]*\\'" query) nil)
+                    ((string-match-p "\\`[[:space:]]*[(\"]" query) (car (read-from-string query)))
+                    (t (org-ql--query-string-to-sexp query)))))
+    `(and (property "CODEQL_KIND" "result") ,@(when sexp (list sexp)))))
+
+(defun codeql-results-org-ql (query &optional view)
+  "Search the results of this CodeQL results buffer with the org-ql QUERY.
+
+QUERY is an org-ql query, as a sexp or in org-ql's plain string syntax,
+and it only matches results, not the Query Source or the footer.  Each
+result is a heading whose properties describe it:
+
+  CODEQL_KIND        always \"result\"
+  CODEQL_QUERY_KIND  \"problem\", \"path-problem\" or \"raw\"
+  CODEQL_FILE, CODEQL_LINE, CODEQL_COLUMN, CODEQL_END_LINE, CODEQL_END_COLUMN
+                     its location, when it has one
+  CODEQL_RESULT, CODEQL_RULE_ID, CODEQL_MESSAGE, CODEQL_PATHS
+                     of problems
+  CODEQL_ROW, CODEQL_RESULT_SET, CODEQL_COL_<COLUMN>
+                     of raw results
+
+For example (property \"CODEQL_RULE_ID\" \"js/xss\"), or
+\"property:CODEQL_FILE=src/app.js\" in the string syntax.
+
+The matches are shown as a sparse tree of this buffer, so their links
+work as usual.  With VIEW (interactively, a prefix argument) they are
+listed in an org-ql view buffer instead.  Raw results shown as a table
+are switched to headings first, see `codeql-results-toggle-raw-style'.
+Only the current page of paginated results is searched.
+
+This needs the org-ql package."
+  (interactive
+   (progn
+     (unless (codeql--results-buffer-p (current-buffer))
+       (user-error "Not a CodeQL results buffer"))
+     (unless (require 'org-ql nil t)
+       (user-error "Searching results needs the org-ql package"))
+     (list (read-string "org-ql query on results: " nil 'codeql--results-org-ql-history)
+           current-prefix-arg)))
+  (unless (codeql--results-buffer-p (current-buffer))
+    (user-error "Not a CodeQL results buffer"))
+  (unless (and (require 'org-ql nil t) (require 'org-ql-search nil t))
+    (user-error "Searching results needs the org-ql package"))
+  (let ((query (codeql--results-org-ql-query query)))
+    (when (and codeql--raw-results-pagination
+               (not (codeql--sarif-results-p codeql--raw-results-pagination))
+               (not (eq (plist-get codeql--raw-results-pagination :style) 'outline)))
+      (codeql-results-toggle-raw-style))
+    (if view
+        (org-ql-search (current-buffer) query
+                       :title (format "CodeQL results of %s" (buffer-name)))
+      (org-ql-sparse-tree query))))
 
 (defvar codeql-results-pagination-mode-map
   (let ((map (make-sparse-keymap)))
@@ -4131,6 +4470,12 @@ diagnostics, path steps and related locations are `:note' diagnostics."
                                 (cons table (codeql--diagnostics-table-header))))
                         (list :warning (codeql--diagnostics-table-row-text
                                         (cdr header-cache)))))
+                     ;; a row of raw results shown as a heading
+                     ((and (string-match-p "\\`\\*+ " line-text)
+                           (eq (codeql--results-heading-kind) 'row))
+                      (list :warning (codeql--diagnostics-text
+                                      (replace-regexp-in-string
+                                       "\\`\\*+ +[0-9]+\\. +" "" line-text t t))))
                      ;; a problem heading, its last link is the problem location
                      ((string-match-p "\\`\\*+ " line-text)
                       (let ((message (codeql--diagnostics-problem-text line-text)))
@@ -4346,12 +4691,46 @@ LINKS are its locations, see `codeql--alert', duplicates are dropped."
       (codeql--alert-create :start start :end end :message message
                             :locations (vconcat (nreverse locations))))))
 
+(defun codeql--results-heading-kind ()
+  "Return what the heading on the current line of a results buffer holds.
+
+That is `problem' for a problem or path-problem result, `row' for a row
+of raw results, `section' for the other top level headings, such as
+Query Source, `other' for the headings nested in a result, such as its
+paths, or nil when the line isn't a heading.  Results are told apart by
+their CODEQL_KIND and CODEQL_QUERY_KIND properties, and in results saved
+before results had properties, every other top level heading is a
+problem."
+  (save-excursion
+    (beginning-of-line)
+    (when (looking-at "\\(\\*+\\) +\\(.*?\\)[ \t]*$")
+      (let ((level (length (match-string 1)))
+            (title (match-string 2))
+            kind query-kind)
+        (forward-line 1)
+        (when (looking-at-p "[ \t]*:PROPERTIES:[ \t]*$")
+          (forward-line 1)
+          (while (and (not (eobp))
+                      (looking-at "[ \t]*:\\([^: \t\n]+\\):\\(?:[ \t]+\\(.*?\\)\\)?[ \t]*$")
+                      (not (equal (match-string 1) "END")))
+            (pcase (match-string 1)
+              ("CODEQL_KIND" (setq kind (match-string 2)))
+              ("CODEQL_QUERY_KIND" (setq query-kind (match-string 2))))
+            (forward-line 1)))
+        (cond ((equal kind "result") (if (equal query-kind "raw") 'row 'problem))
+              (kind 'section)
+              ((> level 1) 'other)
+              ((member title '("Query Source" "Results" "Results Footer")) 'section)
+              (t 'problem))))))
+
 (defun codeql--results-collect-alerts ()
   "Return a vector of the alerts in the current results buffer.
 
-Each top level heading is an alert of a problem query, its last link is
-the location of the problem.  Each table row with links is an alert of
-a raw results table, its first link is its location."
+Each result heading is an alert, see `codeql--results-heading-kind'.  The
+last link of a problem heading is the location of the problem, and the
+first link of a raw results heading its location.  Each table row with
+links is an alert of a raw results table, its first link is its
+location."
   (let (alerts heading)
     (save-excursion
       (save-restriction
@@ -4368,26 +4747,32 @@ a raw results table, its first link is its location."
           (while (not (eobp))
             (let ((line (buffer-substring-no-properties
                          (line-beginning-position) (line-end-position))))
-              (cond
-               ((string-match-p "\\`\\* " line)
+              (pcase-exhaustive (and (string-prefix-p "*" line)
+                                     (codeql--results-heading-kind))
+               ((and (or 'problem 'row) kind)
                 (finish-heading)
                 (let ((links (codeql--line-links)))
                   ;; the location of a problem comes after its message
-                  (unless (string-suffix-p "[location unknown]" line)
+                  (unless (or (eq kind 'row) (string-suffix-p "[location unknown]" line))
                     (setq links (append (last links) (butlast links))))
                   (setq heading (list (line-beginning-position)
-                                      (codeql--diagnostics-problem-text line)
+                                      (if (eq kind 'row)
+                                          (codeql--location-line-context line)
+                                        (codeql--diagnostics-problem-text line))
                                       (reverse links)))))
-               (heading
-                (setf (nth 2 heading)
-                      (append (reverse (codeql--line-links)) (nth 2 heading))))
-               ((string-match-p "\\`[ \t]*|" line)
-                (when-let ((alert (codeql--alert-finish
-                                   (line-beginning-position)
-                                   (min (point-max) (1+ (line-end-position)))
-                                   (codeql--location-line-context line)
-                                   (codeql--line-links))))
-                  (push alert alerts)))))
+               ('section (finish-heading))
+               (_
+                (cond
+                 (heading
+                  (setf (nth 2 heading)
+                        (append (reverse (codeql--line-links)) (nth 2 heading))))
+                 ((string-match-p "\\`[ \t]*|" line)
+                  (when-let ((alert (codeql--alert-finish
+                                     (line-beginning-position)
+                                     (min (point-max) (1+ (line-end-position)))
+                                     (codeql--location-line-context line)
+                                     (codeql--line-links))))
+                    (push alert alerts)))))))
             (forward-line 1))
           (finish-heading))))
     (vconcat (nreverse alerts))))
@@ -4537,7 +4922,9 @@ alert at point is preferred when it has the location of LINK."
                     (buffer-substring-no-properties (line-beginning-position)
                                                     (line-end-position)))))
         (cond
-         ((string-match-p "\\`\\* " line)
+         ((and (string-match-p "\\`\\*+ " line)
+               (eq (save-excursion (goto-char position) (codeql--results-heading-kind))
+                   'problem))
           (format "Related location \"%s\"" description))
          ((string-match "\\`[ \t]*\\([0-9]+\\)\\. +\\(?:src\\|snk\\|\\.\\.\\.\\|→\\)? *" line)
           (format "Path step %s: %s" (match-string 1 line)
@@ -5011,18 +5398,19 @@ is shown as described for `codeql-graph-format'."
           (when codeql--results-marker-suffix
             (format " (%s)" codeql--results-marker-suffix))))
 
-(defun codeql--render-sarif-results (results query-buffer footer marker &optional link-prefix)
+(defun codeql--render-sarif-results (results query-buffer footer marker
+                                             &optional link-prefix context)
   "Render the vector of SARIF RESULTS of QUERY-BUFFER in a results buffer.
 
-FOOTER and MARKER are as for `codeql--org-render-sarif-results', and
-LINK-PREFIX is as for `codeql--sarif-results-to-org'.  Results are shown
+FOOTER, MARKER and CONTEXT are as for `codeql--org-render-sarif-results',
+and LINK-PREFIX is as for `codeql--sarif-results-to-org'.  Results are shown
 one page of `codeql-max-sarif-results' at a time.  Return the rendered
 org data when everything fits on a single page, nil otherwise."
   (let* ((total (length results))
          (page-size (max 1 codeql-max-sarif-results))
          (org-data (codeql--sarif-results-to-org results 0 page-size link-prefix)))
     (if (<= total page-size)
-        (codeql--org-render-sarif-results org-data query-buffer footer marker)
+        (codeql--org-render-sarif-results org-data query-buffer footer marker context)
       (codeql--org-render-raw-query-results
        org-data query-buffer footer marker
        (list :kind 'sarif
@@ -5031,7 +5419,8 @@ org data when everything fits on a single page, nil otherwise."
              :page 0
              :page-size page-size
              :total-rows total
-             :footer footer))
+             :footer footer)
+       context)
       nil)))
 
 (defun codeql-load-bqrs (bqrs-path
@@ -5044,8 +5433,13 @@ org data when everything fits on a single page, nil otherwise."
                          &optional
                          src-filename
                          src-root
-                         src-buffer)
-  "Parse the results at BQRS-PATH and render them accordingly to the user."
+                         src-buffer
+                         provenance)
+  "Parse the results at BQRS-PATH and render them accordingly to the user.
+
+PROVENANCE describes the CodeQL code that produced the results, see
+`codeql--query-provenance'.  It defaults to a run of the whole query at
+QUERY-PATH, and is shown in the Query Source section of the results."
   (message "Loading bqrs from %s (name: %s kind: %s id: %s)"
            bqrs-path
            (or query-name "no-meta")
@@ -5080,6 +5474,7 @@ org data when everything fits on a single page, nil otherwise."
              bqrs-path
              query-path
              db-path) "\n")))
+      (setq provenance (or provenance (list :kind 'file :path query-path)))
       ;; parse results according to the query meta data
       (cond
        ;; AST parsing
@@ -5146,7 +5541,11 @@ org data when everything fits on a single page, nil otherwise."
                 (message "No results found.")
               (let ((rendered (codeql--render-sarif-results
                                results query-buffer footer
-                               (codeql--results-marker query-path))))
+                               (codeql--results-marker query-path)
+                               nil
+                               (list :provenance provenance
+                                     :database db-path
+                                     :query-kind query-kind))))
                 (if rendered
                     ;; save off the fully rendered version for speedy re-loads
                     (with-temp-file (format "%s.org" bqrs-path)
@@ -5177,7 +5576,10 @@ org data when everything fits on a single page, nil otherwise."
                     (codeql--org-render-raw-query-results
                      (cdr setup) query-buffer footer
                      (codeql--results-marker query-path)
-                     state)))
+                     state
+                     (list :provenance provenance
+                           :database db-path
+                           :query-kind "raw"))))
               ;; results that can be paged, sorted or switched to other result
               ;; sets are re-rendered from the bqrs on reload so that they
               ;; remain interactive, only cache plain single page results
@@ -5862,6 +6264,47 @@ QUICK-EVAL is `count', only the number of results is computed."
     ;; any non-null value will trigger a full query run
     `(:query (:xx ""))))
 
+(defun codeql--query-provenance (query-path quick-eval)
+  "Return the provenance of running QUERY-PATH with QUICK-EVAL.
+
+This describes the CodeQL code a run evaluates, for the Query Source
+section of its results buffer.  It is captured from the current buffer
+when the run is requested, so editing the buffer while the run is in
+flight doesn't change it.  It's a plist whose :kind is either:
+
+- `file': the whole query at :path ran.
+- `quick-eval': the region, or what is at point when :at-point is
+  non-nil, of the query at :path was quick evaluated.  :source holds
+  the evaluated text exactly as it was submitted, :line and :column
+  (both 1-based) where it starts, and :count is non-nil for a quick
+  evaluation count.  :predicate is non-nil when the predicate
+  enclosing point was evaluated, then :source is its name, see
+  `codeql-query-server-quick-eval-predicate'.
+
+Other code that runs queries, e.g. to evaluate a snippet that has no
+file of its own, can pass a `quick-eval' provenance whose :path is nil."
+  (if (not quick-eval)
+      (list :kind 'file :path query-path)
+    (let* ((region (use-region-p))
+           (pred-pos (and (eq quick-eval 'predicate)
+                          (not region)
+                          (codeql--enclosing-predicate-name-position)))
+           (bounds (cond (region (car (region-bounds)))
+                         (pred-pos (cons pred-pos pred-pos))
+                         (t (cons (point) (point)))))
+           (beg (car bounds)))
+      (list :kind 'quick-eval
+            :path query-path
+            :count (eq quick-eval 'count)
+            :at-point (not region)
+            :predicate (and pred-pos t)
+            :line (line-number-at-pos beg)
+            :column (1+ (save-excursion (goto-char beg) (current-column)))
+            :source (if region
+                        (buffer-substring-no-properties beg (cdr bounds))
+                      (or (save-excursion (goto-char beg) (thing-at-point 'symbol t))
+                          ""))))))
+
 (defun codeql--query-server-request-run (buffer-context
                                          qlo-path
                                          bqrs-path
@@ -5873,8 +6316,11 @@ QUICK-EVAL is `count', only the number of results is computed."
                                          &optional
                                          template-values
                                          src-filename
-                                         src-buffer)
-  "Request a query evaluation from the query server."
+                                         src-buffer
+                                         provenance)
+  "Request a query evaluation from the query server.
+
+PROVENANCE describes the evaluated code, see `codeql--query-provenance'."
   (with-current-buffer buffer-context
     (cond
      ;; legacy query-server
@@ -5937,6 +6383,7 @@ QUICK-EVAL is `count', only the number of results is computed."
                                           (codeql-query-server-active-database))
                                   `(;; align
                                     :quick-eval ,quick-eval
+                                    :provenance ,provenance
                                     :query-path ,query-path
                                     :bqrs-path ,bqrs-path
                                     :db-path ,db-path
@@ -5956,7 +6403,8 @@ QUICK-EVAL is `count', only the number of results is computed."
                               buffer-context
                               src-filename
                               codeql--database-source-archive-root
-                              src-buffer))))
+                              src-buffer
+                              provenance))))
                      (message "No query results in %s!" bqrs-path)))))
              :error-fn
              (let ((buffer-context buffer-context))
@@ -6035,6 +6483,7 @@ QUICK-EVAL is `count', only the number of results is computed."
                                           (codeql-query-server-active-database))
                                   `(;; align
                                     :quick-eval ,quick-eval
+                                    :provenance ,provenance
                                     :query-path ,query-path
                                     :bqrs-path ,bqrs-path
                                     :db-path ,db-path
@@ -6055,7 +6504,8 @@ QUICK-EVAL is `count', only the number of results is computed."
                               buffer-context
                               src-filename
                               codeql--database-source-archive-root
-                              src-buffer))))
+                              src-buffer
+                              provenance))))
                      (message "No query results in %s!" bqrs-path)))))
              :error-fn
              (let ((buffer-context buffer-context))
@@ -6080,7 +6530,8 @@ QUICK-EVAL is `count', only the number of results is computed."
                                                      &optional
                                                      template-values
                                                      src-filename
-                                                     src-buffer)
+                                                     src-buffer
+                                                     provenance)
   "Request query compilation from the query server."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (with-current-buffer buffer-context
@@ -6155,7 +6606,8 @@ QUICK-EVAL is `count', only the number of results is computed."
                      quick-eval
                      template-values
                      src-filename
-                     src-buffer)))))
+                     src-buffer
+                     provenance)))))
              :error-fn
              (let ((buffer-context buffer-context))
                (jsonrpc-lambda
@@ -6182,15 +6634,21 @@ QUICK-EVAL is `count', only the number of results is computed."
          quick-eval
          template-values
          src-filename
-         src-buffer))))))
+         src-buffer
+         provenance))))))
 
 (defun codeql--query-server-run-query-from-path (query-path
                                                  quick-eval
                                                  &optional
                                                  template-values
                                                  src-filename
-                                                 src-buffer)
-  "Run the query at QUERY-PATH."
+                                                 src-buffer
+                                                 provenance)
+  "Run the query at QUERY-PATH.
+
+PROVENANCE describes the code that runs, and defaults to what QUICK-EVAL
+selects in the current buffer, see `codeql--query-provenance'.  It is
+captured now, before the run is requested."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (cl-assert codeql--active-database t)
   (cl-assert (codeql--resolve-query-paths query-path) t)
@@ -6203,7 +6661,8 @@ QUICK-EVAL is `count', only the number of results is computed."
          (library-path codeql--library-path)
          (db-scheme codeql--dbscheme)
          (db-path (directory-file-name codeql--active-database))
-         (query-info (codeql--query-info query-path)))
+         (query-info (codeql--query-info query-path))
+         (provenance (or provenance (codeql--query-provenance query-path quick-eval))))
     ;; request a query compilation, its success callback will then request a query run
     (codeql--query-server-request-compile-and-run
      (current-buffer)
@@ -6217,7 +6676,8 @@ QUICK-EVAL is `count', only the number of results is computed."
      quick-eval
      template-values
      src-filename
-     src-buffer)))
+     src-buffer
+     provenance)))
 
 (defun codeql-query-server-run-query (&optional quick-eval)
   "Run a query or quick eval a query region.
@@ -6320,7 +6780,8 @@ with many results, as their tuples aren't decoded and rendered."
                  timestamp
                  db-path
                  name kind
-                 id &allow-other-keys)
+                 id
+                 provenance &allow-other-keys)
                 query-data
               (let ((org-results (format "%s.org" bqrs-path)))
                 ;; since we render results in a flat text format
@@ -6334,7 +6795,9 @@ with many results, as their tuples aren't decoded and rendered."
                    name
                    kind
                    id
-                   (current-buffer))))))))
+                   (current-buffer)
+                   nil nil nil
+                   provenance)))))))
     ;; XXX: do we want to serialize query history state to disk?
     (message "No query history available yet in this session.")))
 
@@ -6472,11 +6935,12 @@ Interactively, prompt for FROM and then for TO."
                        (let ((before (buffer-list))
                              (codeql--results-marker-suffix label))
                          (cl-destructuring-bind (&key query-path db-path name kind id
-                                                      &allow-other-keys)
+                                                      provenance &allow-other-keys)
                              data
                            (save-window-excursion
                              (codeql-load-bqrs bqrs query-path db-path name kind id
-                                               (current-buffer))))
+                                               (current-buffer) nil nil nil
+                                               provenance)))
                          (seq-find (lambda (buffer)
                                      (and (not (memq buffer before))
                                           (string-prefix-p "* codeql-org-results:"
