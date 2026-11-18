@@ -7484,6 +7484,22 @@ predicates can't be told apart."
      ((equal type "qualified_expr") '(expression . t))
      (t '(expression)))))
 
+(defun codeql--session-overloads (definitions name)
+  "Return the predicates NAME among DEFINITIONS, by increasing arity."
+  (sort (seq-filter (lambda (definition)
+                      (and (eq (plist-get definition :kind) 'predicate)
+                           (equal (plist-get definition :name) name)))
+                    definitions)
+        (lambda (a b) (< (plist-get a :arity) (plist-get b :arity)))))
+
+(defun codeql--session-signature (definition)
+  "Return the head of DEFINITION, such as \"predicate p(int x)\".
+This leaves out its QLDoc, comments and body."
+  (let ((text (plist-get definition :text)))
+    (while (string-match "\\`[ \t\n]*\\(?:/\\*\\(?:.\\|\n\\)*?\\*/\\|//.*\\)" text)
+      (setq text (substring text (match-end 0))))
+    (string-trim (replace-regexp-in-string "[ \t\n]+" " " (car (split-string text "[{;]"))))))
+
 (defun codeql--session-parse-predicate (input definitions)
   "Return what INPUT asks for when it names a predicate of DEFINITIONS.
 
@@ -7494,21 +7510,14 @@ predicates NAME with different arities.  See `codeql--session-parse'."
                       input)
     (let* ((name (match-string 1 input))
            (arity (and (match-beginning 2) (string-to-number (match-string 2 input))))
-           (arities (sort (delete-dups
-                           (mapcar (lambda (definition) (plist-get definition :arity))
-                                   (seq-filter
-                                    (lambda (definition)
-                                      (and (eq (plist-get definition :kind) 'predicate)
-                                           (equal (plist-get definition :name) name)
-                                           (or (null arity)
-                                               (eql (plist-get definition :arity) arity))))
-                                    definitions)))
-                          #'<)))
+           (overloads (seq-filter (lambda (definition)
+                                    (or (null arity) (eql (plist-get definition :arity) arity)))
+                                  (codeql--session-overloads definitions name))))
       (cond
-       ((cdr arities)
+       ((cdr overloads)
         (user-error "Predicate %s is overloaded, enter one of %s" name
-                    (mapconcat (lambda (arity) (format "%s/%d" name arity)) arities ", ")))
-       (arities (list :action (cons 'predicate (cons name (car arities)))))
+                    (mapconcat #'codeql--session-definition-name overloads ", ")))
+       (overloads (list :action (cons 'predicate (cons name (plist-get (car overloads) :arity)))))
        ;; an identifier divided by a number is no expression
        (arity (user-error "Predicate %s/%d is not defined in this session" name arity))))))
 
@@ -8325,7 +8334,7 @@ All results can be opened in a results buffer from the REPL."
      "list the definitions of the session, or show those named NAME")
     ("undef" codeql-repl--command-undef "NAME" "remove the definitions named NAME")
     ("reset" codeql-repl--command-reset nil "remove all definitions but the default import")
-    ("count" codeql-repl--command-count "PREDICATE|TYPE"
+    ("count" codeql-repl--command-count "PREDICATE[/ARITY]|TYPE"
      "count the results of a predicate of the session, or the values of a type")
     ("results" codeql-repl--command-results nil "open the last results in a results buffer")
     ("module" codeql-repl--command-module nil "show the query module of the last evaluation")
@@ -8471,7 +8480,9 @@ The REPL evaluates CodeQL input in session NAME (default: \"default\")
 of the pack, on the database of the project.  Input can make
 definitions, which later input can use, and ask for a select query, an
 expression, a formula, or the name of a predicate to quick evaluate,
-see `codeql--session-eval'.  The first `codeql-repl-max-rows' rows of the
+see `codeql--session-eval'.  When predicates of that name have
+different arities, which one to evaluate is asked for, or entered as
+NAME/ARITY.  The first `codeql-repl-max-rows' rows of the
 results are printed, and all of them can be opened in a results buffer.
 
 Input that begins with a colon is a REPL command, :help lists them.
@@ -8587,11 +8598,48 @@ See `codeql-repl--input-complete-p' for when input is complete."
   "Return MESSAGE formatted as a note of the REPL."
   (propertize message 'font-lock-face 'codeql-repl-note))
 
+(defun codeql-repl--resolve-overload (input)
+  "Return INPUT, or the NAME/ARITY of the predicate that INPUT names.
+
+When INPUT is the name of predicates of the session with different
+arities, which one to evaluate is read from the minibuffer.  Quitting
+that returns INPUT, whose evaluation then lists the predicates."
+  (let ((overloads (and (string-match "\\`[ \t\n]*\\([A-Za-z_][A-Za-z0-9_]*\\)[ \t\n]*\\'" input)
+                        (codeql--session-overloads
+                         (codeql--session-definitions codeql-repl--session)
+                         (match-string 1 input)))))
+    (if (not (cdr overloads))
+        input
+      (let* ((choices (mapcar (lambda (definition)
+                                (cons (codeql--session-definition-name definition) definition))
+                              overloads))
+             (completion-extra-properties
+              (list :annotation-function
+                    (lambda (choice)
+                      (when-let ((definition (cdr (assoc choice choices))))
+                        (concat "  " (codeql--session-signature definition)))))))
+        (condition-case nil
+            (completing-read (format "Predicate %s is overloaded, evaluate: "
+                                     (plist-get (car overloads) :name))
+                             choices nil t nil nil (caar choices))
+          (quit input))))))
+
 (defun codeql-repl--eval (input &rest args)
   "Evaluate INPUT in the session of the current REPL buffer, and print the outcome.
 
 ARGS are passed on to `codeql--session-eval'."
   (let ((buffer (current-buffer)))
+    (unless (codeql--session-pending codeql-repl--session)
+      (let ((resolved (codeql-repl--resolve-overload input)))
+        (unless (equal resolved input)
+          (comint-output-filter (get-buffer-process buffer)
+                                (concat (codeql-repl--note
+                                         (format (if (plist-get args :count)
+                                                     "Counting %s."
+                                                   "Evaluating %s.")
+                                                 resolved))
+                                        "\n"))
+          (setq input resolved))))
     (condition-case err
         (progn
           (setq codeql-repl--started (float-time))
@@ -8822,7 +8870,7 @@ The evaluation took ELAPSED seconds."
 (defun codeql-repl--command-count (arguments)
   "Count the results of the predicate, or the values of the type, ARGUMENTS."
   (when (string-empty-p arguments)
-    (user-error "Usage: :count PREDICATE|TYPE"))
+    (user-error "Usage: :count PREDICATE[/ARITY]|TYPE"))
   (codeql-repl--eval arguments :count t)
   nil)
 
@@ -8860,26 +8908,59 @@ The evaluation took ELAPSED seconds."
     (delete-region (point-min) (process-mark (get-buffer-process (current-buffer)))))
   "")
 
+(defun codeql-repl--completions (session)
+  "Return the names of the definitions of SESSION, to complete.
+Predicates with several arities are also there as NAME/ARITY."
+  (let ((definitions (seq-remove (lambda (definition) (eq (plist-get definition :kind) 'import))
+                                 (codeql--session-definitions session))))
+    (delete-dups
+     (append (mapcar (lambda (definition) (plist-get definition :name)) definitions)
+             (delq nil (mapcar (lambda (definition)
+                                 (when (cdr (codeql--session-overloads
+                                             definitions (plist-get definition :name)))
+                                   (codeql--session-definition-name definition)))
+                               definitions))))))
+
+(defun codeql-repl--annotation (session candidate)
+  "Return the annotation of the completion CANDIDATE in SESSION.
+That is the signature of the definition it names, the names of the
+predicates it names, or that it is a keyword."
+  (let ((matching (seq-filter (lambda (definition)
+                                (and (not (eq (plist-get definition :kind) 'import))
+                                     (or (equal (plist-get definition :name) candidate)
+                                         (equal (codeql--session-definition-name definition)
+                                                candidate))))
+                              (codeql--session-definitions session))))
+    (cond ((cdr matching)
+           (concat "  " (mapconcat #'codeql--session-definition-name matching ", ")))
+          (matching (concat "  " (codeql--session-signature (car matching))))
+          ((member candidate codeql--session-keywords) "  keyword"))))
+
 (defun codeql-repl--completion-at-point ()
   "Complete CodeQL keywords, names of session definitions and REPL commands."
-  (let ((process (get-buffer-process (current-buffer))))
-    (when (and process codeql-repl--session (>= (point) (process-mark process)))
+  (let ((process (get-buffer-process (current-buffer)))
+        (session codeql-repl--session))
+    (when (and process session (>= (point) (process-mark process)))
       (let* ((bounds (or (bounds-of-thing-at-point 'symbol) (cons (point) (point))))
              (start (car bounds))
              (command (and (eq (char-before start) ?:)
                            (= (1- start) (process-mark process)))))
+        ;; NAME/ARITY of an overloaded predicate
+        (when (and (looking-back "\\_<\\([A-Za-z_][A-Za-z0-9_]*\\)/[0-9]*"
+                                 (process-mark process))
+                   (cdr (codeql--session-overloads (codeql--session-definitions session)
+                                                   (match-string 1))))
+          (setq bounds (cons (match-beginning 0) (point))
+                start (car bounds)))
         (list start (cdr bounds)
               (if command
                   (mapcar #'car codeql-repl--commands)
                 (completion-table-dynamic
                  (lambda (_)
-                   (append (delete-dups
-                            (delq nil (mapcar (lambda (definition)
-                                                (unless (eq (plist-get definition :kind) 'import)
-                                                  (plist-get definition :name)))
-                                              (codeql--session-definitions
-                                               codeql-repl--session))))
-                           codeql--session-keywords))))
+                   (append (codeql-repl--completions session) codeql--session-keywords))))
+              :annotation-function (unless command
+                                     (lambda (candidate)
+                                       (codeql-repl--annotation session candidate)))
               :exclusive 'no)))))
 
 (defun codeql-repl--member-bounds ()
