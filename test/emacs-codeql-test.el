@@ -1393,7 +1393,7 @@ OUTCOME gets the :provenance of RUN."
 (defmacro codeql-test--with-repl (runs &rest body)
   "Run BODY in a REPL buffer of a CodeQL session, see `codeql-test--with-session'.
 
-`codeql-repl--decode' returns `codeql-test--decoded'."
+`codeql--session-decode' returns `codeql-test--decoded'."
   (declare (indent 1) (debug t))
   `(codeql-test--with-session ,runs
      (let ((codeql-repl-history-file nil)
@@ -1401,7 +1401,7 @@ OUTCOME gets the :provenance of RUN."
        (with-current-buffer (codeql--session-buffer session)
          (setq codeql--active-database-language "javascript"))
        (cl-letf (((symbol-function 'codeql--session-ensure) (lambda (s &rest _) s))
-                 ((symbol-function 'codeql-repl--decode)
+                 ((symbol-function 'codeql--session-decode)
                   (lambda (&rest _) codeql-test--decoded)))
          (let ((repl (codeql-repl--start root "default")))
            (unwind-protect
@@ -1529,6 +1529,199 @@ OUTCOME gets the :provenance of RUN."
             (should (equal (ring-elements comint-input-ring)
                            '(":defs" "predicate p(int x) {\n  x = 1\n}")))))
       (delete-file file))))
+
+;;; Org Babel
+
+(require 'ob-codeql)
+
+(defvar codeql-test--decoded-rows nil
+  "The number of rows that `codeql-test--with-babel' was asked to decode.")
+
+(defmacro codeql-test--with-babel (runs &rest body)
+  "Run BODY with source blocks evaluated in a CodeQL pack at `root'.
+
+See `codeql-test--with-session'.  `codeql--session-decode' returns
+`codeql-test--decoded'."
+  (declare (indent 1) (debug t))
+  `(codeql-test--with-session ,runs
+     (let ((codeql-test--decoded nil)
+           (codeql-test--decoded-rows nil)
+           (org-confirm-babel-evaluate nil))
+       (with-current-buffer (codeql--session-buffer session)
+         (setq codeql--active-database-language "javascript"))
+       (cl-letf (((symbol-function 'codeql--session-ensure) (lambda (s &rest _) s))
+                 ((symbol-function 'codeql--session-decode)
+                  (lambda (_session _path rows)
+                    (setq codeql-test--decoded-rows rows)
+                    codeql-test--decoded))
+                 ((symbol-function 'codeql--source-link-prefix) (lambda () "")))
+         (unwind-protect
+             (progn ,@body)
+           (let ((anonymous (gethash (cons (file-name-as-directory root)
+                                           ob-codeql--anonymous-session)
+                                     codeql--sessions)))
+             (when anonymous
+               (codeql--session-kill anonymous))))))))
+
+(defun codeql-test--babel (root block &optional finish)
+  "Evaluate the source BLOCK in an org buffer in ROOT.
+
+FINISH, when non-nil, is called to finish the query run of BLOCK while
+it is awaited.  Return (VALUE . TEXT) of the result value and of the
+org text after the block."
+  (with-temp-buffer
+    (setq default-directory (file-name-as-directory root))
+    (org-mode)
+    (insert block "\n")
+    (goto-char (point-min))
+    (when finish
+      (run-at-time 0.05 nil finish))
+    (let ((value (org-babel-execute-src-block)))
+      (goto-char (point-min))
+      (re-search-forward "^[ \t]*#\\+end_src\n")
+      (cons value (buffer-substring-no-properties (point) (point-max))))))
+
+(ert-deftest codeql-test-babel-cell ()
+  "Values become org table cells, and locations codeql links."
+  (let ((codeql--source-link-prefix-box (list nil)))
+    (cl-letf (((symbol-function 'codeql--source-link-prefix) (lambda () "")))
+      (should (equal (ob-codeql--cell t) "true"))
+      (should (equal (ob-codeql--cell :false) "false"))
+      (should (equal (ob-codeql--cell 42) 42))
+      (should (equal (ob-codeql--cell "a|b\nc") "a¦b c"))
+      (should (equal (ob-codeql--cell '((label . "*bold*"))) "\u200b*\u200bbold\u200b*\u200b"))
+      (should (equal (ob-codeql--cell
+                      '((label . "a|b")
+                        (url . ((uri . "file:///src/a.js") (startLine . 3) (startColumn . 2)
+                                (endLine . 3) (endColumn . 5)))))
+                     "[[codeql:/src/a.js::3:2:3:5][a¦b]]")))))
+
+(ert-deftest codeql-test-babel-results ()
+  "Results become a table under the names of the columns, or one value."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-babel runs
+    (setq codeql-test--decoded
+          '((((name . "x") (kind . "Integer")) ((kind . "String")))
+            ([1 "a|b"] [2 "c"])
+            3))
+    (let ((result (codeql-test--babel
+                   root "#+begin_src codeql :limit 2\nfrom int x select x, \"a|b\"\n#+end_src"
+                   (lambda () (codeql-test--finish-run (car runs) :status 'results
+                                                       :bqrs-path "/r.bqrs")))))
+      (should (equal (car result) '(("x" "String") hline (1 "a¦b") (2 "c"))))
+      (should (string-match-p "\\`\n#\\+RESULTS:\n| x | String |\n|---\\+--------|\n| 1 | a¦b    |\n"
+                              (cdr result)))
+      (should (equal codeql-test--decoded-rows 2))
+      (should (equal (plist-get (plist-get (car runs) :provenance) :frontend) "Org Babel")))
+    ;; a single value is returned as is, strings with their lines
+    (setq codeql-test--decoded '((((kind . "String"))) (["a|b\nc"]) 1))
+    (should (equal (cdr (codeql-test--babel
+                         root "#+begin_src ql\n\"a|b\\nc\"\n#+end_src"
+                         (lambda () (codeql-test--finish-run (car runs) :status 'results
+                                                             :bqrs-path "/r.bqrs"))))
+                   "\n#+RESULTS:\n: a|b\n: c\n"))
+    (should (equal codeql-test--decoded-rows ob-codeql-default-limit))
+    ;; predicates can be counted
+    (codeql-test--babel root "#+begin_src codeql :session\npredicate p(int x) { x = 1 }\n#+end_src")
+    (should (equal (car (codeql-test--babel
+                         root "#+begin_src codeql :session :count yes\np\n#+end_src"
+                         (lambda () (codeql-test--finish-run (car runs) :status 'empty))))
+                   nil))
+    (should (eq (plist-get (car runs) :quick-eval) 'count))))
+
+(ert-deftest codeql-test-babel-sessions ()
+  "Blocks without a :session forget their definitions, others share a session."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-babel runs
+    (let ((block "#+begin_src codeql%s\npredicate p() { any() }\n#+end_src")
+          (use "#+begin_src codeql%s\npredicate q() { p() }\n#+end_src"))
+      (should (equal (car (codeql-test--babel root (format block ""))) "Defined p/0."))
+      (should (equal (car (codeql-test--babel root (format use ""))) "Defined q/0."))
+      (let ((keys (codeql-test--session-keys (codeql--session-get root "org-babel"))))
+        (should (member '(predicate "q" 0) keys))
+        (should-not (member '(predicate "p" 0) keys)))
+      (should (equal (car (codeql-test--babel root (format block " :session"))) "Defined p/0."))
+      (should (equal (car (codeql-test--babel root (format use " :session default")))
+                     "Defined q/0."))
+      ;; the session of a name is that of the REPL
+      (should (equal (codeql-test--session-keys session)
+                     '((import "import javascript") (predicate "p" 0) (predicate "q" 0))))
+      (should (equal (car (codeql-test--babel root (format block " :session other")))
+                     "Defined p/0."))
+      (let ((other (codeql--session-get root "other")))
+        (should-not (eq other session))
+        (codeql--session-kill other))
+      (should-error (codeql-test--babel root (format block " :var x=1")) :type 'user-error))))
+
+(ert-deftest codeql-test-babel-errors ()
+  "Failed evaluations show the error, and what was rolled back."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-babel runs
+    (let ((result (codeql-test--babel
+                   root "#+begin_src codeql :session\npredicate broken() { nope() }\nselect 1\n#+end_src"
+                   (lambda ()
+                     (let ((run (car runs)))
+                       (codeql-test--finish-run
+                        run :status 'error
+                        :message (codeql-test--compile-error run "nope()")))))))
+      (should-not (car result))
+      (with-current-buffer org-babel-error-buffer-name
+        (should (string-match-p "could not resolve something (in broken/0)\nRolled back broken/0\\."
+                                (buffer-string))))
+      (should-not (member '(predicate "broken" 0) (codeql-test--session-keys session))))))
+
+(ert-deftest codeql-test-babel-root ()
+  "Blocks are evaluated in their pack, or in that of the language of a database."
+  (let ((pack (make-temp-file "codeql-test-pack" t))
+        (outside (make-temp-file "codeql-test-outside" t))
+        (database (make-temp-file "codeql-test-db" t)))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "qlpack.yml" pack)
+            (insert "name: test/pack\nversion: 0.0.1\n"))
+          (with-temp-file (expand-file-name "codeql-database.yml" database)
+            (insert "---\nsourceLocationPrefix: \"/src\"\nprimaryLanguage: \"javascript\"\n"))
+          (should (equal (codeql--database-language database) "javascript"))
+          (should-not (codeql--database-language outside))
+          (let ((default-directory (file-name-as-directory pack)))
+            (should (equal (ob-codeql--root nil nil) (cons (file-name-as-directory pack) nil))))
+          (let ((default-directory (file-name-as-directory outside)))
+            (should (equal (ob-codeql--root `((:pack . ,pack)) "/db")
+                           (cons (file-name-as-directory pack) "/db")))
+            (cl-letf (((symbol-function 'codeql--session-fallback-root)
+                       (lambda (language) (format "/fallback/%s/" language))))
+              (should (equal (ob-codeql--root nil database)
+                             (cons "/fallback/javascript/" database)))
+              (should-error (ob-codeql--root nil nil) :type 'user-error)
+              (should-error (ob-codeql--root nil outside) :type 'user-error))))
+      (dolist (directory (list pack outside database))
+        (delete-directory directory t)))))
+
+(ert-deftest codeql-test-session-fallback-root ()
+  "The pack of sessions outside of packs depends on the library of the language."
+  (let* ((codeql-state-dir (make-temp-file "codeql-test-state" t))
+         (codeql-use-gh-codeql-extension-when-available nil)
+         (codeql-cli "codeql")
+         (commands nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'codeql--shell-command-to-string)
+                   (lambda (command)
+                     (push command commands)
+                     (let ((root (car (last (split-string-shell-command command)))))
+                       (write-region "" nil (expand-file-name "codeql-pack.lock.yml" root) nil 0))
+                     "")))
+          (let ((root (codeql--session-fallback-root "python")))
+            (should (equal root (expand-file-name "sessions/python/" codeql-state-dir)))
+            (should (equal (with-temp-buffer
+                             (insert-file-contents (expand-file-name "qlpack.yml" root))
+                             (buffer-string))
+                           (concat "name: emacs-codeql/python-session\nversion: 0.0.1\n"
+                                   "dependencies:\n  codeql/python-all: \"*\"\n")))
+            (should (string-match-p "\\`codeql pack install " (car commands)))
+            ;; installed once
+            (should (equal (codeql--session-fallback-root "python") root))
+            (should (equal (length commands) 1))))
+      (delete-directory codeql-state-dir t))))
 
 (provide 'emacs-codeql-test)
 ;;; emacs-codeql-test.el ends here

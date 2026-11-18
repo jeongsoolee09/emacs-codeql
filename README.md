@@ -10,6 +10,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Query execution
 - Quick query evaluation of regions or of the predicate at point, and quick evaluation counts
 - Query history for the local session
+- A CodeQL REPL and Org Babel source blocks, on sessions that remember definitions
 - Comparing the results of two query runs
 - Loading SARIF files, e.g. from `codeql database analyze` or code scanning, as browsable results
 - Query performance summaries from evaluator logs
@@ -451,6 +452,48 @@ Input that begins with a colon is a command. Commands can be abbreviated, such a
 
 The input history, which keeps multi-line inputs whole, is saved in `codeql-repl-history-file`. The prompt is `codeql-repl-prompt`. Killing a REPL ends its session.
 
+### Org Babel
+
+`ob-codeql.el` evaluates `codeql` (or `ql`) source blocks in sessions, so a block can hold anything that a REPL input can. Enable it with:
+
+```elisp
+(org-babel-do-load-languages 'org-babel-load-languages '((codeql . t)))
+```
+
+```org
+#+begin_src codeql :session
+predicate manyArgs(CallExpr c, int n) { n = c.getNumArgument() and n > 2 }
+#+end_src
+
+#+RESULTS:
+: Defined manyArgs/2.
+
+#+begin_src codeql :session :limit 2
+manyArgs
+#+end_src
+
+#+RESULTS:
+| c                   | n |
+|---------------------+---|
+| [[codeql:...][assert. ... empty")]] | 3 |
+| [[codeql:...][assert. ... empty")]] | 3 |
+```
+
+A single result is returned as a value, other results as a table whose header holds the names of the columns, or their types. Result locations are `codeql:` links into the source archive, and numbers stay numbers, so the tables can be used by other blocks. Definitions return what was defined. Errors are shown in the `*Org-Babel Error Output*` buffer, with what was rolled back, and return no result.
+
+| Header argument | Description |
+| --- | --- |
+| `:session [NAME]` | Evaluate in the session NAME (`default` without a name), which keeps definitions for later blocks and is shared with the REPL of that name. Without a session, each block is evaluated on its own. |
+| `:database PATH` | The database to evaluate on, else that of the project |
+| `:pack DIR` | The CodeQL pack to evaluate in, else that of the org file |
+| `:limit N` | The number of result rows, `ob-codeql-default-limit` by default |
+| `:count yes` | Count the results of a quick evaluated predicate |
+| `:open yes` | Also open all results in an org results buffer |
+
+Outside of CodeQL packs, blocks need a `:database` (or ask for one), and are evaluated in a pack that `ob-codeql` makes in `codeql-state-dir` for the language of the database. The pack depends on the latest standard library of the language, which `codeql pack install` installs the first time. When a query server already has the database, blocks use that query server.
+
+Evaluation is synchronous: `C-g` cancels it. `:var` is not supported.
+
 ### Database source archive Xref support
 
 `emacs-codeql` automatically retrieves references and definitions for database source archive files that are opened from a result buffer org link. It achieves this by registering a custom org-link handler for a `codeql:` link type which then performs a ridiculous elisp ritual to trick emacs into thinking it actually has xref support for these files specifically.
@@ -662,7 +705,7 @@ The regression tests in `test/` don't need the CodeQL CLI:
 emacs -Q --batch -L . -l test/emacs-codeql-test.el -f ert-run-tests-batch-and-exit
 ```
 
-The org-ql tests are skipped unless org-ql and its dependencies are on the `load-path` (add them with `-L`). The session and REPL tests are skipped unless the tree-sitter `ql` grammar is installed.
+The org-ql tests are skipped unless org-ql and its dependencies are on the `load-path` (add them with `-L`). The session, REPL and Org Babel tests are skipped unless the tree-sitter `ql` grammar is installed.
 
 ## Known Quirks
 
