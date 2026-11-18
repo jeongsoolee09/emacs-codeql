@@ -2417,24 +2417,28 @@ checked once rather than for every result node.")
             (setcar codeql--source-link-prefix-box prefix))
           prefix))))
 
+(defun codeql--result-node-link (node)
+  "Return the path of the codeql: link to the location of the visitable NODE."
+  ;; since we have our own link type, also add in a column, and the end
+  ;; of the location when known, see `codeql--parse-link-location'
+  (let* ((url (codeql--result-node-url node))
+         (end-line (and (listp url) (alist-get 'endLine url)))
+         (end-column (and (listp url) (alist-get 'endColumn url))))
+    (format "%s%s::%s:%s%s"
+            (codeql--source-link-prefix)
+            (codeql--encode-link-path (codeql--result-node-filename node))
+            (codeql--result-node-line node)
+            (codeql--result-node-column node)
+            (if (and (natnump end-line) (natnump end-column))
+                (format ":%s:%s" end-line end-column)
+              ""))))
+
 (defun codeql--result-node-to-org (node &optional custom-description)
   "Transform a result node into an org compatible link|string representation."
   (codeql--require-org)
   ;; https://orgmode.org/guide/Hyperlinks.html
   (if (codeql--result-node-visitable node)
-      ;; since we have our own link type, also add in a column, and the end
-      ;; of the location when known, see `codeql--parse-link-location'
-      (let* ((url (codeql--result-node-url node))
-             (end-line (and (listp url) (alist-get 'endLine url)))
-             (end-column (and (listp url) (alist-get 'endColumn url)))
-             (link (format "codeql:%s%s::%s:%s%s"
-                           (codeql--source-link-prefix)
-                           (codeql--encode-link-path (codeql--result-node-filename node))
-                           (codeql--result-node-line node)
-                           (codeql--result-node-column node)
-                           (if (and (natnump end-line) (natnump end-column))
-                               (format ":%s:%s" end-line end-column)
-                             "")))
+      (let ((link (concat "codeql:" (codeql--result-node-link node)))
             (desc (codeql--printable-label (or custom-description
                                                (codeql--result-node-label node)))))
         (format "[[%s][%s]]"
@@ -8806,7 +8810,9 @@ the FILES wildcard to search, which defaults to all files."
            ("v" "variant analysis" codeql-mrva)
            ("t" "performance" codeql-query-performance)
            ("T" "compare performance" codeql-query-performance-compare)
-           ("c" "cancel" codeql-query-server-cancel-query)]
+           ("c" "cancel" codeql-query-server-cancel-query)
+           ("R" "REPL" codeql-repl)
+           ("E" "eval in REPL" codeql-repl-send-region)]
           ["Config"
            ("p" codeql-set-max-paths
             :description
@@ -9041,7 +9047,11 @@ the compiler explains what is wrong with it."
         (let* ((root (codeql--session-parse-root (concat "predicate p() {\n" input "\n}")))
                (body (and root (treesit-search-subtree
                                 root (lambda (node) (equal (treesit-node-type node) "body")))))
-               (terms (and body (treesit-node-children body t)))
+               (terms (and body (seq-remove
+                                 (lambda (node)
+                                   (member (treesit-node-type node)
+                                           '("line_comment" "block_comment" "qldoc")))
+                                 (treesit-node-children body t))))
                (kind (if (= (length terms) 1)
                          (codeql--session-term-kind (car terms) definitions)
                        '(expression))))
@@ -9132,6 +9142,34 @@ definitions are, see `codeql--session-definition-lines'."
             (when (<= (nth 1 entry) line (nth 2 entry))
               (cl-pushnew (car entry) keys :test #'equal))))))
     (nreverse keys)))
+
+(defun codeql--session-describe-errors (message file definitions lines)
+  "Return MESSAGE with its locations in FILE described in terms of the session.
+
+FILE is the query module that was compiled with DEFINITIONS, which are
+at LINES, see `codeql--session-definition-lines'.  Locations in a
+definition name it, the others are in the evaluated input."
+  (let ((suffix (concat "/" (file-name-nondirectory file))))
+    (replace-regexp-in-string
+     "(\\([^()\n]+\\):\\([0-9]+\\),[0-9]+-[0-9]+)$"
+     (lambda (match)
+       (let ((path (match-string 1 match))
+             (line (string-to-number (match-string 2 match))))
+         (if (not (string-suffix-p suffix path))
+             match
+           (if-let ((entry (seq-find (lambda (entry) (<= (nth 1 entry) line (nth 2 entry)))
+                                     lines)))
+               (format "(in %s%s)"
+                       (or (codeql--session-definition-name
+                            (seq-find (lambda (definition)
+                                        (equal (plist-get definition :key) (car entry)))
+                                      definitions))
+                           "a definition")
+                       (if (= (nth 1 entry) (nth 2 entry))
+                           ""
+                         (format ", line %d" (1+ (- line (nth 1 entry))))))
+             "(in the input)"))))
+     message t t)))
 
 (defun codeql--session-kept-definitions (definitions error-keys)
   "Return the definitions a session keeps after an evaluation failed.
@@ -9379,9 +9417,11 @@ right away, while the evaluation runs."
 (defun codeql--session-run (session definitions action input frontend count callback)
   "Run ACTION of INPUT with DEFINITIONS in SESSION.
 
-CALLBACK is called with the outcome, whose :error-keys are the keys of
-the definitions with errors.  See `codeql--session-eval' for FRONTEND
-and COUNT."
+CALLBACK is called with the outcome.  When it is an error, its
+:error-keys are the keys of the definitions with errors, and its
+:message tells where they are in terms of the session, see
+`codeql--session-describe-errors', unlike its :compiler-message.  See
+`codeql--session-eval' for FRONTEND and COUNT."
   (let ((buffer (codeql--session-buffer session))
         (name (codeql--session-name session)))
     (with-current-buffer buffer
@@ -9416,10 +9456,15 @@ and COUNT."
                   (setf (codeql--session-pending session) nil)
                   (funcall callback
                            (if (eq (plist-get outcome :status) 'error)
-                               (append outcome
-                                       (list :error-keys
-                                             (codeql--session-error-keys
-                                              (plist-get outcome :message) file lines)))
+                               (let ((message (plist-get outcome :message)))
+                                 (append (list :error-keys
+                                               (codeql--session-error-keys message file lines)
+                                               :message
+                                               (and message
+                                                    (codeql--session-describe-errors
+                                                     message file definitions lines))
+                                               :compiler-message message)
+                                         outcome))
                              outcome)))))
         (setf (codeql--session-pending session) handler)
         (condition-case err
@@ -9446,6 +9491,27 @@ Its outcome is an error whose :cancelled is non-nil."
   (when (buffer-live-p (codeql--session-buffer session))
     (kill-buffer (codeql--session-buffer session))))
 
+(defun codeql--session-undefine (session name)
+  "Remove the definitions NAME from SESSION, and return them.
+
+NAME is that of `codeql--session-definition-name', or the name of
+predicates of any arity."
+  (let ((removed (seq-filter (lambda (definition)
+                               (or (equal (codeql--session-definition-name definition) name)
+                                   (and (plist-get definition :arity)
+                                        (equal (plist-get definition :name) name))))
+                             (codeql--session-definitions session))))
+    (setf (codeql--session-definitions session)
+          (seq-difference (codeql--session-definitions session) removed #'eq))
+    removed))
+
+(defun codeql--session-reset (session)
+  "Make SESSION forget its definitions, except the default ones."
+  (setf (codeql--session-definitions session)
+        (codeql--session-default-definitions
+         (buffer-local-value 'codeql--active-database-language
+                             (codeql--session-buffer session)))))
+
 (defun codeql--session-eval-sync (session input &rest args)
   "Evaluate INPUT in SESSION like `codeql--session-eval', and return the outcome.
 
@@ -9462,6 +9528,711 @@ ARGS are passed on.  Quitting cancels the evaluation."
        (codeql--session-cancel session)
        (signal (car err) (cdr err))))
     outcome))
+
+;;; REPL
+
+;; The CodeQL REPL is a comint front end to a session: each input is
+;; evaluated with `codeql--session-eval', and the first rows of its
+;; results are printed below it, with a button to open all of them in
+;; an org results buffer.
+
+;; comint is loaded when a REPL starts, see `codeql-repl--start'
+(eval-when-compile (require 'comint))
+(declare-function comint-check-proc "comint")
+(declare-function comint-fontify-input-mode "comint")
+(declare-function comint-mode "comint")
+(declare-function comint-output-filter "comint")
+(declare-function comint-read-input-ring "comint")
+(declare-function comint-send-input "comint")
+(declare-function ring-empty-p "ring")
+(declare-function ring-length "ring")
+(declare-function ring-ref "ring")
+
+(defcustom codeql-repl-prompt "ql> "
+  "The prompt of the CodeQL REPL."
+  :type 'string
+  :group 'emacs-codeql)
+
+(defcustom codeql-repl-max-rows 10
+  "The number of result rows that the CodeQL REPL prints.
+
+All results can be opened in a results buffer from the REPL."
+  :type 'natnum
+  :group 'emacs-codeql)
+
+(defcustom codeql-repl-max-column-width 60
+  "The width that the CodeQL REPL truncates result values to."
+  :type 'natnum
+  :group 'emacs-codeql)
+
+(defcustom codeql-repl-history-file (locate-user-emacs-file "codeql-repl-history")
+  "The file that keeps the input history of the CodeQL REPL, or nil for none."
+  :type '(choice file (const :tag "No history file" nil))
+  :group 'emacs-codeql)
+
+(defcustom codeql-repl-fontify-input t
+  "Non-nil means that the CodeQL REPL highlights its input as CodeQL."
+  :type 'boolean
+  :group 'emacs-codeql)
+
+(defface codeql-repl-error '((t :inherit error))
+  "Face of errors in the CodeQL REPL."
+  :group 'emacs-codeql)
+
+(defface codeql-repl-note '((t :inherit shadow))
+  "Face of notes, such as the number of results, in the CodeQL REPL."
+  :group 'emacs-codeql)
+
+(defface codeql-repl-column '((t :inherit bold))
+  "Face of the names of result columns in the CodeQL REPL."
+  :group 'emacs-codeql)
+
+(defvar-local codeql-repl--session nil
+  "The session that the CodeQL REPL buffer evaluates input in.")
+
+(defvar-local codeql-repl--outcome nil
+  "The outcome of the last evaluation with results in the CodeQL REPL buffer.")
+
+(defvar-local codeql-repl--started nil
+  "When the running evaluation of the CodeQL REPL buffer started, or nil.")
+
+(defconst codeql-repl--keywords
+  '("and" "any" "as" "asc" "avg" "boolean" "by" "class" "concat" "count" "date"
+    "desc" "else" "exists" "extends" "false" "float" "forall" "forex" "from" "if"
+    "implies" "import" "in" "instanceof" "int" "max" "min" "module" "newtype" "none"
+    "not" "or" "order" "predicate" "rank" "result" "select" "strictconcat"
+    "strictcount" "strictsum" "string" "sum" "super" "then" "this" "true" "where")
+  "The CodeQL keywords that the CodeQL REPL completes.")
+
+(defconst codeql-repl--commands
+  '(("help" codeql-repl--command-help nil "list the REPL commands")
+    ("defs" codeql-repl--command-defs "[NAME]"
+     "list the definitions of the session, or show those named NAME")
+    ("undef" codeql-repl--command-undef "NAME" "remove the definitions named NAME")
+    ("reset" codeql-repl--command-reset nil "remove all definitions but the default import")
+    ("count" codeql-repl--command-count "PREDICATE"
+     "count the results of a predicate of the session")
+    ("results" codeql-repl--command-results nil "open the last results in a results buffer")
+    ("module" codeql-repl--command-module nil "show the query module of the last evaluation")
+    ("db" codeql-repl--command-db "[PATH]"
+     "show the database, or register the one at PATH for the project")
+    ("cancel" codeql-repl--command-cancel nil "cancel the running evaluation")
+    ("clear" codeql-repl--command-clear nil "clear the REPL buffer"))
+  "The commands of the CodeQL REPL: (NAME FUNCTION ARGUMENTS DESCRIPTION).
+
+FUNCTION is called with the arguments of the command, a string, and
+returns the text to print, or nil when it prints by itself.")
+
+(defvar codeql-repl--syntax-table
+  (let ((table (make-syntax-table)))
+    (modify-syntax-entry ?_ "w" table)
+    (modify-syntax-entry ?/ ". 124" table)
+    (modify-syntax-entry ?\n ">" table)
+    (modify-syntax-entry ?* ". 23b" table)
+    (modify-syntax-entry ?@ "_" table)
+    table)
+  "Syntax table of the CodeQL REPL, as for CodeQL code.")
+
+(defvar codeql-repl-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'codeql-repl-return)
+    (define-key map (kbd "C-j") #'codeql-repl-newline)
+    (define-key map (kbd "C-c C-c") #'codeql-repl-cancel)
+    (define-key map (kbd "C-c C-v") #'codeql-repl-show-results)
+    (define-key map (kbd "TAB") #'completion-at-point)
+    map)
+  "Keymap of `codeql-repl-mode'.")
+
+(define-derived-mode codeql-repl-mode comint-mode "CodeQL-REPL"
+  "Major mode of the CodeQL REPL, see `codeql-repl'.
+
+\\{codeql-repl-mode-map}"
+  :syntax-table codeql-repl--syntax-table
+  (setq comint-prompt-regexp (concat "^" (regexp-quote codeql-repl-prompt)))
+  (setq-local comint-prompt-read-only t)
+  (setq-local comint-input-sender #'codeql-repl--send)
+  (setq-local comint-process-echoes nil)
+  (setq-local comint-inhibit-carriage-motion t)
+  (setq-local comint-input-ignoredups t)
+  ;; inputs span lines
+  (setq-local comint-input-ring-separator "\n\0\n")
+  (setq-local comint-input-ring-file-name codeql-repl-history-file)
+  (setq-local comment-start "// ")
+  (setq-local comment-start-skip "\\(?://+\\|/\\*+\\)\\s *")
+  (setq-local mode-line-process '(codeql-repl--started ":running"))
+  (add-hook 'completion-at-point-functions #'codeql-repl--completion-at-point nil t)
+  (add-hook 'kill-buffer-hook #'codeql-repl--on-kill nil t)
+  (when (and codeql-repl-fontify-input (codeql--session-treesit-p))
+    (setq-local comint-indirect-setup-function #'ql-tree-sitter-mode)
+    (comint-fontify-input-mode))
+  (comint-read-input-ring t))
+
+(defun codeql-repl--write-history ()
+  "Save the input history of the current REPL buffer.
+
+Unlike `comint-write-input-ring', this separates the inputs by the
+`comint-input-ring-separator' of the REPL, so that multi-line inputs
+are read back whole."
+  (let ((file comint-input-ring-file-name)
+        (ring comint-input-ring)
+        (separator comint-input-ring-separator))
+    (when (and file (not (string-empty-p file))
+               ring (not (ring-empty-p ring))
+               (file-writable-p file))
+      (with-temp-buffer
+        (dotimes (index (ring-length ring))
+          (insert (ring-ref ring (- (ring-length ring) index 1)) separator))
+        (write-region nil nil file nil 'silent)))))
+
+(defun codeql-repl--on-kill ()
+  "Save the input history of this killed REPL buffer, and end its session."
+  (when codeql-repl--session
+    (codeql-repl--write-history)
+    (codeql--session-kill codeql-repl--session)))
+
+(defun codeql-repl--save-histories ()
+  "Save the input history of all CodeQL REPL buffers."
+  (dolist (buffer (buffer-list))
+    (when (eq (buffer-local-value 'major-mode buffer) 'codeql-repl-mode)
+      (with-current-buffer buffer
+        (codeql-repl--write-history)))))
+
+(add-hook 'kill-emacs-hook #'codeql-repl--save-histories)
+
+(defun codeql-repl--root ()
+  "Return the root of the CodeQL pack that the current buffer belongs to, or nil."
+  (cond (codeql-repl--session (codeql--session-root codeql-repl--session))
+        ((codeql--find-project-root (or buffer-file-name default-directory)))))
+
+(defun codeql-repl--find (root name)
+  "Return the live REPL buffer of session NAME in the CodeQL pack at ROOT, or nil."
+  (seq-find (lambda (buffer)
+              (with-current-buffer buffer
+                (and (eq major-mode 'codeql-repl-mode)
+                     codeql-repl--session
+                     (equal (codeql--session-root codeql-repl--session) root)
+                     (equal (codeql--session-name codeql-repl--session) name)
+                     (comint-check-proc buffer))))
+            (buffer-list)))
+
+(defun codeql-repl--banner (session)
+  "Return the text that a new REPL of SESSION starts with."
+  (let ((buffer (codeql--session-buffer session)))
+    (concat
+     (format "CodeQL REPL, session %s of %s\n"
+             (codeql--session-name session)
+             (abbreviate-file-name (codeql--session-root session)))
+     (format "Database: %s (%s)\n"
+             (abbreviate-file-name (or (codeql--session-database session) "none"))
+             (or (buffer-local-value 'codeql--active-database-language buffer) "?"))
+     (substitute-command-keys
+      (concat "Enter definitions, select queries, expressions or formulas.  "
+              ":help lists the commands, \\<codeql-repl-mode-map>\\[codeql-repl-cancel] cancels.\n")))))
+
+(defun codeql-repl--start (root name)
+  "Return a new REPL buffer for session NAME in the CodeQL pack at ROOT."
+  (require 'comint)
+  (let* ((session (codeql--session-ensure (codeql--session-get root name)))
+         (buffer (generate-new-buffer
+                  (format "*codeql-repl %s%s*"
+                          (file-name-nondirectory (directory-file-name root))
+                          (if (equal name "default") "" (format "<%s>" name))))))
+    (with-current-buffer buffer
+      (codeql-repl-mode)
+      (setq codeql-repl--session session)
+      ;; result locations are visited like from results of the session
+      (setq codeql--org-query-buffer (codeql--session-buffer session))
+      (let ((process (make-pipe-process :name "codeql-repl" :buffer buffer :noquery t)))
+        (set-process-filter process #'ignore)
+        (set-marker (process-mark process) (point-max))
+        (comint-output-filter process (concat (codeql-repl--banner session)
+                                              codeql-repl-prompt))))
+    buffer))
+
+;;;###autoload
+(defun codeql-repl (root &optional name)
+  "Switch to the CodeQL REPL of the CodeQL pack at ROOT, starting it if needed.
+
+The REPL evaluates CodeQL input in session NAME (default: \"default\")
+of the pack, on the database of the project.  Input can make
+definitions, which later input can use, and ask for a select query, an
+expression, a formula, or the name of a predicate to quick evaluate,
+see `codeql--session-eval'.  The first `codeql-repl-max-rows' rows of the
+results are printed, and all of them can be opened in a results buffer.
+
+Input that begins with a colon is a REPL command, :help lists them.
+
+Interactively, ROOT is the pack of the current buffer, or read from the
+minibuffer, and with a prefix argument, NAME is read as well."
+  (interactive
+   (list (or (codeql-repl--root)
+             (read-directory-name "CodeQL pack: " nil nil t))
+         (when current-prefix-arg
+           (read-string "Session name (default \"default\"): " nil nil "default"))))
+  (let* ((pack (or (codeql--find-project-root root)
+                   (user-error "%s is not in a CodeQL pack" root)))
+         (root (file-name-as-directory (expand-file-name pack)))
+         (name (or name "default")))
+    (pop-to-buffer (or (codeql-repl--find root name) (codeql-repl--start root name)))))
+
+(defun codeql-repl--print (text)
+  "Print TEXT as REPL output, followed by a new prompt."
+  (comint-output-filter (get-buffer-process (current-buffer))
+                        (concat text
+                                (if (or (string-empty-p text) (string-suffix-p "\n" text))
+                                    ""
+                                  "\n")
+                                codeql-repl-prompt)))
+
+(defun codeql-repl--input-complete-p (input)
+  "Return non-nil if INPUT is complete, rather than to be continued on a new line.
+
+Input is incomplete while it has unclosed parentheses, brackets, braces,
+strings or comments, when it ends in an operator, or when it is a from
+or where clause without a select."
+  (with-temp-buffer
+    (set-syntax-table codeql-repl--syntax-table)
+    (insert input)
+    (let ((state (syntax-ppss (point-max)))
+          (code (progn
+                  ;; what the input ends with, but for comments
+                  (insert "\n")
+                  (forward-comment (- (point-max)))
+                  (string-trim (buffer-substring-no-properties (point-min) (point))))))
+      (and (<= (car state) 0)
+           (not (nth 3 state))
+           ;; a line comment ends with the input, unlike a block comment
+           (not (and (nth 4 state) (nth 7 state)))
+           (not (string-match-p
+                 (concat "\\(?:[-+*/%=<>|,]\\|\\_<"
+                         (regexp-opt '("and" "or" "implies" "not" "if" "then" "else"
+                                       "from" "where" "select" "instanceof" "extends"
+                                       "import" "as" "in"))
+                         "\\)\\'")
+                 code))
+           (not (and (string-match-p "\\`\\(?:from\\|where\\)\\_>" code)
+                     (not (string-match-p "\\_<select\\_>" code))))))))
+
+(defun codeql-repl-return ()
+  "Send the input to the CodeQL REPL when it is complete, else continue it.
+
+See `codeql-repl--input-complete-p' for when input is complete."
+  (interactive)
+  (let ((process (get-buffer-process (current-buffer))))
+    (if (and process
+             (>= (point) (process-mark process))
+             (not (codeql-repl--input-complete-p
+                   (buffer-substring-no-properties (process-mark process) (point-max)))))
+        (codeql-repl-newline)
+      (comint-send-input))))
+
+(defun codeql-repl-newline ()
+  "Continue the input of the CodeQL REPL on a new line."
+  (interactive)
+  (let* ((process (get-buffer-process (current-buffer)))
+         (start (if (and process (>= (point) (process-mark process)))
+                    (process-mark process)
+                  (line-beginning-position)))
+         ;; earlier output may have unbalanced parentheses
+         (depth (car (parse-partial-sexp start (point)))))
+    (insert "\n" (make-string (* 2 (max depth 0)) ?\s))))
+
+(defun codeql-repl--send (_process input)
+  "Evaluate INPUT, which was entered in the current REPL buffer."
+  (let ((input (string-trim input)))
+    (cond ((string-empty-p input)
+           (codeql-repl--print ""))
+          ((string-prefix-p ":" input)
+           (let* ((name (car (split-string (substring input 1) "[ \t\n]+")))
+                  (arguments (string-trim (substring input (1+ (length name)))))
+                  (commands (if-let ((exact (assoc name codeql-repl--commands)))
+                                (list exact)
+                              (seq-filter (lambda (c) (string-prefix-p name (car c)))
+                                          codeql-repl--commands))))
+             (cond
+              ((null commands)
+               (codeql-repl--print
+                (codeql-repl--error (format "Unknown command :%s, :help lists them" name))))
+              ((cdr commands)
+               (codeql-repl--print
+                (codeql-repl--error
+                 (format "Ambiguous command :%s, it may be %s" name
+                         (mapconcat (lambda (c) (concat ":" (car c))) commands " ")))))
+              (t
+               (condition-case err
+                   (when-let ((text (funcall (nth 1 (car commands)) arguments)))
+                     (codeql-repl--print text))
+                 (error (codeql-repl--print (codeql-repl--error (error-message-string err)))))))))
+          (t (codeql-repl--eval input)))))
+
+(defun codeql-repl--error (message)
+  "Return MESSAGE formatted as an error of the REPL."
+  (propertize (string-trim-right message) 'font-lock-face 'codeql-repl-error))
+
+(defun codeql-repl--note (message)
+  "Return MESSAGE formatted as a note of the REPL."
+  (propertize message 'font-lock-face 'codeql-repl-note))
+
+(defun codeql-repl--eval (input &rest args)
+  "Evaluate INPUT in the session of the current REPL buffer, and print the outcome.
+
+ARGS are passed on to `codeql--session-eval'."
+  (let ((buffer (current-buffer)))
+    (condition-case err
+        (progn
+          (setq codeql-repl--started (float-time))
+          (apply #'codeql--session-eval codeql-repl--session input
+                 (lambda (outcome)
+                   (when (buffer-live-p buffer)
+                     (with-current-buffer buffer
+                       (codeql-repl--print (codeql-repl--format-outcome outcome)))))
+                 :frontend "REPL" args))
+      (error
+       (setq codeql-repl--started nil)
+       (codeql-repl--print
+        (codeql-repl--error
+         (if (codeql--session-pending codeql-repl--session)
+             (substitute-command-keys
+              "An evaluation is running, \\<codeql-repl-mode-map>\\[codeql-repl-cancel] cancels it")
+           (error-message-string err))))))
+    (force-mode-line-update)))
+
+(defun codeql-repl--format-outcome (outcome)
+  "Return the text that the REPL prints for the OUTCOME of an evaluation."
+  (let* ((elapsed (and codeql-repl--started (- (float-time) codeql-repl--started)))
+         (status (plist-get outcome :status))
+         (dropped (plist-get outcome :dropped))
+         (defined (seq-difference (plist-get outcome :definitions) dropped))
+         (lines nil))
+    (setq codeql-repl--started nil)
+    (force-mode-line-update)
+    (when defined
+      (push (codeql-repl--note (format "Defined %s." (string-join defined ", "))) lines))
+    (pcase status
+      ('results
+       (setq codeql-repl--outcome outcome)
+       (push (condition-case err
+                 (codeql-repl--format-results outcome elapsed)
+               (error (codeql-repl--error (format "Could not read the results: %s"
+                                                  (error-message-string err)))))
+             lines))
+      ('empty
+       (push (codeql-repl--note (format "No results%s." (codeql-repl--elapsed elapsed))) lines))
+      ('error
+       (if (plist-get outcome :cancelled)
+           (push (codeql-repl--note "Canceled.") lines)
+         (push (codeql-repl--error (or (plist-get outcome :message) "Evaluation failed")) lines)
+         (when dropped
+           (push (propertize (format "Rolled back %s." (string-join dropped ", "))
+                             'font-lock-face 'warning)
+                 lines)))))
+    (when (and (eq status 'defined) (not defined))
+      (push (codeql-repl--note "Nothing new was defined.") lines))
+    (mapconcat #'identity (nreverse lines) "\n")))
+
+(defun codeql-repl--elapsed (elapsed)
+  "Return the text for an evaluation that took ELAPSED seconds, or nil."
+  (if elapsed (format " in %.1fs" elapsed) ""))
+
+(defun codeql-repl--decode (session bqrs-path rows)
+  "Return the (COLUMNS TUPLES TOTAL) of the first ROWS results at BQRS-PATH.
+
+The results are those of the #select result set, or of the first one,
+as decoded by SESSION's CLI.  TOTAL is the number of results."
+  (with-current-buffer (codeql--session-buffer session)
+    (let* ((info (or (codeql--bqrs-info bqrs-path (max rows 1))
+                     (error "No result sets in %s" bqrs-path)))
+           (sets (append (alist-get 'result-sets info) nil))
+           (set (or (seq-find (lambda (s) (equal (alist-get 'name s) "#select")) sets)
+                    (car sets)))
+           (offsets (alist-get 'offsets (alist-get 'pagination set)))
+           (start (and (> (length offsets) 0) (aref offsets 0)))
+           (json (codeql--bqrs-to-json bqrs-path "string,url" (alist-get 'name set)
+                                       (and start (max rows 1)) start))
+           (data (json-parse-string json :object-type 'alist))
+           ;; a single result set isn't keyed by its name
+           (data (if (assq 'columns data) data (cdar data))))
+      (list (append (alist-get 'columns data) nil)
+            (seq-take (append (alist-get 'tuples data) nil) rows)
+            (or (alist-get 'rows set) 0)))))
+
+(defun codeql-repl--cell (value)
+  "Return the text that the REPL shows for the result VALUE.
+
+Locations become buttons that visit them.  This is called in the query
+buffer of the results, which locates their source archive."
+  (pcase value
+    ('t "true")
+    (:false "false")
+    (:null "")
+    ((pred numberp) (number-to-string value))
+    ((pred stringp)
+     (propertize (codeql--printable-label value) 'font-lock-face 'font-lock-string-face))
+    ((pred listp)
+     (let ((label (codeql--printable-label (alist-get 'label value)))
+           (url (codeql--location-url (alist-get 'url value))))
+       (if (not url)
+           label
+         (let ((link (codeql--result-node-link
+                      (codeql--result-node-create
+                       :label label
+                       :filename (codeql--uri-to-filename (alist-get 'uri url))
+                       :line (alist-get 'startLine url)
+                       :column (alist-get 'startColumn url)
+                       :visitable t
+                       :url url))))
+           (make-text-button label nil
+                             'action #'codeql-repl--visit
+                             'codeql-link link
+                             'help-echo (format "Visit %s:%s"
+                                                (file-name-nondirectory
+                                                 (codeql--uri-to-filename (alist-get 'uri url)))
+                                                (alist-get 'startLine url))
+                             'follow-link t)))))
+    (_ (format "%s" value))))
+
+(defun codeql-repl--visit (button)
+  "Visit the result location of BUTTON."
+  (codeql--org-open-file-link (button-get button 'codeql-link)))
+
+(defun codeql-repl--table (columns rows)
+  "Return a text table of ROWS of cell texts, under the names of COLUMNS."
+  (let* ((names (cl-loop for column in columns
+                         for i from 0
+                         collect (or (alist-get 'name column)
+                                     (if (= (length columns) 1) "" (format "[%d]" i)))))
+         (numeric (mapcar (lambda (column)
+                            (member (alist-get 'kind column) '("Integer" "Float")))
+                          columns))
+         (rows (mapcar (lambda (row)
+                         (mapcar (lambda (cell)
+                                   (truncate-string-to-width
+                                    cell codeql-repl-max-column-width nil nil "…"))
+                                 row))
+                       rows))
+         (widths (cl-loop for i from 0 below (length columns)
+                          collect (apply #'max (string-width (nth i names))
+                                         (mapcar (lambda (row) (string-width (nth i row)))
+                                                 rows))))
+         (line (lambda (cells)
+                 (string-trim-right
+                  (mapconcat #'identity
+                             (cl-loop for cell in cells
+                                      for width in widths
+                                      for right in numeric
+                                      for pad = (make-string (- width (string-width cell)) ?\s)
+                                      collect (if right (concat pad cell) (concat cell pad)))
+                             (codeql-repl--note " │ "))))))
+    (concat
+     ;; a single value needs no header
+     (unless (or (seq-every-p #'string-empty-p names)
+                 (and (= (length columns) 1) (<= (length rows) 1)))
+       (concat (funcall line (mapcar (lambda (name)
+                                       (propertize name 'font-lock-face 'codeql-repl-column))
+                                     names))
+               "\n"
+               (codeql-repl--note (mapconcat (lambda (width) (make-string width ?─))
+                                             widths "─┼─"))
+               "\n"))
+     (mapconcat (lambda (row) (funcall line row)) rows "\n"))))
+
+(defun codeql-repl--format-results (outcome elapsed)
+  "Return the text that the REPL prints for the results of OUTCOME.
+
+The evaluation took ELAPSED seconds."
+  (pcase-let* ((session (plist-get outcome :session))
+               (`(,columns ,tuples ,total)
+                (codeql-repl--decode session (plist-get outcome :bqrs-path)
+                                     codeql-repl-max-rows))
+               (rows (with-current-buffer (codeql--session-buffer session)
+                       (let ((codeql--source-link-prefix-box (list nil)))
+                         (mapcar (lambda (tuple) (mapcar #'codeql-repl--cell tuple))
+                                 tuples))))
+               (button (make-text-button "[results]" nil
+                                         'action #'codeql-repl--show-outcome
+                                         'codeql-outcome outcome
+                                         'help-echo "Open all results in a results buffer"
+                                         'follow-link t)))
+    (concat
+     (codeql-repl--table columns rows)
+     "\n"
+     (codeql-repl--note
+      (format "%s%s%s "
+              (if (= total 1) "1 result" (format "%d results" total))
+              (if (> total (length rows)) (format ", %d shown" (length rows)) "")
+              (codeql-repl--elapsed elapsed)))
+     button)))
+
+(defun codeql-repl--show-outcome (button)
+  "Open the results of BUTTON's outcome in a results buffer."
+  (codeql--query-run-show (button-get button 'codeql-outcome)))
+
+(defun codeql-repl-show-results ()
+  "Open the results of the last evaluation of the CodeQL REPL in a results buffer."
+  (interactive)
+  (if codeql-repl--outcome
+      (codeql--query-run-show codeql-repl--outcome)
+    (user-error "No results yet")))
+
+(defun codeql-repl-cancel ()
+  "Cancel the evaluation that runs in the CodeQL REPL."
+  (interactive)
+  (unless (and codeql-repl--session (codeql--session-pending codeql-repl--session))
+    (user-error "No evaluation is running"))
+  (codeql--session-cancel codeql-repl--session))
+
+(defun codeql-repl--command-help (_arguments)
+  "Return the help of the REPL commands."
+  (concat
+   (mapconcat (lambda (command)
+                (format "  :%-28s %s"
+                        (concat (car command) (if (nth 2 command) (concat " " (nth 2 command)) ""))
+                        (nth 3 command)))
+              codeql-repl--commands "\n")
+   "\n"
+   (codeql-repl--note
+    (concat "Commands can be abbreviated.  Other input is CodeQL: definitions, a select query,\n"
+            "an expression, a formula, or the name of a predicate to quick evaluate."))))
+
+(defun codeql-repl--definition-label (definition)
+  "Return how the REPL lists DEFINITION."
+  (concat (pcase (plist-get definition :kind)
+            ('import (plist-get definition :name))
+            ('newtype (format "newtype %s" (plist-get definition :name)))
+            (kind (format "%s %s" kind (codeql--session-definition-name definition))))
+          (unless (or (eq (plist-get definition :kind) 'import)
+                      (plist-get definition :verified))
+            (codeql-repl--note " (not compiled yet)"))))
+
+(defun codeql-repl--command-defs (arguments)
+  "Return the definitions of the session, or the code of those named ARGUMENTS."
+  (let ((definitions (codeql--session-definitions codeql-repl--session)))
+    (if (string-empty-p arguments)
+        (if definitions
+            (mapconcat #'codeql-repl--definition-label definitions "\n")
+          (codeql-repl--note "No definitions."))
+      (let ((matching (seq-filter (lambda (definition)
+                                    (or (equal (codeql--session-definition-name definition)
+                                               arguments)
+                                        (equal (plist-get definition :name) arguments)))
+                                  definitions)))
+        (if matching
+            (mapconcat (lambda (definition) (plist-get definition :text)) matching "\n\n")
+          (codeql-repl--error (format "No definition named %s" arguments)))))))
+
+(defun codeql-repl--command-undef (arguments)
+  "Remove the definitions named ARGUMENTS from the session."
+  (when (string-empty-p arguments)
+    (user-error "Usage: :undef NAME"))
+  (if-let ((removed (codeql--session-undefine codeql-repl--session arguments)))
+      (codeql-repl--note (format "Removed %s."
+                                 (mapconcat #'codeql--session-definition-name removed ", ")))
+    (codeql-repl--error (format "No definition named %s" arguments))))
+
+(defun codeql-repl--command-reset (_arguments)
+  "Remove the definitions of the session, except the default ones."
+  (codeql--session-reset codeql-repl--session)
+  (codeql-repl--note "Removed all definitions."))
+
+(defun codeql-repl--command-count (arguments)
+  "Count the results of the predicate ARGUMENTS of the session."
+  (when (string-empty-p arguments)
+    (user-error "Usage: :count PREDICATE"))
+  (codeql-repl--eval arguments :count t)
+  nil)
+
+(defun codeql-repl--command-results (_arguments)
+  "Open the last results in a results buffer."
+  (codeql-repl-show-results)
+  "")
+
+(defun codeql-repl--command-module (_arguments)
+  "Return the query module of the last evaluation."
+  (with-current-buffer (codeql--session-buffer codeql-repl--session)
+    (string-trim-right (buffer-substring-no-properties (point-min) (point-max)))))
+
+(defun codeql-repl--command-db (arguments)
+  "Return the database of the session, after registering the one at ARGUMENTS."
+  (unless (string-empty-p arguments)
+    (when (codeql--session-pending codeql-repl--session)
+      (user-error "An evaluation is running"))
+    (codeql--session-ensure codeql-repl--session (expand-file-name arguments)))
+  (format "%s (%s)"
+          (abbreviate-file-name (or (codeql--session-database codeql-repl--session) "none"))
+          (or (buffer-local-value 'codeql--active-database-language
+                                  (codeql--session-buffer codeql-repl--session))
+              "?")))
+
+(defun codeql-repl--command-cancel (_arguments)
+  "Cancel the running evaluation."
+  (if (codeql--session-pending codeql-repl--session)
+      (progn (codeql--session-cancel codeql-repl--session) nil)
+    (codeql-repl--note "No evaluation is running.")))
+
+(defun codeql-repl--command-clear (_arguments)
+  "Clear the REPL buffer."
+  (let ((inhibit-read-only t))
+    (delete-region (point-min) (process-mark (get-buffer-process (current-buffer)))))
+  "")
+
+(defun codeql-repl--completion-at-point ()
+  "Complete CodeQL keywords, names of session definitions and REPL commands."
+  (let ((process (get-buffer-process (current-buffer))))
+    (when (and process codeql-repl--session (>= (point) (process-mark process)))
+      (let* ((bounds (or (bounds-of-thing-at-point 'symbol) (cons (point) (point))))
+             (start (car bounds))
+             (command (and (eq (char-before start) ?:)
+                           (= (1- start) (process-mark process)))))
+        (list start (cdr bounds)
+              (if command
+                  (mapcar #'car codeql-repl--commands)
+                (completion-table-dynamic
+                 (lambda (_)
+                   (append (delete-dups
+                            (delq nil (mapcar (lambda (definition)
+                                                (unless (eq (plist-get definition :kind) 'import)
+                                                  (plist-get definition :name)))
+                                              (codeql--session-definitions
+                                               codeql-repl--session))))
+                           codeql-repl--keywords))))
+              :exclusive 'no)))))
+
+(defun codeql-repl--member-bounds ()
+  "Return the bounds of the top-level definition or query at point."
+  (let ((node (treesit-node-at (point) 'ql))
+        (member nil))
+    (while node
+      (when (equal (treesit-node-type node) "moduleMember")
+        (setq member node))
+      (setq node (treesit-node-parent node)))
+    (unless member
+      (user-error "No definition or query at point"))
+    (list (treesit-node-start member) (treesit-node-end member))))
+
+(defun codeql-repl-send-region (start end)
+  "Evaluate the code from START to END in the CodeQL REPL of its pack.
+
+Interactively, that is the active region, or the top-level definition
+or query at point.  The code is entered in the REPL, which is displayed,
+and started when there is none yet."
+  (interactive (if (use-region-p)
+                   (list (region-beginning) (region-end))
+                 (codeql-repl--member-bounds)))
+  (let ((code (string-trim (buffer-substring-no-properties start end)))
+        (root (or (codeql-repl--root) (user-error "Not in a CodeQL pack"))))
+    (save-selected-window
+      (codeql-repl root)
+      (codeql-repl--enter code))))
+
+(defun codeql-repl--enter (code)
+  "Enter CODE in the current REPL buffer, as if it was typed and sent."
+  (let* ((process (get-buffer-process (current-buffer)))
+         (pending (buffer-substring (process-mark process) (point-max))))
+    (goto-char (point-max))
+    (delete-region (process-mark process) (point-max))
+    (insert code)
+    (comint-send-input)
+    (insert pending)))
 
 ;; cleanup on kill
 (defun codeql--cli-server-release ()

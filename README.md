@@ -408,6 +408,49 @@ Definitions are kept as soon as they are entered, without compiling them. When a
 
 Session results use the same org results buffers and query history as other runs. Their `Query Source` shows the evaluated input and the query module that ran.
 
+Compiler errors are reported in terms of the session: a location in a definition names it, such as `(in manyArgs/2, line 3)`, and other locations are `(in the input)`.
+
+### CodeQL REPL
+
+`M-x codeql-repl` opens a REPL for the CodeQL pack of the current buffer, which evaluates its input in a session of the pack (with a prefix argument, it asks for the name of the session). Several REPLs, each with its own session, can run in a pack.
+
+```
+ql> predicate manyArgs(CallExpr c, int n) { n = c.getNumArgument() and n > 2 }
+Defined manyArgs/2.
+ql> count(CallExpr c | manyArgs(c, _))
+37
+1 result in 9.8s [results]
+ql> manyArgs
+c                    │ n
+─────────────────────┼──
+assert. ... empty")  │ 3
+...
+37 results, 10 shown in 1.1s [results]
+```
+
+`RET` sends the input when it is complete, and otherwise continues it on a new, indented line: while parentheses, brackets, braces, strings or block comments are open, after an operator or a keyword like `and`, and in a `from` or `where` clause without a `select`. `C-j` always continues the input. `TAB` completes the names of the session's definitions, CodeQL keywords, and commands after a `:`.
+
+The first `codeql-repl-max-rows` results are printed as a table, with cells cut at `codeql-repl-max-column-width`. Result locations are buttons that visit the source archive. `[results]`, `C-c C-v` or `:results` opens all results in an org results buffer. `C-c C-c` cancels the running evaluation. Input is fontified as CodeQL when `codeql-repl-fontify-input` is non-nil.
+
+Input that begins with a colon is a command. Commands can be abbreviated, such as `:d` for `:defs`.
+
+| Command | Description |
+| --- | --- |
+| `:help` | List the commands |
+| `:defs [NAME]` | List the definitions of the session, or show the code of those named NAME |
+| `:undef NAME` | Remove the definitions named NAME |
+| `:reset` | Remove all definitions but the default import |
+| `:count PREDICATE` | Count the results of a predicate of the session |
+| `:results` | Open the last results in a results buffer |
+| `:module` | Show the query module of the last evaluation |
+| `:db [PATH]` | Show the database, or register the one at PATH for the project |
+| `:cancel` | Cancel the running evaluation |
+| `:clear` | Clear the REPL buffer |
+
+`M-x codeql-repl-send-region` evaluates the region of a query buffer in the REPL of its pack, or the top-level definition or query at point when the region isn't active. The query server menu has these as `R` and `E`.
+
+The input history, which keeps multi-line inputs whole, is saved in `codeql-repl-history-file`. The prompt is `codeql-repl-prompt`. Killing a REPL ends its session.
+
 ### Database source archive Xref support
 
 `emacs-codeql` automatically retrieves references and definitions for database source archive files that are opened from a result buffer org link. It achieves this by registering a custom org-link handler for a `codeql:` link type which then performs a ridiculous elisp ritual to trick emacs into thinking it actually has xref support for these files specifically.
@@ -619,7 +662,7 @@ The regression tests in `test/` don't need the CodeQL CLI:
 emacs -Q --batch -L . -l test/emacs-codeql-test.el -f ert-run-tests-batch-and-exit
 ```
 
-The org-ql tests are skipped unless org-ql and its dependencies are on the `load-path` (add them with `-L`). The session tests are skipped unless the tree-sitter `ql` grammar is installed.
+The org-ql tests are skipped unless org-ql and its dependencies are on the `load-path` (add them with `-L`). The session and REPL tests are skipped unless the tree-sitter `ql` grammar is installed.
 
 ## Known Quirks
 
