@@ -822,6 +822,7 @@ OUTCOME gets the :provenance of RUN."
       (should (equal (parse "exists(int x | x = 1)")
                      '(nil (formula . "exists(int x | x = 1)") nil)))
       (should (equal (parse "p(1)") '(nil (formula . "p(1)") nil)))
+      (should (equal (parse "/* a */ p(1) // b") '(nil (formula . "/* a */ p(1) // b") nil)))
       ;; calls of predicates the session doesn't know might be either
       (should (equal (parse "foo(1)") '(nil (expression . "foo(1)") t)))
       (should (equal (parse "\"a\".length()") '(nil (expression . "\"a\".length()") t)))
@@ -1093,6 +1094,239 @@ OUTCOME gets the :provenance of RUN."
                        (list "1 + 2\n" module)))
         (should (equal (mapcar #'car (codeql-test--headlines buffer))
                        '(1 2 2 1 1)))))))
+
+;;; Sessions, continued
+
+(ert-deftest codeql-test-session-describe-errors ()
+  "Compiler errors tell where they are in terms of the session."
+  (let ((definitions (list (list :key '(import "import javascript") :text "import javascript")
+                           (list :key '(predicate "p" 1) :name "p" :arity 1 :kind 'predicate
+                                 :text "predicate p(int x) {\n  x = nope\n}")))
+        (lines '(((import "import javascript") 3 3) ((predicate "p" 1) 5 7))))
+    (should (equal (codeql--session-describe-errors
+                    (concat "ERROR: could not resolve nope (/p/.codeql-session/s.ql:6,7-11)\n"
+                            "ERROR: unexpected input (/p/.codeql-session/s.ql:10,1-2)\n"
+                            "ERROR: elsewhere (/p/Other.ql:6,1-2)\n")
+                    "/p/.codeql-session/s.ql" definitions lines)
+                   (concat "ERROR: could not resolve nope (in p/1, line 2)\n"
+                           "ERROR: unexpected input (in the input)\n"
+                           "ERROR: elsewhere (/p/Other.ql:6,1-2)\n")))))
+
+(ert-deftest codeql-test-session-errors-are-described ()
+  "Session error outcomes describe the locations, and keep the compiler's message."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-session runs
+    (codeql-test--session-eval session "predicate broken() { nope() }")
+    (codeql-test--session-eval session "1 + 2")
+    (let* ((run (car runs))
+           (message (codeql-test--compile-error run "nope()")))
+      (codeql-test--finish-run run :status 'error :message message)
+      (let ((outcome (car codeql-test--outcomes)))
+        (should (equal (plist-get outcome :message)
+                       "ERROR: could not resolve something (in broken/0)\n"))
+        (should (equal (plist-get outcome :compiler-message) message))
+        (should (equal (plist-get outcome :dropped) '("broken/0")))))))
+
+;;; REPL
+
+(ert-deftest codeql-test-repl-input-complete ()
+  "Input is sent when it is complete, and continued on a new line otherwise."
+  (dolist (input '("1 + 2" "select 1" "from int x where x = 1 select x"
+                   "predicate p(int x) { x = 1 }" "\"a(\"" "p(1) // and" "p(1) /* ( */" ":defs" ""
+                   "count(int x | x = [1 .. 3])"))
+    (should (codeql-repl--input-complete-p input)))
+  (dolist (input '("predicate p(int x) {" "count(int x |" "1 +" "x = 1 and"
+                   "from int x" "from int x\nwhere x = 1" "\"unterminated" "/* comment"
+                   "class C extends" "import"))
+    (should-not (codeql-repl--input-complete-p input))))
+
+(ert-deftest codeql-test-repl-cell ()
+  "Result values are shown as text, and locations as buttons that visit them."
+  (should (equal (codeql-repl--cell t) "true"))
+  (should (equal (codeql-repl--cell :false) "false"))
+  (should (equal (codeql-repl--cell 42) "42"))
+  (should (equal (codeql-repl--cell 1.5) "1.5"))
+  (should (equal (codeql-repl--cell "a\nb") "a b"))
+  (should (equal (codeql-repl--cell '((label . "no location"))) "no location"))
+  (let* ((codeql--source-link-prefix-box (list nil))
+         (cell (cl-letf (((symbol-function 'codeql--source-link-prefix) (lambda () "")))
+                 (codeql-repl--cell
+                  '((label . "call")
+                    (url . ((uri . "file:///src/a.js") (startLine . 3) (startColumn . 2)
+                            (endLine . 3) (endColumn . 5))))))))
+    (should (equal (substring-no-properties cell) "call"))
+    (should (eq (get-text-property 0 'action cell) #'codeql-repl--visit))
+    (should (string-prefix-p "/src/a.js::3:2" (get-text-property 0 'codeql-link cell)))))
+
+(ert-deftest codeql-test-repl-table ()
+  "Results are aligned in a table, with headers when they say something."
+  (let ((codeql-repl-max-column-width 6))
+    (cl-flet ((table (columns rows)
+                (substring-no-properties (codeql-repl--table columns rows))))
+      ;; a single value is shown bare, even when its column has a name
+      (should (equal (table '(((kind . "Integer"))) '(("3"))) "3"))
+      (should (equal (table '(((name . "holds") (kind . "Boolean"))) '(("true"))) "true"))
+      (should (equal (table '(((kind . "Integer"))) '(("1") ("22"))) " 1\n22"))
+      ;; numbers are aligned to the right, long cells are truncated
+      (should (equal (table '(((name . "s") (kind . "String")) ((name . "n") (kind . "Integer")))
+                            '(("abc" "7") ("abcdefghij" "123")))
+                     "s      │   n\n───────┼────\nabc    │   7\nabcde… │ 123"))
+      ;; columns without names are numbered
+      (should (equal (table '(((kind . "Integer")) ((kind . "Integer"))) '(("1" "2")))
+                     "[0] │ [1]\n────┼────\n  1 │   2")))))
+
+(ert-deftest codeql-test-repl-format-outcome ()
+  "Outcomes are printed as what was defined, what failed and was rolled back."
+  (cl-flet ((text (outcome)
+              (let ((codeql-repl--started nil))
+                (substring-no-properties (codeql-repl--format-outcome outcome)))))
+    (should (equal (text '(:status defined :definitions ("p/1" "q/0"))) "Defined p/1, q/0."))
+    (should (equal (text '(:status defined)) "Nothing new was defined."))
+    (should (equal (text '(:status empty)) "No results."))
+    (should (equal (text '(:status error :cancelled t)) "Canceled."))
+    (should (equal (text '(:status error :message "ERROR: oops (in p/1)\n"
+                                   :definitions ("p/1" "q/0") :dropped ("p/1")))
+                   "Defined q/0.\nERROR: oops (in p/1)\nRolled back p/1."))))
+
+(defmacro codeql-test--with-repl (runs &rest body)
+  "Run BODY in a REPL buffer of a CodeQL session, see `codeql-test--with-session'.
+
+`codeql-repl--decode' returns `codeql-test--decoded'."
+  (declare (indent 1) (debug t))
+  `(codeql-test--with-session ,runs
+     (let ((codeql-repl-history-file nil)
+           (codeql-test--decoded nil))
+       (with-current-buffer (codeql--session-buffer session)
+         (setq codeql--active-database-language "javascript"))
+       (cl-letf (((symbol-function 'codeql--session-ensure) (lambda (s &rest _) s))
+                 ((symbol-function 'codeql-repl--decode)
+                  (lambda (&rest _) codeql-test--decoded)))
+         (let ((repl (codeql-repl--start root "default")))
+           (unwind-protect
+               (with-current-buffer repl
+                 ,@body)
+             (with-current-buffer repl
+               (setq codeql-repl--session nil))
+             (kill-buffer repl)))))))
+
+(defvar codeql-test--decoded nil
+  "What the REPL decodes results to in `codeql-test--with-repl'.")
+
+(defun codeql-test--repl-enter (input)
+  "Enter INPUT in the current REPL buffer, and return the output it prints."
+  (let ((start (point-max)))
+    (codeql-repl--enter input)
+    (codeql-test--repl-output start)))
+
+(defun codeql-test--repl-output (start)
+  "Return what the current REPL buffer printed after START, without the prompt."
+  (string-remove-suffix
+   codeql-repl-prompt
+   (buffer-substring-no-properties
+    (save-excursion (goto-char start) (forward-line 1) (point))
+    (point-max))))
+
+(ert-deftest codeql-test-repl-round-trip ()
+  "Input is evaluated in the session of the REPL, which prints the outcome."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-repl runs
+    (should (string-match-p "\\`CodeQL REPL, session default of " (buffer-string)))
+    (should (string-suffix-p codeql-repl-prompt (buffer-string)))
+    (should (equal (codeql-test--repl-enter "predicate p(int x) { x = [1 .. 3] }")
+                   "Defined p/1.\n"))
+    (let ((start (point-max)))
+      (should (equal (codeql-test--repl-enter "count(int x | p(x))") ""))
+      (should (equal (plist-get (car runs) :target) "select\ncount(int x | p(x))"))
+      (should (equal (plist-get (plist-get (car runs) :provenance) :frontend) "REPL"))
+      ;; the outcome is printed before a new prompt
+      (setq codeql-test--decoded '((((kind . "Integer"))) ((3)) 1))
+      (codeql-test--finish-run (car runs) :status 'results :bqrs-path "/r.bqrs")
+      (should (string-match-p "\\`3\n1 result in [0-9.]+s \\[results\\]\n\\'"
+                              (codeql-test--repl-output start)))
+      (should (eq (plist-get codeql-repl--outcome :status) 'results))
+      (should (button-at (- (point-max) (length codeql-repl-prompt) 2))))
+    ;; one evaluation at a time
+    (codeql-test--repl-enter "1 + 2")
+    (should (string-match-p "\\`An evaluation is running" (codeql-test--repl-enter "2 + 3")))
+    (should (equal (codeql-test--repl-enter ":cancel") "Canceled.\n"))
+    (should-not (codeql--session-pending session))))
+
+(ert-deftest codeql-test-repl-commands ()
+  "REPL commands, which can be abbreviated, act on the session."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-repl runs
+    (codeql-test--repl-enter "predicate p(int x) { x = 1 }\nint f() { result = 2 }")
+    (should (equal (codeql-test--repl-enter ":defs")
+                   (concat "import javascript\npredicate p/1 (not compiled yet)\n"
+                           "predicate f/0 (not compiled yet)\n")))
+    (should (equal (codeql-test--repl-enter ":de f") "int f() { result = 2 }\n"))
+    (should (equal (codeql-test--repl-enter ":undef p") "Removed p/1.\n"))
+    (should (equal (codeql-test--repl-enter ":undef p") "No definition named p\n"))
+    (should (equal (codeql-test--repl-enter ":reset") "Removed all definitions.\n"))
+    (should (equal (codeql-test--session-keys session) '((import "import javascript"))))
+    (should (equal (codeql-test--repl-enter ":nope") "Unknown command :nope, :help lists them\n"))
+    (should (equal (codeql-test--repl-enter ":c")
+                   "Ambiguous command :c, it may be :count :cancel :clear\n"))
+    (should (equal (codeql-test--repl-enter ":cancel") "No evaluation is running.\n"))
+    (should (equal (codeql-test--repl-enter ":count") "Usage: :count PREDICATE\n"))
+    (should (string-match-p "^  :help +list the REPL commands$"
+                            (codeql-test--repl-enter ":help")))
+    (should (string-match-p "\\`/dbs/js-db/ (javascript)" (codeql-test--repl-enter ":db")))
+    (codeql-test--repl-enter "predicate q() { any() }")
+    (codeql-test--repl-enter ":count q")
+    (should (eq (plist-get (car runs) :quick-eval) 'count))
+    (codeql-test--repl-enter ":cancel")
+    (codeql-test--repl-enter ":clear")
+    (should (equal (buffer-string) codeql-repl-prompt))))
+
+(ert-deftest codeql-test-repl-completion ()
+  "Commands are completed after a colon, and definitions and keywords otherwise."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-repl runs
+    (codeql-test--repl-enter "predicate manyArgs(int x) { x = 1 }")
+    (insert ":de")
+    (let ((capf (codeql-repl--completion-at-point)))
+      (should (equal (all-completions "de" (nth 2 capf)) '("defs"))))
+    (comint-kill-input)
+    (insert "exists(int x | man")
+    (let ((capf (codeql-repl--completion-at-point)))
+      (should (equal (buffer-substring (nth 0 capf) (nth 1 capf)) "man"))
+      (should (equal (all-completions "man" (nth 2 capf)) '("manyArgs")))
+      (should (member "exists" (all-completions "ex" (nth 2 capf)))))))
+
+(ert-deftest codeql-test-repl-continuation ()
+  "Incomplete input continues on an indented line, despite earlier output."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-repl runs
+    (codeql-repl--print "unbalanced output ))")
+    (insert "exists(int x |")
+    (codeql-repl-return)
+    (should-not runs)
+    (insert "x = 1")
+    (should (string-suffix-p "exists(int x |\n  x = 1" (buffer-string)))
+    (insert ")")
+    (codeql-repl-return)
+    (should (equal (plist-get (plist-get (car runs) :provenance) :input)
+                   "exists(int x |\n  x = 1)"))))
+
+(ert-deftest codeql-test-repl-history ()
+  "The input history keeps multi-line inputs whole."
+  (skip-unless (codeql-test--session-available-p))
+  (let ((file (make-temp-file "codeql-repl-history")))
+    (unwind-protect
+        (progn
+          (codeql-test--with-repl runs
+            (setq-local comint-input-ring-file-name file)
+            (codeql-test--repl-enter "predicate p(int x) {\n  x = 1\n}")
+            (codeql-test--repl-enter ":defs")
+            (codeql-repl--write-history))
+          (with-temp-buffer
+            (setq-local comint-input-ring-separator "\n\0\n"
+                        comint-input-ring-file-name file)
+            (comint-read-input-ring)
+            (should (equal (ring-elements comint-input-ring)
+                           '(":defs" "predicate p(int x) {\n  x = 1\n}")))))
+      (delete-file file))))
 
 (provide 'emacs-codeql-test)
 ;;; emacs-codeql-test.el ends here
