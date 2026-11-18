@@ -1601,7 +1601,7 @@ The first LINES lines (default 1) after START are the echoed input."
     (should (equal (codeql-test--repl-enter ":c")
                    "Ambiguous command :c, it may be :count :cancel :clear\n"))
     (should (equal (codeql-test--repl-enter ":cancel") "No evaluation is running.\n"))
-    (should (equal (codeql-test--repl-enter ":count") "Usage: :count PREDICATE|TYPE\n"))
+    (should (equal (codeql-test--repl-enter ":count") "Usage: :count PREDICATE[/ARITY]|TYPE\n"))
     (should (string-match-p "^  :help +list the REPL commands$"
                             (codeql-test--repl-enter ":help")))
     (should (string-match-p "\\`/dbs/js-db/ (javascript)" (codeql-test--repl-enter ":db")))
@@ -1626,6 +1626,60 @@ The first LINES lines (default 1) after START are the echoed input."
       (should (equal (buffer-substring (nth 0 capf) (nth 1 capf)) "man"))
       (should (equal (all-completions "man" (nth 2 capf)) '("manyArgs")))
       (should (member "exists" (all-completions "ex" (nth 2 capf)))))))
+
+(ert-deftest codeql-test-repl-overloads ()
+  "A bare name of overloaded predicates asks which one to evaluate."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-repl runs
+    (codeql-test--repl-enter "predicate p(int x) { x = 1 }\npredicate p(int x, int y) { x = y and p(x) }")
+    (let ((asked nil))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (prompt collection &rest _)
+                   (setq asked (list prompt (mapcar #'car collection)
+                                     (mapcar (plist-get completion-extra-properties
+                                                        :annotation-function)
+                                             '("p/1" "p/2"))))
+                   "p/2")))
+        (should (equal (codeql-test--repl-enter "p") "Evaluating p/2.\n")))
+      (should (equal asked '("Predicate p is overloaded, evaluate: " ("p/1" "p/2")
+                             ("  predicate p(int x)" "  predicate p(int x, int y)"))))
+      (should (equal (plist-get (car runs) :target-line)
+                     "predicate p(int x, int y) { x = y and p(x) }"))
+      (should (equal (plist-get (plist-get (car runs) :provenance) :input) "p/2"))
+      (codeql-test--finish-run (car runs) :status 'empty))
+    ;; quitting explains the ambiguity instead
+    (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) (signal 'quit nil))))
+      (should (equal (codeql-test--repl-enter "p")
+                     "Predicate p is overloaded, enter one of p/1, p/2\n"))
+      (should (equal (length runs) 1)))
+    ;; :count asks as well, NAME/ARITY doesn't
+    (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) "p/1")))
+      (should (equal (codeql-test--repl-enter ":count p") "Counting p/1.\n")))
+    (should (eq (plist-get (car runs) :quick-eval) 'count))
+    (codeql-test--finish-run (car runs) :status 'empty)
+    (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) (error "Asked"))))
+      (codeql-test--repl-enter "p/1")
+      (should (equal (plist-get (car runs) :target-line) "predicate p(int x) { x = 1 }")))))
+
+(ert-deftest codeql-test-repl-completion-overloads ()
+  "Overloaded predicates are completed as NAME/ARITY too, with their signatures."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-repl runs
+    (codeql-test--repl-enter
+     "/** Doc. */\npredicate p(int x) { x = 1 }\npredicate p(int x, int y) { x = y }")
+    (codeql-test--repl-enter "class C extends int {\n  C() { this = 1 }\n}")
+    (insert "p")
+    (let* ((capf (codeql-repl--completion-at-point))
+           (annotate (plist-get (nthcdr 3 capf) :annotation-function)))
+      (should (equal (all-completions "p" (nth 2 capf)) '("p" "p/1" "p/2" "predicate")))
+      (should (equal (funcall annotate "p") "  p/1, p/2"))
+      (should (equal (funcall annotate "p/1") "  predicate p(int x)"))
+      (should (equal (funcall annotate "C") "  class C extends int"))
+      (should (equal (funcall annotate "predicate") "  keyword")))
+    (insert "/")
+    (let ((capf (codeql-repl--completion-at-point)))
+      (should (equal (buffer-substring (nth 0 capf) (nth 1 capf)) "p/"))
+      (should (equal (all-completions "p/" (nth 2 capf)) '("p/1" "p/2"))))))
 
 (ert-deftest codeql-test-repl-continuation ()
   "Incomplete input continues on an indented line, despite earlier output."
