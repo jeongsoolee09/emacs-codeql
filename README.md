@@ -399,7 +399,8 @@ Each input can define predicates, classes, modules, newtypes and imports, and as
 - a `select` query (`from int x where x in [1 .. 3] select x`);
 - an expression (`count(CallExpr c | manyArgs(c, _))`), which is selected;
 - a formula (`exists(CallExpr c | manyArgs(c, 4))`), whose truth is selected as `holds`;
-- the name of a predicate of the session (`manyArgs`), which is quick evaluated.
+- the name of a predicate of the session (`manyArgs`), which is quick evaluated;
+- the name of a type (`Integers`, `DataFlow::Node`), whose values are selected.
 
 A call of a predicate that the session doesn't define could be an expression or a formula. It is tried as an expression first, and then as a formula.
 
@@ -441,7 +442,7 @@ Input that begins with a colon is a command. Commands can be abbreviated, such a
 | `:defs [NAME]` | List the definitions of the session, or show the code of those named NAME |
 | `:undef NAME` | Remove the definitions named NAME |
 | `:reset` | Remove all definitions but the default import |
-| `:count PREDICATE` | Count the results of a predicate of the session |
+| `:count PREDICATE\|TYPE` | Count the results of a predicate of the session, or the values of a type |
 | `:results` | Open the last results in a results buffer |
 | `:module` | Show the query module of the last evaluation |
 | `:db [PATH]` | Show the database, or register the one at PATH for the project |
@@ -487,7 +488,7 @@ A single result is returned as a value, other results as a table whose header ho
 | `:database PATH` | The database to evaluate on, else that of the project |
 | `:pack DIR` | The CodeQL pack to evaluate in, else that of the org file |
 | `:limit N` | The number of result rows, `ob-codeql-default-limit` by default |
-| `:count yes` | Count the results of a quick evaluated predicate |
+| `:count yes` | Count the results of a quick evaluated predicate, or the values of a type |
 | `:open yes` | Also open all results in an org results buffer |
 
 Outside of CodeQL packs, blocks need a `:database` (or ask for one), and are evaluated in a pack that `ob-codeql` makes in `codeql-state-dir` for the language of the database. The pack depends on the latest standard library of the language, which `codeql pack install` installs the first time. When a query server already has the database, blocks use that query server.
