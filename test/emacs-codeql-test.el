@@ -1435,6 +1435,34 @@ OUTCOME gets the :provenance of RUN."
     (should (eq (get-text-property 0 'action cell) #'codeql-repl--visit))
     (should (string-prefix-p "/src/a.js::3:2" (get-text-property 0 'codeql-link cell)))))
 
+(ert-deftest codeql-test-repl-button-return ()
+  "RET pushes REPL buttons, also when a keymap such as Evil's binds <return>."
+  (let* ((codeql--source-link-prefix-box (list nil))
+         (cell (cl-letf (((symbol-function 'codeql--source-link-prefix) (lambda () "")))
+                 (codeql-repl--cell
+                  '((label . "call")
+                    (url . ((uri . "file:///src/a.js") (startLine . 3) (startColumn . 2)
+                            (endLine . 3) (endColumn . 5)))))))
+         (shadow (let ((map (make-sparse-keymap)))
+                   ;; like evil-collection's comint bindings in normal state
+                   (define-key map (kbd "RET") #'comint-send-input)
+                   (define-key map [return] #'comint-send-input)
+                   map))
+         (emulation-mode-map-alists (list (list (cons t shadow))))
+         visited)
+    (cl-letf (((symbol-function 'codeql--org-open-file-link)
+               (lambda (link) (setq visited link))))
+      (with-temp-buffer
+        (insert "x " cell " y")
+        (goto-char 4)
+        (should (eq (key-binding (kbd "RET")) #'push-button))
+        (should (eq (key-binding [return]) #'push-button))
+        (call-interactively (key-binding [return]))
+        (should (string-prefix-p "/src/a.js::3:2" visited))
+        ;; elsewhere RET is left alone
+        (goto-char (point-max))
+        (should (eq (key-binding [return]) #'comint-send-input))))))
+
 (ert-deftest codeql-test-repl-table ()
   "Results are aligned in a table, with headers when they say something."
   (let ((codeql-repl-max-column-width 6))
@@ -1577,7 +1605,9 @@ The first LINES lines (default 1) after START are the echoed input."
       (should (string-match-p "\\`3\n1 result in [0-9.]+s \\[results\\]\n\\'"
                               (codeql-test--repl-output start)))
       (should (eq (plist-get codeql-repl--outcome :status) 'results))
-      (should (button-at (- (point-max) (length codeql-repl-prompt) 2))))
+      (should (button-at (- (point-max) (length codeql-repl-prompt) 2)))
+      (should (eq (get-char-property (- (point-max) (length codeql-repl-prompt) 2) 'keymap)
+                  codeql-repl-button-map)))
     ;; one evaluation at a time
     (codeql-test--repl-enter "1 + 2")
     (should (string-match-p "\\`An evaluation is running" (codeql-test--repl-enter "2 + 3")))
