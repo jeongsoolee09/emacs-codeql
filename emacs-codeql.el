@@ -7773,6 +7773,43 @@ QL buffer that uses the query server and database of the project, see
         session
       (codeql--session-open root name))))
 
+(defun codeql--database-language (database)
+  "Return the primary language of the CodeQL DATABASE directory, or nil."
+  (let ((metadata (expand-file-name "codeql-database.yml" database)))
+    (when (file-readable-p metadata)
+      (with-temp-buffer
+        (insert-file-contents metadata)
+        (when (re-search-forward "^primaryLanguage:[ \t]*[\"']?\\([A-Za-z0-9_-]+\\)" nil t)
+          (match-string 1))))))
+
+(defun codeql--session-fallback-root (language)
+  "Return the root of the CodeQL pack for sessions of LANGUAGE outside of packs.
+
+The pack is in the sessions directory of `codeql-state-dir', and depends
+on the standard CodeQL library of LANGUAGE, which `codeql pack install'
+installs the first time."
+  (let* ((root (file-name-as-directory
+                (expand-file-name (format "sessions/%s" language) codeql-state-dir)))
+         (lock (expand-file-name "codeql-pack.lock.yml" root)))
+    (unless (file-exists-p lock)
+      (make-directory root t)
+      (write-region (format "name: emacs-codeql/%s-session\nversion: 0.0.1\ndependencies:\n  codeql/%s-all: \"*\"\n"
+                            language language)
+                    nil (expand-file-name "qlpack.yml" root) nil 0)
+      (message "Installing the CodeQL library for %s sessions..." language)
+      (let ((default-directory root)
+            (cli (if (and codeql-use-gh-codeql-extension-when-available
+                          (codeql--gh-codeql-cli-available-p))
+                     (list (executable-find "gh") "codeql")
+                   (list codeql-cli))))
+        (unless (and (codeql--shell-command-to-string
+                      (mapconcat #'shell-quote-argument
+                                 (append cli (list "pack" "install" root))
+                                 " "))
+                     (file-exists-p lock))
+          (user-error "Could not install the CodeQL library for %s in %s" language root))))
+    root))
+
 (defun codeql--session-wait (predicate what)
   "Wait until PREDICATE returns non-nil, for `codeql-session-timeout' seconds.
 
@@ -7786,20 +7823,44 @@ WHAT describes what is waited for."
   "Return the database of SESSION, or nil if it has none."
   (buffer-local-value 'codeql--active-database (codeql--session-buffer session)))
 
+(defun codeql--session-database-holder (database)
+  "Return a QL buffer whose query server has DATABASE registered, or nil."
+  (let ((path (codeql--database-history-path database)))
+    (seq-find (lambda (buffer)
+                (with-current-buffer buffer
+                  (and codeql--query-server
+                       (jsonrpc-running-p codeql--query-server)
+                       codeql--active-database
+                       (equal (codeql--database-history-path codeql--active-database)
+                              path))))
+              (codeql--ql-buffers))))
+
 (defun codeql--session-ensure (session &optional database)
   "Make sure that SESSION has a query server and a database, and return SESSION.
 
-The query server of the project is used, or one is started.  DATABASE
-is registered when it is given, else the database of the project, or
-the one last registered in it.  When there is none, one is read from
-the database history, or as a directory when the history is empty."
+The query server of the project is used, or one is started, unless the
+database is in use by another query server already.  DATABASE is
+registered when it is given, else the database of the project, or the
+one last registered in it.  When there is none, one is read from the
+database history, or as a directory when the history is empty."
   (with-current-buffer (codeql--session-buffer session)
     (let ((started nil))
       (unless codeql--query-server
-        (if (codeql--query-server-shareable)
-            (codeql--query-server-adopt)
+        (cond
+         ;; a database can be used by one query server only
+         ((when-let* ((wanted (or database
+                                  (and (not (codeql--query-server-shareable))
+                                       (codeql--last-database))))
+                      (holder (codeql--session-database-holder wanted)))
+            (codeql--query-server-copy-state holder)
+            (message "Using the query server of %s, which has %s."
+                     (buffer-name holder) (abbreviate-file-name wanted))
+            t))
+         ((codeql--query-server-shareable)
+          (codeql--query-server-adopt))
+         (t
           (codeql--query-server-start codeql-query-server-default-args)
-          (setq started t)))
+          (setq started t))))
       (let* ((last (codeql--last-database))
              (target (or database
                          codeql--active-database
@@ -8008,6 +8069,42 @@ predicates of any arity."
         (codeql--session-default-definitions
          (buffer-local-value 'codeql--active-database-language
                              (codeql--session-buffer session)))))
+
+(defun codeql--session-decode (session bqrs-path rows)
+  "Return the (COLUMNS TUPLES TOTAL) of the first ROWS results at BQRS-PATH.
+
+The results are those of the #select result set, or of the first one,
+as decoded by SESSION's CLI.  TOTAL is the number of results."
+  (with-current-buffer (codeql--session-buffer session)
+    (let* ((info (or (codeql--bqrs-info bqrs-path (max rows 1))
+                     (error "No result sets in %s" bqrs-path)))
+           (sets (append (alist-get 'result-sets info) nil))
+           (set (or (seq-find (lambda (s) (equal (alist-get 'name s) "#select")) sets)
+                    (car sets)))
+           (offsets (alist-get 'offsets (alist-get 'pagination set)))
+           (start (and (> (length offsets) 0) (aref offsets 0)))
+           (json (codeql--bqrs-to-json bqrs-path "string,url" (alist-get 'name set)
+                                       (and start (max rows 1)) start))
+           (data (json-parse-string json :object-type 'alist))
+           ;; a single result set isn't keyed by its name
+           (data (if (assq 'columns data) data (cdar data))))
+      (list (append (alist-get 'columns data) nil)
+            (seq-take (append (alist-get 'tuples data) nil) rows)
+            (or (alist-get 'rows set) 0)))))
+
+(defun codeql--session-value-node (value)
+  "Return a result node for the decoded result VALUE when it has a location.
+
+The node is visitable, see `codeql--result-node-link'."
+  (when-let* (((consp value))
+              (url (codeql--location-url (alist-get 'url value))))
+    (codeql--result-node-create
+     :label (codeql--printable-label (alist-get 'label value))
+     :filename (codeql--uri-to-filename (alist-get 'uri url))
+     :line (alist-get 'startLine url)
+     :column (alist-get 'startColumn url)
+     :visitable t
+     :url url)))
 
 (defun codeql--session-eval-sync (session input &rest args)
   "Evaluate INPUT in SESSION like `codeql--session-eval', and return the outcome.
@@ -8418,28 +8515,6 @@ ARGS are passed on to `codeql--session-eval'."
   "Return the text for an evaluation that took ELAPSED seconds, or nil."
   (if elapsed (format " in %.1fs" elapsed) ""))
 
-(defun codeql-repl--decode (session bqrs-path rows)
-  "Return the (COLUMNS TUPLES TOTAL) of the first ROWS results at BQRS-PATH.
-
-The results are those of the #select result set, or of the first one,
-as decoded by SESSION's CLI.  TOTAL is the number of results."
-  (with-current-buffer (codeql--session-buffer session)
-    (let* ((info (or (codeql--bqrs-info bqrs-path (max rows 1))
-                     (error "No result sets in %s" bqrs-path)))
-           (sets (append (alist-get 'result-sets info) nil))
-           (set (or (seq-find (lambda (s) (equal (alist-get 'name s) "#select")) sets)
-                    (car sets)))
-           (offsets (alist-get 'offsets (alist-get 'pagination set)))
-           (start (and (> (length offsets) 0) (aref offsets 0)))
-           (json (codeql--bqrs-to-json bqrs-path "string,url" (alist-get 'name set)
-                                       (and start (max rows 1)) start))
-           (data (json-parse-string json :object-type 'alist))
-           ;; a single result set isn't keyed by its name
-           (data (if (assq 'columns data) data (cdar data))))
-      (list (append (alist-get 'columns data) nil)
-            (seq-take (append (alist-get 'tuples data) nil) rows)
-            (or (alist-get 'rows set) 0)))))
-
 (defun codeql-repl--cell (value)
   "Return the text that the REPL shows for the result VALUE.
 
@@ -8453,26 +8528,16 @@ buffer of the results, which locates their source archive."
     ((pred stringp)
      (propertize (codeql--printable-label value) 'font-lock-face 'font-lock-string-face))
     ((pred listp)
-     (let ((label (codeql--printable-label (alist-get 'label value)))
-           (url (codeql--location-url (alist-get 'url value))))
-       (if (not url)
-           label
-         (let ((link (codeql--result-node-link
-                      (codeql--result-node-create
-                       :label label
-                       :filename (codeql--uri-to-filename (alist-get 'uri url))
-                       :line (alist-get 'startLine url)
-                       :column (alist-get 'startColumn url)
-                       :visitable t
-                       :url url))))
-           (make-text-button label nil
-                             'action #'codeql-repl--visit
-                             'codeql-link link
-                             'help-echo (format "Visit %s:%s"
-                                                (file-name-nondirectory
-                                                 (codeql--uri-to-filename (alist-get 'uri url)))
-                                                (alist-get 'startLine url))
-                             'follow-link t)))))
+     (if-let ((node (codeql--session-value-node value)))
+         (make-text-button (codeql--result-node-label node) nil
+                           'action #'codeql-repl--visit
+                           'codeql-link (codeql--result-node-link node)
+                           'help-echo (format "Visit %s:%s"
+                                              (file-name-nondirectory
+                                               (codeql--result-node-filename node))
+                                              (codeql--result-node-line node))
+                           'follow-link t)
+       (codeql--printable-label (alist-get 'label value))))
     (_ (format "%s" value))))
 
 (defun codeql-repl--visit (button)
@@ -8526,8 +8591,8 @@ buffer of the results, which locates their source archive."
 The evaluation took ELAPSED seconds."
   (pcase-let* ((session (plist-get outcome :session))
                (`(,columns ,tuples ,total)
-                (codeql-repl--decode session (plist-get outcome :bqrs-path)
-                                     codeql-repl-max-rows))
+                (codeql--session-decode session (plist-get outcome :bqrs-path)
+                                        codeql-repl-max-rows))
                (rows (with-current-buffer (codeql--session-buffer session)
                        (let ((codeql--source-link-prefix-box (list nil)))
                          (mapcar (lambda (tuple) (mapcar #'codeql-repl--cell tuple))
