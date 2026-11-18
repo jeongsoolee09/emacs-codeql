@@ -828,6 +828,10 @@ OUTCOME gets the :provenance of RUN."
       (should (equal (parse "\"a\".length()") '(nil (expression . "\"a\".length()") t)))
       ;; a predicate of the session is quick evaluated
       (should (equal (parse "p") '(nil (predicate . "p") nil)))
+      ;; the values of a type are selected
+      (should (equal (parse " Integers\n") '(nil (type . "Integers") nil)))
+      (should (equal (parse "DataFlow::Node") '(nil (type . "DataFlow::Node") nil)))
+      (should (equal (parse "foo") '(nil (expression . "foo") nil)))
       ;; broken queries are left to the compiler to explain
       (should (equal (parse "select 1 +") '(nil (select . "select 1 +") nil))))))
 
@@ -889,6 +893,11 @@ OUTCOME gets the :provenance of RUN."
       (should (string-match-p "\\`from boolean holds\nwhere\n  if (\nexists(int x | p(x))\n"
                               (action-code '(formula . "exists(int x | p(x))"))))
       (should (equal (action-code '(predicate . "p")) "select 1"))
+      (should (equal (action-code '(type . "Integers")) "from Integers integers\nselect integers"))
+      (should (equal (action-code '(type . "DataFlow::Node")) "from DataFlow::Node node\nselect node"))
+      (should (equal (action-code '(type . "Module")) "from Module module_\nselect module_"))
+      (should (string-suffix-p "\nselect count(C c)\n"
+                               (codeql--session-module "s" nil '(type . "C") t)))
       (should (equal (action-code '(check)) "select 1"))
       (should-not (action-code nil)))
     (with-temp-buffer
@@ -903,9 +912,16 @@ OUTCOME gets the :provenance of RUN."
                                 "ERROR: could not resolve y (/p/.codeql-session/s.ql:10,1-2)\n"
                                 "ERROR: could not resolve z (/p/Other.ql:3,1-2)\n")
                         "/p/.codeql-session/s.ql" lines)
+                       '((predicate "p" 1))))
+        ;; locations can span lines
+        (should (equal (codeql--session-error-keys
+                        "ERROR: ’this’ is not bound (/p/.codeql-session/s.ql:5,3-7,4)\n"
+                        "/p/.codeql-session/s.ql" lines)
                        '((predicate "p" 1))))))
     (should (equal (codeql--session-clean-message
-                    "ERROR: oops (/s.ql:1,1-2)\nWARNING: unused predicate 'p' (/s.ql:3,1-2)\n")
+                    (concat "ERROR: oops (/s.ql:1,1-2)\nWARNING: unused predicate 'p' (/s.ql:3,1-2)\n"
+                            "WARNING: unused class ’C’ (/s.ql:4,7-8)\n"
+                            "WARNING: unused datatype ’T’ (/s.ql:5,9-10)\n"))
                    "ERROR: oops (/s.ql:1,1-2)\n"))))
 
 (ert-deftest codeql-test-session-buffer ()
@@ -1104,6 +1120,10 @@ OUTCOME gets the :provenance of RUN."
                                  :text "predicate p(int x) {\n  x = nope\n}")))
         (lines '(((import "import javascript") 3 3) ((predicate "p" 1) 5 7))))
     (should (equal (codeql--session-describe-errors
+                    "ERROR: unbound (/p/.codeql-session/s.ql:5,3-7,4)\n"
+                    "/p/.codeql-session/s.ql" definitions lines)
+                   "ERROR: unbound (in p/1, line 1)\n"))
+    (should (equal (codeql--session-describe-errors
                     (concat "ERROR: could not resolve nope (/p/.codeql-session/s.ql:6,7-11)\n"
                             "ERROR: unexpected input (/p/.codeql-session/s.ql:10,1-2)\n"
                             "ERROR: elsewhere (/p/Other.ql:6,1-2)\n")
@@ -1126,6 +1146,38 @@ OUTCOME gets the :provenance of RUN."
                        "ERROR: could not resolve something (in broken/0)\n"))
         (should (equal (plist-get outcome :compiler-message) message))
         (should (equal (plist-get outcome :dropped) '("broken/0")))))))
+
+;; The query server reports locations that span lines, and quotes names with ’.
+(ert-deftest codeql-test-session-types ()
+  "A type name selects its values, and a broken class is rolled back."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-session runs
+    (codeql-test--session-eval session "class Integers extends int {\n  Integers() {\n    this > 0\n  }\n}")
+    (codeql-test--session-eval session "Integers")
+    (let* ((run (car runs))
+           (file (plist-get run :file))
+           (line (with-temp-buffer
+                   (insert (plist-get run :module))
+                   (goto-char (point-min))
+                   (search-forward "Integers() {")
+                   (line-number-at-pos))))
+      (should (equal (plist-get run :target) "from Integers integers\nselect integers"))
+      (should (eq (plist-get (plist-get run :provenance) :action) 'type))
+      (codeql-test--finish-run
+       run :status 'error
+       :message (format (concat "ERROR: The characteristic predicate for ’default::Integers’ does "
+                                "not bind ’this’ to a value. (%s:%d,3-%d,4)\n"
+                                "WARNING: unused class ’Integers’ (%s:%d,7-15)\n")
+                        file line (+ line 2) file (1- line))))
+    (let ((outcome (car codeql-test--outcomes)))
+      (should (equal (plist-get outcome :message)
+                     (concat "ERROR: The characteristic predicate for ’default::Integers’ does "
+                             "not bind ’this’ to a value. (in Integers, line 2)\n")))
+      (should (equal (plist-get outcome :dropped) '("Integers"))))
+    (should-not (assoc '(type "Integers") (mapcar #'list (codeql-test--session-keys session))))
+    (codeql-test--session-eval session "Integers" :count t)
+    (should (equal (plist-get (car runs) :target) "select count(Integers integers)"))
+    (should (plist-get (plist-get (car runs) :provenance) :count))))
 
 ;;; REPL
 
@@ -1268,7 +1320,7 @@ OUTCOME gets the :provenance of RUN."
     (should (equal (codeql-test--repl-enter ":c")
                    "Ambiguous command :c, it may be :count :cancel :clear\n"))
     (should (equal (codeql-test--repl-enter ":cancel") "No evaluation is running.\n"))
-    (should (equal (codeql-test--repl-enter ":count") "Usage: :count PREDICATE\n"))
+    (should (equal (codeql-test--repl-enter ":count") "Usage: :count PREDICATE|TYPE\n"))
     (should (string-match-p "^  :help +list the REPL commands$"
                             (codeql-test--repl-enter ":help")))
     (should (string-match-p "\\`/dbs/js-db/ (javascript)" (codeql-test--repl-enter ":db")))

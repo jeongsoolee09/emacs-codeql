@@ -2394,6 +2394,7 @@ comma, which org removes again when the block is read or edited.  The
     ('predicate (if (plist-get provenance :count)
                     "quick evaluation count of a predicate"
                   "quick evaluation of a predicate"))
+    ('type (if (plist-get provenance :count) "count of a type" "values of a type"))
     (_ "input")))
 
 (defun codeql--results-session-source-org (provenance)
@@ -7496,6 +7497,8 @@ nil or a cons (TYPE . TEXT) of one of these types:
   or whether the formula TEXT holds.  :guess is non-nil when INPUT could
   be either, the action holds the more likely one.
 - `predicate': quick evaluate the predicate named TEXT of the session.
+- `type': select the values of the type named TEXT, a class of the
+  session or of its imports.
 
 Input that isn't valid CodeQL is evaluated as an expression, so that
 the compiler explains what is wrong with it."
@@ -7512,6 +7515,12 @@ the compiler explains what is wrong with it."
                               (equal (plist-get definition :name) (match-string 1 input))))
                        definitions))
         (list :action (cons 'predicate (match-string 1 input))))
+       ;; a type by name, which can't be an expression
+       ((let ((case-fold-search nil))
+          (string-match (concat "\\`[ \t\n]*\\(\\(?:[A-Za-z_][A-Za-z0-9_]*::\\)*"
+                                "[A-Z][A-Za-z0-9_]*\\)[ \t\n]*\\'")
+                        input))
+        (list :action (cons 'type (match-string 1 input))))
        ;; definitions, and maybe a select clause
        ((when-let ((root (codeql--session-parse-root input)))
           (let ((start (point-min))
@@ -7585,14 +7594,36 @@ replaced definition that compiled as its :previous."
     (let ((import (format "import %s" language)))
       (list (list :kind 'import :name import :key (list 'import import) :text import)))))
 
-(defun codeql--session-module (name definitions action)
+(defconst codeql--session-keywords
+  '("and" "any" "as" "asc" "avg" "boolean" "by" "class" "concat" "count" "date"
+    "desc" "else" "exists" "extends" "false" "float" "forall" "forex" "from" "if"
+    "implies" "import" "in" "instanceof" "int" "max" "min" "module" "newtype" "none"
+    "not" "or" "order" "predicate" "rank" "result" "select" "strictconcat"
+    "strictcount" "strictsum" "string" "sum" "super" "then" "this" "true" "where")
+  "CodeQL keywords, which the CodeQL REPL completes.")
+
+(defun codeql--session-type-variable (type)
+  "Return the name of a variable of TYPE, which names its column of results."
+  (let* ((name (car (last (split-string type "::"))))
+         (variable (concat (downcase (substring name 0 1)) (substring name 1))))
+    (if (member variable codeql--session-keywords)
+        (concat variable "_")
+      variable)))
+
+(defun codeql--session-module (name definitions action &optional count)
   "Return the query module of session NAME that evaluates ACTION with DEFINITIONS.
 
 ACTION is that of `codeql--session-parse', or (check) for a module
-that only checks the definitions.  The module is a string, whose
-`codeql-session-action' text property marks the code of ACTION."
+that only checks the definitions.  With COUNT, the values of a type
+are counted.  The module is a string, whose `codeql-session-action'
+text property marks the code of ACTION."
   (let ((code (pcase action
                 (`(select . ,text) text)
+                (`(type . ,type)
+                 (let ((variable (codeql--session-type-variable type)))
+                   (if count
+                       (format "select count(%s %s)" type variable)
+                     (format "from %s %s\nselect %s" type variable variable))))
                 (`(expression . ,text) (concat "select\n" text))
                 (`(formula . ,text)
                  (concat "from boolean holds\nwhere\n  if (\n" text
@@ -7623,6 +7654,10 @@ that only checks the definitions.  The module is a string, whose
         (setq pos next)))
     (nreverse lines)))
 
+(defconst codeql--session-location-regexp
+  "(\\([^()\n]+\\):\\([0-9]+\\),[0-9]+-\\(?:[0-9]+,\\)?[0-9]+)"
+  "Matches the (FILE:LINE,COLUMN-[LINE,]COLUMN) location of a compiler message.")
+
 (defun codeql--session-error-keys (message file lines)
   "Return the keys of the definitions that the errors in MESSAGE are in.
 
@@ -7631,7 +7666,8 @@ definitions are, see `codeql--session-definition-lines'."
   (let ((keys nil)
         (start 0)
         (suffix (concat "/" (file-name-nondirectory file))))
-    (while (string-match "^ERROR: .*(\\(.+\\):\\([0-9]+\\),[0-9]+-[0-9]+)$" (or message "") start)
+    (while (string-match (concat "^ERROR: .*" codeql--session-location-regexp "$")
+                         (or message "") start)
       (setq start (match-end 0))
       (when (string-suffix-p suffix (match-string 1 message))
         (let ((line (string-to-number (match-string 2 message))))
@@ -7648,7 +7684,7 @@ at LINES, see `codeql--session-definition-lines'.  Locations in a
 definition name it, the others are in the evaluated input."
   (let ((suffix (concat "/" (file-name-nondirectory file))))
     (replace-regexp-in-string
-     "(\\([^()\n]+\\):\\([0-9]+\\),[0-9]+-[0-9]+)$"
+     (concat codeql--session-location-regexp "$")
      (lambda (match)
        (let ((path (match-string 1 match))
              (line (string-to-number (match-string 2 match))))
@@ -7695,7 +7731,8 @@ rolled back then."
 (defun codeql--session-clean-message (message)
   "Return the compiler MESSAGE without warnings that sessions always cause."
   (and message
-       (replace-regexp-in-string "^WARNING: unused predicate .*\n?" "" message)))
+       (replace-regexp-in-string "^WARNING: unused \\(?:predicate\\|class\\|datatype\\) .*\n?"
+                                 "" message)))
 
 (defun codeql--session-definition-name (definition)
   "Return the name of DEFINITION to show to users."
@@ -7903,10 +7940,11 @@ database history, or as a directory when the history is empty."
 
 INPUT can make definitions, which the following input of the session can
 use, and ask for a select clause, an expression or a formula to be
-evaluated, or for a predicate of the session to be quick evaluated, see
-`codeql--session-parse'.  With COUNT, a quick evaluation only counts the
-results.  FRONTEND names what INPUT was entered in, e.g. \"REPL\", for
-the Query Source section of results and query history.
+evaluated, for a predicate of the session to be quick evaluated, or
+for the values of a type, see `codeql--session-parse'.  With COUNT,
+a quick evaluation or the values of a type are only counted.  FRONTEND
+names what INPUT was entered in, e.g. \"REPL\", for the Query Source
+section of results and query history.
 
 Definitions are kept right away, unless `codeql-session-check-definitions'
 says to compile them first, and are rolled back when the compiler
@@ -7985,7 +8023,7 @@ CALLBACK is called with the outcome.  When it is an error, its
     (with-current-buffer buffer
       (unless (and codeql--query-server codeql--active-database)
         (codeql--session-ensure session))
-      (codeql--session-write (codeql--session-module name definitions action))
+      (codeql--session-write (codeql--session-module name definitions action count))
       (let* ((quick-eval (and (eq (car action) 'predicate) (if count 'count t)))
              (codeql--quick-eval-region
               (if quick-eval
@@ -8003,7 +8041,7 @@ CALLBACK is called with the outcome.  When it is an error, its
                     :frontend frontend
                     :input input
                     :action (car action)
-                    :count (eq quick-eval 'count)
+                    :count (or (eq quick-eval 'count) (and count (eq (car action) 'type)))
                     :module (buffer-substring-no-properties (point-min) (point-max))
                     :check (equal action '(check))))
              (handler nil))
@@ -8178,22 +8216,14 @@ All results can be opened in a results buffer from the REPL."
 (defvar-local codeql-repl--started nil
   "When the running evaluation of the CodeQL REPL buffer started, or nil.")
 
-(defconst codeql-repl--keywords
-  '("and" "any" "as" "asc" "avg" "boolean" "by" "class" "concat" "count" "date"
-    "desc" "else" "exists" "extends" "false" "float" "forall" "forex" "from" "if"
-    "implies" "import" "in" "instanceof" "int" "max" "min" "module" "newtype" "none"
-    "not" "or" "order" "predicate" "rank" "result" "select" "strictconcat"
-    "strictcount" "strictsum" "string" "sum" "super" "then" "this" "true" "where")
-  "The CodeQL keywords that the CodeQL REPL completes.")
-
 (defconst codeql-repl--commands
   '(("help" codeql-repl--command-help nil "list the REPL commands")
     ("defs" codeql-repl--command-defs "[NAME]"
      "list the definitions of the session, or show those named NAME")
     ("undef" codeql-repl--command-undef "NAME" "remove the definitions named NAME")
     ("reset" codeql-repl--command-reset nil "remove all definitions but the default import")
-    ("count" codeql-repl--command-count "PREDICATE"
-     "count the results of a predicate of the session")
+    ("count" codeql-repl--command-count "PREDICATE|TYPE"
+     "count the results of a predicate of the session, or the values of a type")
     ("results" codeql-repl--command-results nil "open the last results in a results buffer")
     ("module" codeql-repl--command-module nil "show the query module of the last evaluation")
     ("db" codeql-repl--command-db "[PATH]"
@@ -8684,9 +8714,9 @@ The evaluation took ELAPSED seconds."
   (codeql-repl--note "Removed all definitions."))
 
 (defun codeql-repl--command-count (arguments)
-  "Count the results of the predicate ARGUMENTS of the session."
+  "Count the results of the predicate, or the values of the type, ARGUMENTS."
   (when (string-empty-p arguments)
-    (user-error "Usage: :count PREDICATE"))
+    (user-error "Usage: :count PREDICATE|TYPE"))
   (codeql-repl--eval arguments :count t)
   nil)
 
@@ -8743,7 +8773,7 @@ The evaluation took ELAPSED seconds."
                                                   (plist-get definition :name)))
                                               (codeql--session-definitions
                                                codeql-repl--session))))
-                           codeql-repl--keywords))))
+                           codeql--session-keywords))))
               :exclusive 'no)))))
 
 (defun codeql-repl--member-bounds ()

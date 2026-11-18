@@ -19,8 +19,8 @@
 
 ;; Evaluates `codeql' (or `ql') source blocks in CodeQL sessions, like
 ;; the CodeQL REPL does, see `codeql--session-eval'.  A block can hold
-;; a query, definitions, an expression, a formula, or the name of a
-;; predicate of its session to quick evaluate:
+;; a query, definitions, an expression, a formula, the name of a
+;; predicate of its session to quick evaluate, or the name of a type:
 ;;
 ;;   #+begin_src codeql :database ~/dbs/js-db
 ;;   from CallExpr c
@@ -40,7 +40,8 @@
 ;;              the CodeQL REPL of the pack can share; with none (the
 ;;              default), each block is evaluated on its own
 ;;   :limit     the number of result rows, `ob-codeql-default-limit'
-;;   :count     with yes, a quick evaluation counts the results
+;;   :count     with yes, a quick evaluation or the values of a type are
+;;              counted
 ;;   :open      with yes, the results also open in a results buffer
 ;;
 ;; Enable it with
