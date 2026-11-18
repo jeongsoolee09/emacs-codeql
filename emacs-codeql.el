@@ -118,6 +118,8 @@
 (declare-function treesit-node-start "treesit.c")
 (declare-function treesit-node-child "treesit.c")
 (declare-function treesit-node-child-by-field-name "treesit.c")
+(declare-function treesit-node-children "treesit.c")
+(declare-function treesit-node-text "treesit.c")
 (declare-function tree-sitter-node-at-pos "tree-sitter")
 (declare-function tsc-get-parent "tsc")
 (declare-function tsc-node-type "tsc")
@@ -874,11 +876,21 @@ SYNC is used as `eglot-sync-connect'."
 We start the language server of CodeQL buffers ourselves once their
 search paths are known, so an `eglot-ensure' from the major mode hook
 would start a server without them, or a second one."
-  (and codeql-configure-eglot-lsp
-       buffer-file-name
-       (derived-mode-p 'ql-tree-sitter-mode)))
+  (or codeql--inhibit-lsp
+      codeql--lsp-inhibited
+      (and codeql-configure-eglot-lsp
+           buffer-file-name
+           (derived-mode-p 'ql-tree-sitter-mode))))
 
 (advice-add 'eglot-ensure :before-until #'codeql--eglot-ensure-skip-p)
+
+(defun codeql--lsp-inhibited-p ()
+  "Return non-nil if the buffer must not be managed by a language server.
+Eglot manages the buffers of a project whose server is running, as they
+are set up and once a server is up, see `codeql--inhibit-lsp'."
+  codeql--lsp-inhibited)
+
+(advice-add 'eglot--maybe-activate-editing-mode :before-until #'codeql--lsp-inhibited-p)
 
 (defun codeql--maybe-buffer-local-init ()
   "Run `codeql--buffer-local-init-hook' in buffers that visit a file.
@@ -2695,6 +2707,32 @@ comma, which org removes again when the block is read or edited.  The
             (unless (or (string-empty-p body) (string-suffix-p "\n" body)) "\n")
             "#+end_src\n")))
 
+(defun codeql--session-action-description (provenance)
+  "Describe what the session evaluation of PROVENANCE evaluated."
+  (pcase (plist-get provenance :action)
+    ('select "query")
+    ('expression "expression")
+    ('formula "formula")
+    ('predicate (if (plist-get provenance :count)
+                    "quick evaluation count of a predicate"
+                  "quick evaluation of a predicate"))
+    (_ "input")))
+
+(defun codeql--results-session-source-org (provenance)
+  "Return the body of the Query Source section for session PROVENANCE.
+
+See `codeql--session-run'."
+  (concat
+   "** Evaluated Code\n"
+   (format "%s %s of session %s:\n"
+           (or (plist-get provenance :frontend) "Session")
+           (codeql--session-action-description provenance)
+           (codeql--org-text (format "%s" (plist-get provenance :session))))
+   (codeql--org-src-block (or (plist-get provenance :input) ""))
+   "** Session Module\n"
+   "The query module that ran, with the definitions of the session:\n"
+   (codeql--org-src-block (or (plist-get provenance :module) ""))))
+
 (defun codeql--results-query-source-org (context)
   "Return the Query Source section for the results of CONTEXT.
 
@@ -2702,6 +2740,7 @@ See `codeql--results-context'."
   (let* ((provenance (plist-get context :provenance))
          (kind (plist-get provenance :kind))
          (path (plist-get provenance :path))
+         (session (eq kind 'session))
          (quick-eval (eq kind 'quick-eval))
          (sarif (memq kind '(sarif mrva)))
          (mrva (eq kind 'mrva)))
@@ -2709,11 +2748,13 @@ See `codeql--results-context'."
      "* Query Source\n"
      (codeql--org-property-drawer
       `(("CODEQL_KIND" . "query-source")
-        ("CODEQL_EVALUATION" . ,(cond (mrva "variant-analysis")
+        ("CODEQL_EVALUATION" . ,(cond (session "session")
+                                      (mrva "variant-analysis")
                                       (sarif "sarif")
                                       ((not quick-eval) "query")
                                       ((plist-get provenance :count) "quick-eval-count")
                                       (t "quick-eval")))
+        ("CODEQL_SESSION" . ,(and session (plist-get provenance :session)))
         ("CODEQL_QUERY" . ,path)
         ("CODEQL_DATABASE" . ,(plist-get context :database))
         ,@(when mrva
@@ -2727,6 +2768,8 @@ See `codeql--results-context'."
               ("CODEQL_REPOSITORY_URI" . ,(plist-get provenance :repository-uri))
               ("CODEQL_REVISION_ID" . ,(plist-get provenance :revision-id))))
         ("VISIBILITY" . "folded")))
+     (when session
+       (codeql--results-session-source-org provenance))
      (when path
        (concat "** Originating Query\n" (codeql--org-file-link path) "\n"))
      (when quick-eval
@@ -6476,6 +6519,20 @@ was analyzed.  Raw BQRS results are shown decoded."
   (setq codeql--query-server-jsonrpc-current-connection nil)
   (setq codeql--query-server-jsonrpc-current-deferred nil))
 
+(declare-function jsonrpc--remove "jsonrpc")
+(declare-function jsonrpc--request-continuations "jsonrpc")
+(declare-function jsonrpc--deferred-actions "jsonrpc")
+
+(defun codeql--jsonrpc-forget-request (connection id deferred-spec)
+  "Make CONNECTION forget the continuations of request ID.
+
+DEFERRED-SPEC is the key of its deferred action."
+  (if (fboundp 'jsonrpc--remove)
+      (jsonrpc--remove connection id deferred-spec)
+    ;; jsonrpc before 1.0.24 keeps continuations in a hash table
+    (remhash id (jsonrpc--request-continuations connection))
+    (remhash deferred-spec (jsonrpc--deferred-actions connection))))
+
 (defun codeql-query-server-cancel-query ()
   "Cancel a currently active query."
   (interactive)
@@ -6487,10 +6544,10 @@ was analyzed.  Raw BQRS results are shown decoded."
         (message "Canceling query id: %s" codeql--query-server-jsonrpc-current-id)
         (jsonrpc-notify (codeql--query-server-current-or-error) :$/cancelRequest
                         `(:id ,codeql--query-server-jsonrpc-current-id))
-        (remhash codeql--query-server-jsonrpc-current-id
-                 (jsonrpc--request-continuations codeql--query-server-jsonrpc-current-connection))
-        (remhash (list codeql--query-server-jsonrpc-current-deferred (current-buffer))
-                 (jsonrpc--deferred-actions codeql--query-server-jsonrpc-current-connection))
+        (codeql--jsonrpc-forget-request codeql--query-server-jsonrpc-current-connection
+                                        codeql--query-server-jsonrpc-current-id
+                                        (list codeql--query-server-jsonrpc-current-deferred
+                                              (current-buffer)))
         (message "Query canceled."))
     (message "No active query running.")))
 
@@ -6516,6 +6573,36 @@ was analyzed.  Raw BQRS results are shown decoded."
     ('predicate "quick-eval predicate")
     (_ "quick-eval")))
 
+;; bound by code that quick evaluates text of a buffer that isn't displayed
+(defvar codeql--quick-eval-region nil
+  "When non-nil, the (BEG . END) of the code to quick evaluate.
+
+It is used instead of the active region or point, see
+`codeql--quick-eval-bounds'.")
+
+(defun codeql--quick-eval-predicate-position (quick-eval)
+  "Return the position of the predicate name that QUICK-EVAL evaluates, or nil.
+
+That is the name of the predicate enclosing point when QUICK-EVAL is
+`predicate' and neither `codeql--quick-eval-region' nor the region is
+active, see `codeql--enclosing-predicate-name-position'."
+  (and (eq quick-eval 'predicate)
+       (not codeql--quick-eval-region)
+       (not (use-region-p))
+       (codeql--enclosing-predicate-name-position)))
+
+(defun codeql--quick-eval-bounds (&optional quick-eval)
+  "Return the (BEG . END) of what a quick evaluation evaluates.
+
+That is `codeql--quick-eval-region' when it is bound, else the active
+region, else the name of the enclosing predicate when QUICK-EVAL is
+`predicate', or point."
+  (let ((pred-pos (codeql--quick-eval-predicate-position quick-eval)))
+    (cond (codeql--quick-eval-region)
+          ((use-region-p) (car (region-bounds)))
+          (pred-pos (cons pred-pos pred-pos))
+          (t (cons (point) (point))))))
+
 (defun codeql--query-target (query-path quick-eval)
   "Return the query server target for running QUERY-PATH.
 
@@ -6524,17 +6611,10 @@ region, or point when there is none, is quick evaluated: the query
 server evaluates the predicate or expression found there.  When
 QUICK-EVAL is `predicate', the predicate enclosing point is evaluated
 instead, see `codeql--enclosing-predicate-name-position'.  When
-QUICK-EVAL is `count', only the number of results is computed."
+QUICK-EVAL is `count', only the number of results is computed.  See
+`codeql--quick-eval-bounds' for code that is not in the region."
   (if quick-eval
-      (let* ((pred-pos (and (eq quick-eval 'predicate)
-                            (not (use-region-p))
-                            (codeql--enclosing-predicate-name-position)))
-             (bounds (cond ((use-region-p)
-                            (car (region-bounds)))
-                           (pred-pos
-                            (cons pred-pos pred-pos))
-                           (t
-                            (cons (point) (point)))))
+      (let* ((bounds (codeql--quick-eval-bounds quick-eval))
              (min (car bounds))
              (max (cdr bounds)))
         ;; positions in CodeQL are 1-based
@@ -6572,14 +6652,10 @@ Other code that runs queries, e.g. to evaluate a snippet that has no
 file of its own, can pass a `quick-eval' provenance whose :path is nil."
   (if (not quick-eval)
       (list :kind 'file :path query-path)
-    (let* ((region (use-region-p))
-           (pred-pos (and (eq quick-eval 'predicate)
-                          (not region)
-                          (codeql--enclosing-predicate-name-position)))
-           (bounds (cond (region (car (region-bounds)))
-                         (pred-pos (cons pred-pos pred-pos))
-                         (t (cons (point) (point)))))
-           (beg (car bounds)))
+    (let* ((pred-pos (codeql--quick-eval-predicate-position quick-eval))
+           (bounds (codeql--quick-eval-bounds quick-eval))
+           (beg (car bounds))
+           (region (/= beg (cdr bounds))))
       (list :kind 'quick-eval
             :path query-path
             :count (eq quick-eval 'count)
@@ -6591,6 +6667,117 @@ file of its own, can pass a `quick-eval' provenance whose :path is nil."
                         (buffer-substring-no-properties beg (cdr bounds))
                       (or (save-excursion (goto-char beg) (thing-at-point 'symbol t))
                           ""))))))
+
+(defvar codeql--query-result-handler nil
+  "Function that receives the outcome of the query runs requested now.
+
+When nil, results are shown in a results buffer and failures are
+reported as messages.  Otherwise it is called with a plist whose
+:status is one of:
+
+- `results': the run produced the results in :bqrs-path.  The plist
+  also holds :query-path, :db-path, :name, :kind and :id (from the
+  query metadata, any of which can be nil), :quick-eval, :provenance,
+  :buffer (the QL buffer the run was requested in), :src-filename,
+  :src-root, :src-buffer and :log-path, see `codeql-load-bqrs'.
+- `empty': the run finished without results.
+- `error': the run failed, or was canceled, as described by :message.
+
+The handler is captured when a run is requested, so let-bind this
+around `codeql--query-server-run-query-from-path'.")
+
+(defun codeql--query-run-history-name (query-path quick-eval provenance)
+  "Return how the run of QUERY-PATH with QUICK-EVAL and PROVENANCE is named.
+
+This names the run in query history, after the time it completed."
+  (if (eq (plist-get provenance :kind) 'session)
+      (format "%s %s: %s"
+              (or (plist-get provenance :frontend) "session")
+              (plist-get provenance :session)
+              (truncate-string-to-width
+               (replace-regexp-in-string "[ \t\n]+" " "
+                                         (string-trim (or (plist-get provenance :input) "")))
+               60 nil nil "..."))
+    (format "%s (%s)" (file-name-nondirectory query-path)
+            (codeql--run-kind-label quick-eval))))
+
+(defun codeql--query-run-show (outcome)
+  "Show the OUTCOME of a query run, see `codeql--query-result-handler'."
+  (pcase (plist-get outcome :status)
+    ('results
+     (with-current-buffer (plist-get outcome :buffer)
+       (codeql-load-bqrs
+        (plist-get outcome :bqrs-path)
+        (plist-get outcome :query-path)
+        (plist-get outcome :db-path)
+        (plist-get outcome :name)
+        (plist-get outcome :kind)
+        (plist-get outcome :id)
+        (plist-get outcome :buffer)
+        (plist-get outcome :src-filename)
+        (plist-get outcome :src-root)
+        (plist-get outcome :src-buffer)
+        (plist-get outcome :provenance))))
+    ('empty
+     (message "No query results in %s!" (plist-get outcome :bqrs-path)))
+    ('error
+     (message "%s" (plist-get outcome :message)))))
+
+(defun codeql--query-run-report (handler outcome)
+  "Hand the OUTCOME of a query run to HANDLER, or show it when that is nil."
+  (funcall (or handler #'codeql--query-run-show) outcome))
+
+(defun codeql--query-run-failed (handler buffer-context message &rest properties)
+  "Report to HANDLER that the run requested in BUFFER-CONTEXT failed with MESSAGE.
+
+PROPERTIES are added to the outcome, see `codeql--query-result-handler'."
+  (codeql--query-run-report
+   handler `(:status error :message ,message :buffer ,buffer-context ,@properties)))
+
+(defun codeql--query-run-completed (handler outcome)
+  "Record the query run of OUTCOME in query history and report it to HANDLER.
+
+OUTCOME is a `results' outcome, see `codeql--query-result-handler',
+which becomes an `empty' one when the run has no results."
+  (message "Query run completed, checking results.")
+  (let* ((bqrs-path (plist-get outcome :bqrs-path))
+         (buffer-context (plist-get outcome :buffer))
+         (query-path (plist-get outcome :query-path))
+         (bqrs-size (file-attribute-size (file-attributes bqrs-path))))
+    ;; if size is > 0 then we have results to deal with
+    (if (not (and bqrs-size (> bqrs-size 0)))
+        (codeql--query-run-report handler (plist-put (copy-sequence outcome) :status 'empty))
+      ;; save in query history, name/kind/id can be nil!
+      ;; skip templated queries and session definition checks in query history
+      (when (and (buffer-live-p buffer-context)
+                 (not (codeql--templated-query-p query-path))
+                 (not (plist-get (plist-get outcome :provenance) :check)))
+        (with-current-buffer buffer-context
+          (unless codeql--completed-query-history
+            (setq codeql--completed-query-history (make-hash-table :test #'equal))
+            (codeql--query-server-sync-state))
+          (let ((timestamp (current-time-string))
+                (log-path (plist-get outcome :log-path)))
+            (puthash
+             (format "[%s] %s [%s]"
+                     timestamp
+                     (codeql--query-run-history-name
+                      query-path (plist-get outcome :quick-eval) (plist-get outcome :provenance))
+                     (codeql-query-server-active-database))
+             `(;; align
+               :quick-eval ,(plist-get outcome :quick-eval)
+               :provenance ,(plist-get outcome :provenance)
+               :query-path ,query-path
+               :bqrs-path ,bqrs-path
+               :db-path ,(plist-get outcome :db-path)
+               :timestamp ,timestamp
+               :name ,(plist-get outcome :name)
+               :kind ,(plist-get outcome :kind)
+               :id ,(plist-get outcome :id)
+               ,@(when log-path
+                   (list :log-path (and (file-exists-p log-path) log-path))))
+             codeql--completed-query-history))))
+      (codeql--query-run-report handler outcome))))
 
 (defun codeql--query-server-request-run (buffer-context
                                          qlo-path
@@ -6604,206 +6791,122 @@ file of its own, can pass a `quick-eval' provenance whose :path is nil."
                                          template-values
                                          src-filename
                                          src-buffer
-                                         provenance)
+                                         provenance
+                                         handler)
   "Request a query evaluation from the query server.
 
-PROVENANCE describes the evaluated code, see `codeql--query-provenance'."
+PROVENANCE describes the evaluated code, see `codeql--query-provenance'.
+HANDLER receives the outcome, see `codeql--query-result-handler'."
   (with-current-buffer buffer-context
-    (cond
-     ;; legacy query-server
-     ((string= codeql-query-server "query-server")
-      (let ((run-query-params
-             `(:body
-               (:db
-                (;; align
-                 :dbDir ,codeql--database-dataset-folder
-                 :workingSet "default")
-                :evaluateId ,(codeql--query-server-next-evaluate-id)
-                :queries
-                (;; align
-                 :resultsPath ,(codeql--tramp-unwrap bqrs-path)
-                 :qlo ,(format "file:%s" (codeql--tramp-unwrap qlo-path))
-                 :allowUnknownTemplates t
-                 :templateValues ,template-values
-                 :id 0
-                 :timeoutSecs 0)
-                :stopOnError :json-false
-                :useSequenceHint :json-false)
-               :progressId ,(codeql--query-server-next-progress-id))))
-        (message "Running query ...")
-        (cl-multiple-value-bind (id timer)
-            (codeql--jsonrpc-async-request
-             (codeql--query-server-current-or-error)
-             :evaluation/runQueries run-query-params
-             :timeout codeql-query-server-timeout
-             :success-fn
-             (let ((buffer-context buffer-context)
-                   (query-info query-info)
-                   (bqrs-path bqrs-path)
-                   (query-path query-path)
-                   (db-path db-path)
-                   (quick-eval quick-eval)
-                   (src-filename src-filename)
-                   (src-root codeql--database-source-archive-root))
+    (let ((outcome
+           `(;; align
+             :status results
+             :bqrs-path ,bqrs-path
+             :query-path ,query-path
+             :db-path ,db-path
+             :name ,(json-pointer-get query-info "/name")
+             :kind ,(json-pointer-get query-info "/kind")
+             :id ,(json-pointer-get query-info "/id")
+             :quick-eval ,quick-eval
+             :provenance ,provenance
+             :buffer ,buffer-context
+             :src-filename ,src-filename
+             :src-root ,codeql--database-source-archive-root
+             :src-buffer ,src-buffer))
+          (error-fn
+           (jsonrpc-lambda (&key code message data &allow-other-keys)
+             (when (buffer-live-p buffer-context)
+               (with-current-buffer buffer-context
+                 (codeql--query-server-jsonrpc-unregister-request)))
+             (codeql--query-run-failed
+              handler buffer-context
+              (format "Error %s: %s\n%s\n" code message data)))))
+      (cond
+       ;; legacy query-server
+       ((string= codeql-query-server "query-server")
+        (let ((run-query-params
+               `(:body
+                 (:db
+                  (;; align
+                   :dbDir ,codeql--database-dataset-folder
+                   :workingSet "default")
+                  :evaluateId ,(codeql--query-server-next-evaluate-id)
+                  :queries
+                  (;; align
+                   :resultsPath ,(codeql--tramp-unwrap bqrs-path)
+                   :qlo ,(format "file:%s" (codeql--tramp-unwrap qlo-path))
+                   :allowUnknownTemplates t
+                   :templateValues ,template-values
+                   :id 0
+                   :timeoutSecs 0)
+                  :stopOnError :json-false
+                  :useSequenceHint :json-false)
+                 :progressId ,(codeql--query-server-next-progress-id))))
+          (message "Running query ...")
+          (cl-multiple-value-bind (id _timer)
+              (codeql--jsonrpc-async-request
+               (codeql--query-server-current-or-error)
+               :evaluation/runQueries run-query-params
+               :timeout codeql-query-server-timeout
+               :success-fn
                (jsonrpc-lambda
                    (&rest _)
-                 (with-current-buffer buffer-context
-                   (codeql--query-server-jsonrpc-unregister-request))
-                 (message "Query run completed, checking results.")
-                 ;; if size is > 0 then we have results to deal with
-                 (let ((bqrs-size (file-attribute-size (file-attributes bqrs-path))))
-                   (if (> bqrs-size 0)
-                       (progn
-                         (with-current-buffer buffer-context
-                           ;; save in query history,  name/kind/id can be nil!
-                           (let ((name (json-pointer-get query-info "/name"))
-                                 (kind (json-pointer-get query-info "/kind"))
-                                 (id (json-pointer-get query-info "/id")))
-                             (let ((timestamp (current-time-string)))
-                               ;; skip templated queries in query history
-                               (unless (codeql--templated-query-p query-path)
-                                 (puthash
-                                  (format "[%s] %s (%s) [%s]"
-                                          timestamp
-                                          (file-name-nondirectory query-path)
-                                          (codeql--run-kind-label quick-eval)
-                                          (codeql-query-server-active-database))
-                                  `(;; align
-                                    :quick-eval ,quick-eval
-                                    :provenance ,provenance
-                                    :query-path ,query-path
-                                    :bqrs-path ,bqrs-path
-                                    :db-path ,db-path
-                                    :timestamp ,timestamp
-                                    :name ,name
-                                    :kind ,kind
-                                    :id ,id)
-                                  codeql--completed-query-history)))
-                             ;; display results
-                             (codeql-load-bqrs
-                              bqrs-path
-                              query-path
-                              db-path
-                              name
-                              kind
-                              id
-                              buffer-context
-                              src-filename
-                              codeql--database-source-archive-root
-                              src-buffer
-                              provenance))))
-                     (message "No query results in %s!" bqrs-path)))))
-             :error-fn
-             (let ((buffer-context buffer-context))
-               (jsonrpc-lambda (&key code message data &allow-other-keys)
-                 (with-current-buffer buffer-context
-                   (codeql--query-server-jsonrpc-unregister-request))
-                 (message "Error %s: %s\n%s\n" code message data)))
-             :deferred :evaluation/runQueries)
-          (codeql--query-server-jsonrpc-register-request
-           id (codeql--query-server-current-or-error)
-           :evaluation/runQueries))))
+                 (when (buffer-live-p buffer-context)
+                   (with-current-buffer buffer-context
+                     (codeql--query-server-jsonrpc-unregister-request)))
+                 (codeql--query-run-completed handler outcome))
+               :error-fn error-fn
+               :deferred :evaluation/runQueries)
+            (codeql--query-server-jsonrpc-register-request
+             id (codeql--query-server-current-or-error)
+             :evaluation/runQueries))))
 
-     ;; query-server2
-     ((string= codeql-query-server "query-server2")
-      (let* ((query-target
-              (codeql--query-target query-path quick-eval))
-             (log-path (when codeql-evaluator-log
-                         (concat (file-name-sans-extension bqrs-path) ".evaluator-log.jsonl")))
-             (run-query-params
-              `(:body
-                (;; align
-                 :db ,(codeql--file-truename codeql--active-database)
-                 :additionalPacks ,library-path
-                 :externalInputs ()
-                 :singletonExternalInputs ,(or template-values '())
-                 :outputPath ,(codeql--tramp-unwrap bqrs-path)
-                 :queryPath ,(codeql--tramp-unwrap query-path)
-                 ;; do we want Datalog Intermediary Language dumps?
-                 ;; https://codeql.github.com/docs/codeql-overview/codeql-glossary/#dil
-                 ;;:dilPath: string
-                 ,@(when log-path
-                     (list :logPath (codeql--tramp-unwrap log-path)))
-                 :target ,query-target)
-                :progressId ,(codeql--query-server-next-progress-id))))
-        (message "Running query ...")
-        (cl-multiple-value-bind (id timer)
-            (codeql--jsonrpc-async-request
-             (codeql--query-server-current-or-error)
-             :evaluation/runQuery run-query-params
-             :timeout codeql-query-server-timeout
-             :success-fn
-             (let ((buffer-context buffer-context)
-                   (query-info query-info)
-                   (bqrs-path bqrs-path)
-                   (query-path query-path)
-                   (db-path db-path)
-                   (quick-eval quick-eval)
-                   (log-path log-path)
-                   (src-filename src-filename)
-                   (src-root codeql--database-source-archive-root))
+       ;; query-server2
+       ((string= codeql-query-server "query-server2")
+        (let* ((query-target
+                (codeql--query-target query-path quick-eval))
+               (log-path (when codeql-evaluator-log
+                           (concat (file-name-sans-extension bqrs-path) ".evaluator-log.jsonl")))
+               (run-query-params
+                `(:body
+                  (;; align
+                   :db ,(codeql--file-truename codeql--active-database)
+                   :additionalPacks ,library-path
+                   :externalInputs ()
+                   :singletonExternalInputs ,(or template-values '())
+                   :outputPath ,(codeql--tramp-unwrap bqrs-path)
+                   :queryPath ,(codeql--tramp-unwrap query-path)
+                   ;; do we want Datalog Intermediary Language dumps?
+                   ;; https://codeql.github.com/docs/codeql-overview/codeql-glossary/#dil
+                   ;;:dilPath: string
+                   ,@(when log-path
+                       (list :logPath (codeql--tramp-unwrap log-path)))
+                   :target ,query-target)
+                  :progressId ,(codeql--query-server-next-progress-id))))
+          (message "Running query ...")
+          (cl-multiple-value-bind (id _timer)
+              (codeql--jsonrpc-async-request
+               (codeql--query-server-current-or-error)
+               :evaluation/runQuery run-query-params
+               :timeout codeql-query-server-timeout
+               :success-fn
                (jsonrpc-lambda
                    (&rest params)
-                 (with-current-buffer buffer-context
-                   (codeql--query-server-jsonrpc-unregister-request))
+                 (when (buffer-live-p buffer-context)
+                   (with-current-buffer buffer-context
+                     (codeql--query-server-jsonrpc-unregister-request)))
                  (let ((errors (codeql--query-server2-handle-message params)))
-                   (when errors
-                     (error errors)))
-                 (message "Query run completed, checking results.")
-                 ;; if size is > 0 then we have results to deal with
-                 (let ((bqrs-size (file-attribute-size (file-attributes bqrs-path))))
-                   (if (> bqrs-size 0)
-                       (progn
-                         (with-current-buffer buffer-context
-                           ;; save in query history,  name/kind/id can be nil!
-                           (let ((name (json-pointer-get query-info "/name"))
-                                 (kind (json-pointer-get query-info "/kind"))
-                                 (id (json-pointer-get query-info "/id")))
-                             (let ((timestamp (current-time-string)))
-                               ;; skip templated queries in query history
-                               (unless (codeql--templated-query-p query-path)
-                                 (puthash
-                                  (format "[%s] %s (%s) [%s]"
-                                          timestamp
-                                          (file-name-nondirectory query-path)
-                                          (codeql--run-kind-label quick-eval)
-                                          (codeql-query-server-active-database))
-                                  `(;; align
-                                    :quick-eval ,quick-eval
-                                    :provenance ,provenance
-                                    :query-path ,query-path
-                                    :bqrs-path ,bqrs-path
-                                    :db-path ,db-path
-                                    :timestamp ,timestamp
-                                    :name ,name
-                                    :kind ,kind
-                                    :id ,id
-                                    :log-path ,(and log-path (file-exists-p log-path) log-path))
-                                  codeql--completed-query-history)))
-                             ;; display results
-                             (codeql-load-bqrs
-                              bqrs-path
-                              query-path
-                              db-path
-                              name
-                              kind
-                              id
-                              buffer-context
-                              src-filename
-                              codeql--database-source-archive-root
-                              src-buffer
-                              provenance))))
-                     (message "No query results in %s!" bqrs-path)))))
-             :error-fn
-             (let ((buffer-context buffer-context))
-               (jsonrpc-lambda (&key code message data &allow-other-keys)
-                 (with-current-buffer buffer-context
-                   (codeql--query-server-jsonrpc-unregister-request))
-                 (message "Error %s: %s\n%s\n" code message data)))
-             :deferred :evaluation/runQuery)
-          (codeql--query-server-jsonrpc-register-request
-           id (codeql--query-server-current-or-error)
-           :evaluation/runQuery)))))))
+                   (if errors
+                       (codeql--query-run-failed
+                        handler buffer-context errors
+                        :result-type (plist-get params :resultType))
+                     (codeql--query-run-completed
+                      handler (append outcome (list :log-path log-path))))))
+               :error-fn error-fn
+               :deferred :evaluation/runQuery)
+            (codeql--query-server-jsonrpc-register-request
+             id (codeql--query-server-current-or-error)
+             :evaluation/runQuery))))))))
 
 (defun codeql--query-server-request-compile-and-run (buffer-context
                                                      library-path
@@ -6818,8 +6921,11 @@ PROVENANCE describes the evaluated code, see `codeql--query-provenance'."
                                                      template-values
                                                      src-filename
                                                      src-buffer
-                                                     provenance)
-  "Request query compilation from the query server."
+                                                     provenance
+                                                     handler)
+  "Request query compilation from the query server.
+
+HANDLER receives the outcome, see `codeql--query-result-handler'."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (with-current-buffer buffer-context
     (let*
@@ -6851,57 +6957,53 @@ PROVENANCE describes the evaluated code, see `codeql--query-provenance'."
        ;; legacy query-server
        ((string= codeql-query-server "query-server")
         (message "Compiling query (%s) ..." (codeql--run-kind-label quick-eval))
-        (cl-multiple-value-bind (id timer)
+        (cl-multiple-value-bind (id _timer)
             (codeql--jsonrpc-async-request
              (codeql--query-server-current-or-error)
              :compilation/compileQuery compile-query-params
              :timeout codeql-query-server-timeout
              :success-fn
-             (let ((buffer-context buffer-context)
-                   (bqrs-path bqrs-path)
-                   (qlo-path qlo-path)
-                   (query-path query-path)
-                   (query-info query-info)
-                   (library-path library-path)
-                   (db-path db-path)
-                   (quick-eval quick-eval)
-                   (template-values template-values)
-                   (src-filename src-filename))
-               (jsonrpc-lambda
-                (&key messages &allow-other-keys)
-                (with-current-buffer buffer-context
-                  (codeql--query-server-jsonrpc-unregister-request))
-                (message "Compilation completed, checking results.")
-                (let ((abort-run-query nil))
-                  (seq-map
-                   (lambda (m)
-                     (cl-destructuring-bind
-                         (&key severity message &allow-other-keys) m
-                       (message "[compilation/compileQuery] severity %s: %s" severity message)
-                       (when (eql severity 0)
-                         (message "[compilation/compileQuery] Aborting query! severity 0: %s" message)
-                         (setq abort-run-query t))))
-                   messages)
-                  (unless abort-run-query
-                    ;; note: this is a nested jsonrpc request, maintain buffer-local context
-                    (codeql--query-server-request-run
-                     buffer-context qlo-path
-                     bqrs-path query-path
-                     query-info
-                     library-path
-                     db-path
-                     quick-eval
-                     template-values
-                     src-filename
-                     src-buffer
-                     provenance)))))
+             (jsonrpc-lambda
+                 (&key messages &allow-other-keys)
+               (when (buffer-live-p buffer-context)
+                 (with-current-buffer buffer-context
+                   (codeql--query-server-jsonrpc-unregister-request)))
+               (message "Compilation completed, checking results.")
+               (let ((errors nil))
+                 (seq-map
+                  (lambda (m)
+                    (cl-destructuring-bind
+                        (&key severity message &allow-other-keys) m
+                      (message "[compilation/compileQuery] severity %s: %s" severity message)
+                      (when (eql severity 0)
+                        (message "[compilation/compileQuery] Aborting query! severity 0: %s" message)
+                        (push message errors))))
+                  messages)
+                 (if errors
+                     (codeql--query-run-failed
+                      handler buffer-context (string-join (nreverse errors) "\n"))
+                   ;; note: this is a nested jsonrpc request, maintain buffer-local context
+                   (codeql--query-server-request-run
+                    buffer-context qlo-path
+                    bqrs-path query-path
+                    query-info
+                    library-path
+                    db-path
+                    quick-eval
+                    template-values
+                    src-filename
+                    src-buffer
+                    provenance
+                    handler))))
              :error-fn
-             (let ((buffer-context buffer-context))
-               (jsonrpc-lambda
-                (&key code message data &allow-other-keys)
-                (with-current-buffer buffer-context
-                  (codeql--query-server-jsonrpc-unregister-request))
-                (message "Error %s: %s\n%s\n" code message data)))
+             (jsonrpc-lambda
+                 (&key code message data &allow-other-keys)
+               (when (buffer-live-p buffer-context)
+                 (with-current-buffer buffer-context
+                   (codeql--query-server-jsonrpc-unregister-request)))
+               (codeql--query-run-failed
+                handler buffer-context
+                (format "Error %s: %s\n%s\n" code message data)))
              :deferred :compilation/compileQuery)
           ;; register this request so we can cancel it if need be
           (codeql--query-server-jsonrpc-register-request
@@ -6922,7 +7024,8 @@ PROVENANCE describes the evaluated code, see `codeql--query-provenance'."
          template-values
          src-filename
          src-buffer
-         provenance))))))
+         provenance
+         handler))))))
 
 (defun codeql--query-server-run-query-from-path (query-path
                                                  quick-eval
@@ -6935,7 +7038,8 @@ PROVENANCE describes the evaluated code, see `codeql--query-provenance'."
 
 PROVENANCE describes the code that runs, and defaults to what QUICK-EVAL
 selects in the current buffer, see `codeql--query-provenance'.  It is
-captured now, before the run is requested."
+captured now, before the run is requested, as is the handler of the
+outcome, see `codeql--query-result-handler'."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (cl-assert codeql--active-database t)
   (cl-assert (codeql--resolve-query-paths query-path) t)
@@ -6964,7 +7068,8 @@ captured now, before the run is requested."
      template-values
      src-filename
      src-buffer
-     provenance)))
+     provenance
+     codeql--query-result-handler)))
 
 (defun codeql-query-server-run-query (&optional quick-eval)
   "Run a query or quick eval a query region.
@@ -7749,15 +7854,22 @@ A project is a version controlled directory tree, or else a CodeQL pack."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (codeql-query-server-register-database (codeql--read-database "Database: ")))
 
+(defun codeql--last-database ()
+  "Return the database last registered in the project of the current buffer.
+
+Databases that no longer exist are skipped."
+  (when-let* ((entry (seq-find (lambda (entry)
+                                 (let ((path (plist-get entry :path)))
+                                   (or (file-remote-p path) (file-directory-p path))))
+                               (car (codeql--database-history-entries)))))
+    (plist-get entry :path)))
+
 (defun codeql--register-last-database ()
   "Register the database last registered in the project of the current buffer."
   (unless codeql--active-database
-    (when-let* ((entry (seq-find (lambda (entry)
-                                   (let ((path (plist-get entry :path)))
-                                     (or (file-remote-p path) (file-directory-p path))))
-                                 (car (codeql--database-history-entries)))))
-      (message "Registering the last database of this project: %s" (plist-get entry :path))
-      (codeql-query-server-register-database (plist-get entry :path)))))
+    (when-let* ((path (codeql--last-database)))
+      (message "Registering the last database of this project: %s" path)
+      (codeql-query-server-register-database path))))
 
 (defun codeql--database-unbundle (archive)
   "Unbundle the database ARCHIVE into `codeql-state-dir' and return its path.
@@ -8713,6 +8825,643 @@ the FILES wildcard to search, which defaults to all files."
             (local-set-key
              (kbd codeql-transient-binding)
              #'codeql-transient-query-server-interact)))
+
+;;; Sessions
+
+;; A session evaluates snippets of CodeQL, entered one after another,
+;; against the database of a project: definitions made in a snippet are
+;; kept for the snippets that follow.  It does so by writing a query
+;; module to a hidden buffer of the CodeQL pack, which runs like any
+;; other query, so the REPL and org-babel share the query server and
+;; results of the project.
+
+(defcustom codeql-session-directory ".codeql-session"
+  "Directory of a CodeQL pack in which sessions keep their query module.
+
+Sessions write the snippets they evaluate, along with the definitions
+made in the session so far, to a query module in this directory of the
+pack they run in, so that the module can use the dependencies of the
+pack.  The directory ignores itself for git."
+  :type 'string
+  :group 'emacs-codeql)
+
+(defcustom codeql-session-check-definitions nil
+  "Whether sessions compile new definitions right away.
+
+When non-nil, input that only makes definitions is checked by running a
+trivial query with them, so that errors in them are reported when they
+are entered, and they are only kept when they have none.  This costs a
+compilation of the query module, which can take seconds.
+
+When nil, such definitions are kept right away, and compiled with the
+input that follows.  When that has errors in definitions that were never
+compiled successfully before, those definitions are dropped again."
+  :type 'boolean
+  :group 'emacs-codeql)
+
+(defcustom codeql-session-timeout 60
+  "Seconds to wait for the query server and database of a session."
+  :type 'number
+  :group 'emacs-codeql)
+
+(cl-defstruct (codeql--session (:constructor codeql--session-make)
+                               (:copier nil))
+  "A CodeQL session, see `codeql--session-get'.
+
+NAME and ROOT, the root of its CodeQL pack, identify it.  BUFFER visits
+its query module.  DEFINITIONS are those made so far, see
+`codeql--session-definition'.  EVALUATIONS counts the evaluations that
+were requested, and PENDING is the handler of the outcome of the one
+that runs, if any."
+  name root buffer definitions (evaluations 0) pending)
+
+(defvar codeql--sessions (make-hash-table :test #'equal)
+  "The live sessions, by (ROOT . NAME).")
+
+(defvar-local codeql--session nil
+  "The session whose query module the current buffer visits.")
+
+(declare-function ql-tree-sitter-mode "ext:ql-tree-sitter")
+
+(defconst codeql--session-formula-types
+  '("comp_term" "quantified" "negation" "conjunction" "disjunction" "implication"
+    "in_expr" "instance_of" "if_term" "special_call")
+  "Types of the tree-sitter ql nodes that are formulas rather than expressions.")
+
+(defconst codeql--session-module-start-regexp
+  (concat "\\`\\(?:[ \t\n]+\\|//[^\n]*\\|/\\*\\(?:[^*]\\|\\*+[^*/]\\)*\\*+/\\)*"
+          (regexp-opt '("from" "select" "import" "predicate" "class" "module" "newtype"
+                        "private" "deprecated" "abstract" "final" "cached" "pragma"
+                        "bindingset" "language" "query" "signature" "extensible"
+                        "external" "additional" "override" "library" "transient")
+                      'symbols))
+  "Matches CodeQL that starts like a module member rather than a term.")
+
+(defun codeql--session-treesit-p ()
+  "Return non-nil if sessions can parse CodeQL with the builtin tree-sitter."
+  (and (fboundp 'treesit-ready-p) (treesit-ready-p 'ql t)))
+
+(defun codeql--session-parse-root (text)
+  "Parse TEXT as CodeQL in the current buffer and return the root node.
+
+Return nil when TEXT doesn't parse."
+  (erase-buffer)
+  (insert text)
+  (let ((root (treesit-parser-root-node (treesit-parser-create 'ql))))
+    (unless (treesit-search-subtree
+             root (lambda (node) (or (equal (treesit-node-type node) "ERROR")
+                                     (treesit-node-check node 'missing))))
+      root)))
+
+(defun codeql--session-child (node type)
+  "Return the first named child of NODE of TYPE."
+  (seq-find (lambda (child) (equal (treesit-node-type child) type))
+            (treesit-node-children node t)))
+
+(defun codeql--session-definition (node text)
+  "Return the definition that the module member NODE makes with TEXT.
+
+This is a plist with the :text of the definition, a :key that a later
+definition replacing it has too, and the :kind and :name of what is
+defined.  Predicates have an :arity, and :result is non-nil for those
+with a result."
+  (let ((name-of (lambda (type) (when-let ((child (codeql--session-child node type)))
+                                  (treesit-node-text child t)))))
+    (pcase (treesit-node-type node)
+      ("classlessPredicate"
+       (let ((name (funcall name-of "predicateName"))
+             (arity (seq-count (lambda (child) (equal (treesit-node-type child) "varDecl"))
+                               (treesit-node-children node t))))
+         (list :kind 'predicate :name name :arity arity
+               :result (not (codeql--session-child node "predicate"))
+               :key (list 'predicate name arity) :text text)))
+      ((and (or "dataclass" "datatype") type)
+       (let ((name (funcall name-of "className")))
+         (list :kind (if (equal type "dataclass") 'class 'newtype) :name name
+               :key (list 'type name) :text text)))
+      ("module"
+       (let ((name (funcall name-of "moduleName")))
+         (list :kind 'module :name name :key (list 'module name) :text text)))
+      ("importDirective"
+       (let ((import (replace-regexp-in-string "[ \t\n]+" " " (treesit-node-text node t))))
+         (list :kind 'import :name import :key (list 'import import) :text text)))
+      (type
+       (list :kind (intern type) :key (list 'other text) :text text)))))
+
+(defun codeql--session-callee (node)
+  "Return the name of the predicate that the call NODE calls."
+  (when-let* ((callee (codeql--session-child node "aritylessPredicateExpr"))
+              (name (codeql--session-child callee "literalId")))
+    (treesit-node-text name t)))
+
+(defun codeql--session-term-kind (node definitions)
+  "Return whether NODE is a `formula' or an `expression', and if that is a guess.
+
+The result is (KIND . GUESS).  Calls are formulas when they call
+predicates without a result among DEFINITIONS, but calls of other
+predicates can't be told apart."
+  (let ((type (treesit-node-type node)))
+    (cond
+     ((member type codeql--session-formula-types) '(formula))
+     ((and (equal type "par_expr") (= (treesit-node-child-count node t) 1))
+      (codeql--session-term-kind (treesit-node-child node 0 t) definitions))
+     ((equal type "call_or_unqual_agg_expr")
+      (let* ((name (codeql--session-callee node))
+             (callees (seq-filter (lambda (definition)
+                                    (and (eq (plist-get definition :kind) 'predicate)
+                                         (equal (plist-get definition :name) name)))
+                                  definitions)))
+        (cond ((null callees) '(expression . t))
+              ((seq-every-p (lambda (definition) (plist-get definition :result)) callees)
+               '(expression))
+              ((seq-some (lambda (definition) (plist-get definition :result)) callees)
+               '(expression . t))
+              (t '(formula)))))
+     ((equal type "qualified_expr") '(expression . t))
+     (t '(expression)))))
+
+(defun codeql--session-parse (input definitions)
+  "Return what INPUT, entered in a session with DEFINITIONS, asks for.
+
+This is a plist with the :definitions INPUT makes, see
+`codeql--session-definition', and the :action it requests, which is
+nil or a cons (TYPE . TEXT) of one of these types:
+
+- `select': run the query that the select clause TEXT, along with the
+  definitions of the session and of INPUT, makes.
+- `expression' or `formula': show the values of the expression TEXT,
+  or whether the formula TEXT holds.  :guess is non-nil when INPUT could
+  be either, the action holds the more likely one.
+- `predicate': quick evaluate the predicate named TEXT of the session.
+
+Input that isn't valid CodeQL is evaluated as an expression, so that
+the compiler explains what is wrong with it."
+  (unless (codeql--session-treesit-p)
+    (user-error "CodeQL sessions need Emacs 29 or newer with the tree-sitter ql grammar"))
+  (let ((input (string-trim-right input)))
+    (with-temp-buffer
+      (cond
+       ((string-empty-p (string-trim input)) nil)
+       ;; a predicate of the session by name
+       ((and (string-match "\\`[ \t\n]*\\([A-Za-z_][A-Za-z0-9_]*\\)[ \t\n]*\\'" input)
+             (seq-find (lambda (definition)
+                         (and (eq (plist-get definition :kind) 'predicate)
+                              (equal (plist-get definition :name) (match-string 1 input))))
+                       definitions))
+        (list :action (cons 'predicate (match-string 1 input))))
+       ;; definitions, and maybe a select clause
+       ((when-let ((root (codeql--session-parse-root input)))
+          (let ((start (point-min))
+                (new nil)
+                (select nil))
+            (dolist (member (treesit-node-children root t))
+              (when (equal (treesit-node-type member) "moduleMember")
+                (let ((main (seq-find (lambda (child)
+                                        (not (member (treesit-node-type child)
+                                                     '("annotation" "qldoc"))))
+                                      (treesit-node-children member t))))
+                  ;; qldoc and comments go with the member that follows them
+                  (when main
+                    (let ((text (string-trim (buffer-substring-no-properties
+                                              start (treesit-node-end member)))))
+                      (setq start (treesit-node-end member))
+                      (if (equal (treesit-node-type main) "select")
+                          (if select
+                              (user-error "Only one select clause can be evaluated at a time")
+                            (setq select text))
+                        (push (codeql--session-definition main text) new)))))))
+            (when (or new select)
+              (list :definitions (nreverse new)
+                    :action (and select (cons 'select select)))))))
+       ;; malformed definitions or queries, for the compiler to explain
+       ((string-match-p codeql--session-module-start-regexp input)
+        (list :action (cons 'select input)))
+       ;; an expression or a formula
+       (t
+        (let* ((root (codeql--session-parse-root (concat "predicate p() {\n" input "\n}")))
+               (body (and root (treesit-search-subtree
+                                root (lambda (node) (equal (treesit-node-type node) "body")))))
+               (terms (and body (treesit-node-children body t)))
+               (kind (if (= (length terms) 1)
+                         (codeql--session-term-kind (car terms) definitions)
+                       '(expression))))
+          (list :action (cons (car kind) input) :guess (cdr kind))))))))
+
+(defun codeql--session-merge (definitions new)
+  "Return DEFINITIONS with the NEW definitions made after them.
+
+A new definition replaces the one with the same key in place, the
+others are added at the end.  A replacement remembers the last
+replaced definition that compiled as its :previous."
+  (let ((merged (copy-sequence definitions)))
+    (dolist (definition new)
+      (let ((old (seq-find (lambda (d) (equal (plist-get d :key) (plist-get definition :key)))
+                           merged)))
+        (if old
+            (let ((replacement (plist-put (copy-sequence definition) :previous
+                                          (if (plist-get old :verified)
+                                              old
+                                            (plist-get old :previous)))))
+              (setq merged (mapcar (lambda (d) (if (eq d old) replacement d)) merged)))
+          (setq merged (append merged (list definition))))))
+    merged))
+
+(defun codeql--session-verified (definition)
+  "Return DEFINITION marked as compiled successfully."
+  (let ((verified (copy-sequence definition)))
+    (cl-remf verified :previous)
+    (plist-put verified :verified t)))
+
+(defun codeql--session-default-definitions (language)
+  "Return the definitions a new session for a database of LANGUAGE starts with."
+  (when language
+    (let ((import (format "import %s" language)))
+      (list (list :kind 'import :name import :key (list 'import import) :text import)))))
+
+(defun codeql--session-module (name definitions action)
+  "Return the query module of session NAME that evaluates ACTION with DEFINITIONS.
+
+ACTION is that of `codeql--session-parse', or (check) for a module
+that only checks the definitions.  The module is a string, whose
+`codeql-session-action' text property marks the code of ACTION."
+  (let ((code (pcase action
+                (`(select . ,text) text)
+                (`(expression . ,text) (concat "select\n" text))
+                (`(formula . ,text)
+                 (concat "from boolean holds\nwhere\n  if (\n" text
+                         "\n  ) then holds = true else holds = false\nselect holds"))
+                ;; a query module needs a query, also to quick evaluate in it
+                ((or '(check) `(predicate . ,_)) "select 1")
+                (_ nil))))
+    (concat (format "// The query module of CodeQL session %s, rewritten for each evaluation\n\n"
+                    name)
+            (mapconcat (lambda (definition)
+                         (concat (propertize (plist-get definition :text)
+                                             'codeql-session-definition
+                                             (plist-get definition :key))
+                                 "\n\n"))
+                       definitions "")
+            (when code
+              (concat (propertize code 'codeql-session-action t) "\n")))))
+
+(defun codeql--session-definition-lines ()
+  "Return the (KEY FIRST-LINE LAST-LINE) of the session definitions in this buffer."
+  (let ((pos (point-min))
+        (lines nil))
+    (while (< pos (point-max))
+      (let ((key (get-text-property pos 'codeql-session-definition))
+            (next (next-single-property-change pos 'codeql-session-definition nil (point-max))))
+        (when key
+          (push (list key (line-number-at-pos pos) (line-number-at-pos (1- next))) lines))
+        (setq pos next)))
+    (nreverse lines)))
+
+(defun codeql--session-error-keys (message file lines)
+  "Return the keys of the definitions that the errors in MESSAGE are in.
+
+FILE is the query module that was compiled, and LINES are where its
+definitions are, see `codeql--session-definition-lines'."
+  (let ((keys nil)
+        (start 0)
+        (suffix (concat "/" (file-name-nondirectory file))))
+    (while (string-match "^ERROR: .*(\\(.+\\):\\([0-9]+\\),[0-9]+-[0-9]+)$" (or message "") start)
+      (setq start (match-end 0))
+      (when (string-suffix-p suffix (match-string 1 message))
+        (let ((line (string-to-number (match-string 2 message))))
+          (dolist (entry lines)
+            (when (<= (nth 1 entry) line (nth 2 entry))
+              (cl-pushnew (car entry) keys :test #'equal))))))
+    (nreverse keys)))
+
+(defun codeql--session-kept-definitions (definitions error-keys)
+  "Return the definitions a session keeps after an evaluation failed.
+
+The evaluation used DEFINITIONS, and the compiler reported errors in
+those with ERROR-KEYS, see `codeql--session-error-keys'.
+
+Definitions that never compiled successfully are rolled back when they
+have errors: they are dropped, or a redefinition leaves the definition
+it replaced, see `codeql--session-merge'.  Errors in definitions that
+did compile can only come from those that never did, so they are all
+rolled back then."
+  (let* ((broken (lambda (definition) (member (plist-get definition :key) error-keys)))
+         (verified-broken (seq-some (lambda (definition)
+                                      (and (plist-get definition :verified)
+                                           (funcall broken definition)))
+                                    definitions)))
+    (delq nil
+          (mapcar (lambda (definition)
+                    (if (and (not (plist-get definition :verified))
+                             (or verified-broken (funcall broken definition)))
+                        (plist-get definition :previous)
+                      definition))
+                  definitions))))
+
+(defun codeql--session-clean-message (message)
+  "Return the compiler MESSAGE without warnings that sessions always cause."
+  (and message
+       (replace-regexp-in-string "^WARNING: unused predicate .*\n?" "" message)))
+
+(defun codeql--session-definition-name (definition)
+  "Return the name of DEFINITION to show to users."
+  (when-let ((name (plist-get definition :name)))
+    (if (plist-get definition :arity)
+        (format "%s/%s" name (plist-get definition :arity))
+      name)))
+
+(defun codeql--session-predicate-name-bounds (name)
+  "Return the bounds of the name of the last predicate NAME defined in this buffer."
+  (let ((root (treesit-parser-root-node (treesit-parser-create 'ql)))
+        (found nil))
+    (dolist (member (treesit-node-children root t))
+      (when-let* ((predicate (codeql--session-child member "classlessPredicate"))
+                  (node (codeql--session-child predicate "predicateName")))
+        (when (equal (treesit-node-text node t) name)
+          (setq found (cons (treesit-node-start node) (treesit-node-end node))))))
+    found))
+
+(defun codeql--session-file-name (name)
+  "Return the file name of the query module of session NAME."
+  (concat (replace-regexp-in-string "[^A-Za-z0-9_]" "_" name) ".ql"))
+
+(defun codeql--session-on-kill ()
+  "Forget the session of the current buffer, which is killed."
+  (when codeql--session
+    (let ((session codeql--session))
+      (remhash (cons (codeql--session-root session) (codeql--session-name session))
+               codeql--sessions)
+      (when (and buffer-file-name (file-exists-p buffer-file-name))
+        (delete-file buffer-file-name)))))
+
+(defun codeql--session-open (root name)
+  "Return a new session NAME in the CodeQL pack at ROOT."
+  (unless (codeql--session-treesit-p)
+    (user-error "CodeQL sessions need Emacs 29 or newer with the tree-sitter ql grammar"))
+  (unless (codeql--find-project-root root)
+    (user-error "%s is not in a CodeQL pack" root))
+  (let* ((dir (expand-file-name codeql-session-directory root))
+         (file (expand-file-name (codeql--session-file-name name) dir))
+         (ignore (expand-file-name ".gitignore" dir))
+         (session (codeql--session-make :name name :root root)))
+    (make-directory dir t)
+    (unless (file-exists-p ignore)
+      (write-region "*\n" nil ignore nil 0))
+    (write-region (codeql--session-module name nil nil) nil file nil 0)
+    ;; the hidden buffer of a session must not join the language server
+    ;; of the project, nor start one of its own
+    (let ((buffer (let ((codeql--inhibit-lsp t)
+                        (find-file-hook nil))
+                    (find-file-noselect file t))))
+      (with-current-buffer buffer
+        (unless (eq major-mode 'ql-tree-sitter-mode)
+          (let ((codeql--inhibit-lsp t))
+            (ql-tree-sitter-mode)))
+        (rename-buffer (format " *codeql-session %s: %s*" name (abbreviate-file-name root)) t)
+        (buffer-disable-undo)
+        (setq-local create-lockfiles nil)
+        (auto-save-mode -1)
+        (setq codeql--session session)
+        (add-hook 'kill-buffer-hook #'codeql--session-on-kill nil t))
+      (setf (codeql--session-buffer session) buffer)
+      (puthash (cons root name) session codeql--sessions)
+      session)))
+
+(defun codeql--session-get (root &optional name)
+  "Return the session NAME (default: \"default\") in the CodeQL pack at ROOT.
+
+The session is created when there is none yet.  Its query module lives
+in `codeql-session-directory' of the pack, and is visited by a hidden
+QL buffer that uses the query server and database of the project, see
+`codeql--session-ensure'."
+  (let* ((root (file-name-as-directory (expand-file-name root)))
+         (name (or name "default"))
+         (session (gethash (cons root name) codeql--sessions)))
+    (if (and session (buffer-live-p (codeql--session-buffer session)))
+        session
+      (codeql--session-open root name))))
+
+(defun codeql--session-wait (predicate what)
+  "Wait until PREDICATE returns non-nil, for `codeql-session-timeout' seconds.
+
+WHAT describes what is waited for."
+  (with-timeout (codeql-session-timeout
+                 (user-error "Timed out waiting for %s" what))
+    (while (not (funcall predicate))
+      (accept-process-output nil 0.05))))
+
+(defun codeql--session-database (session)
+  "Return the database of SESSION, or nil if it has none."
+  (buffer-local-value 'codeql--active-database (codeql--session-buffer session)))
+
+(defun codeql--session-ensure (session &optional database)
+  "Make sure that SESSION has a query server and a database, and return SESSION.
+
+The query server of the project is used, or one is started.  DATABASE
+is registered when it is given, else the database of the project, or
+the one last registered in it.  When there is none, one is read from
+the database history."
+  (with-current-buffer (codeql--session-buffer session)
+    (let ((started nil))
+      (unless codeql--query-server
+        (if (codeql--query-server-shareable)
+            (codeql--query-server-adopt)
+          (codeql--query-server-start codeql-query-server-default-args)
+          (setq started t)))
+      (let* ((last (codeql--last-database))
+             (target (or database
+                         codeql--active-database
+                         last
+                         (if noninteractive
+                             (user-error "No database for CodeQL session %s"
+                                         (codeql--session-name session))
+                           (codeql--read-database
+                            (format "Database for CodeQL session %s: "
+                                    (codeql--session-name session))))))
+             (target (codeql--database-history-path target))
+             (active-p (lambda ()
+                         (and codeql--active-database
+                              (equal (codeql--database-history-path codeql--active-database)
+                                     target)))))
+        (unless (funcall active-p)
+          ;; starting the server registers the last database already
+          (unless (and started codeql-register-last-database (equal target last))
+            (codeql-query-server-register-database target))
+          (codeql--session-wait active-p (format "database %s" target))))
+      (unless (codeql--session-definitions session)
+        (setf (codeql--session-definitions session)
+              (codeql--session-default-definitions codeql--active-database-language)))))
+  session)
+
+(defun codeql--session-write (text)
+  "Make TEXT the content of the current buffer, and save it to its file."
+  (set-visited-file-modtime)
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (insert text))
+  (let ((inhibit-message t)
+        (coding-system-for-write 'utf-8-unix))
+    (write-region nil nil buffer-file-name nil t)))
+
+(cl-defun codeql--session-eval (session input callback &key frontend count)
+  "Evaluate INPUT in SESSION and call CALLBACK with the outcome when done.
+
+INPUT can make definitions, which the following input of the session can
+use, and ask for a select clause, an expression or a formula to be
+evaluated, or for a predicate of the session to be quick evaluated, see
+`codeql--session-parse'.  With COUNT, a quick evaluation only counts the
+results.  FRONTEND names what INPUT was entered in, e.g. \"REPL\", for
+the Query Source section of results and query history.
+
+Definitions are kept right away, unless `codeql-session-check-definitions'
+says to compile them first, and are rolled back when the compiler
+reports errors before an evaluation succeeded with them, see
+`codeql--session-kept-definitions'.
+
+The outcome is that of `codeql--query-result-handler', with the
+:session, the :action of INPUT, the names of the :definitions it made
+and of the definitions that were :dropped for errors.  When INPUT only
+makes definitions, the outcome's :status is `defined'.  This returns
+right away, while the evaluation runs."
+  (when (codeql--session-pending session)
+    (user-error "CodeQL session %s is busy" (codeql--session-name session)))
+  (let* ((parsed (or (codeql--session-parse input (codeql--session-definitions session))
+                     (user-error "Nothing to evaluate")))
+         (new (plist-get parsed :definitions))
+         (definitions (codeql--session-merge (codeql--session-definitions session) new))
+         (action (or (plist-get parsed :action)
+                     (and new codeql-session-check-definitions '(check))))
+         (finish
+          (lambda (outcome)
+            (let* ((kept (pcase (plist-get outcome :status)
+                           ((or 'results 'empty)
+                            (mapcar #'codeql--session-verified definitions))
+                           ('defined (if (plist-get outcome :verified)
+                                         (mapcar #'codeql--session-verified definitions)
+                                       definitions))
+                           (_ (codeql--session-kept-definitions
+                               definitions (plist-get outcome :error-keys)))))
+                   (dropped (when (eq (plist-get outcome :status) 'error)
+                              (seq-remove (lambda (definition) (memq definition kept))
+                                          definitions))))
+              (setf (codeql--session-definitions session) kept)
+              (funcall callback
+                       (append (list :session session
+                                     ;; a retried expression runs as a formula
+                                     :action (or (plist-get (plist-get outcome :provenance) :action)
+                                                 (car (plist-get parsed :action)))
+                                     :definitions (delq nil (mapcar #'codeql--session-definition-name new))
+                                     :dropped (delq nil (mapcar #'codeql--session-definition-name dropped)))
+                               (if (plist-get outcome :message)
+                                   (plist-put (copy-sequence outcome) :message
+                                              (codeql--session-clean-message
+                                               (plist-get outcome :message)))
+                                 outcome)))))))
+    (cl-incf (codeql--session-evaluations session))
+    (if (not action)
+        (funcall finish (list :status 'defined))
+      (codeql--session-run
+       session definitions action input frontend count
+       (lambda (outcome)
+         (cond
+          ;; calls and member calls can be expressions or formulas
+          ((and (eq (plist-get outcome :status) 'error)
+                (not (plist-get outcome :cancelled))
+                (plist-get parsed :guess)
+                (eq (car action) 'expression))
+           (codeql--session-run
+            session definitions (cons 'formula (cdr action)) input frontend count
+            (lambda (retry)
+              (funcall finish (if (eq (plist-get retry :status) 'error) outcome retry)))))
+          ((and (equal action '(check)) (not (eq (plist-get outcome :status) 'error)))
+           (funcall finish (list :status 'defined :verified t)))
+          (t (funcall finish outcome))))))))
+
+(defun codeql--session-run (session definitions action input frontend count callback)
+  "Run ACTION of INPUT with DEFINITIONS in SESSION.
+
+CALLBACK is called with the outcome, whose :error-keys are the keys of
+the definitions with errors.  See `codeql--session-eval' for FRONTEND
+and COUNT."
+  (let ((buffer (codeql--session-buffer session))
+        (name (codeql--session-name session)))
+    (with-current-buffer buffer
+      (unless (and codeql--query-server codeql--active-database)
+        (codeql--session-ensure session))
+      (codeql--session-write (codeql--session-module name definitions action))
+      (let* ((quick-eval (and (eq (car action) 'predicate) (if count 'count t)))
+             (codeql--quick-eval-region
+              (if quick-eval
+                  (or (codeql--session-predicate-name-bounds (cdr action))
+                      (error "Predicate %s is not defined in session %s" (cdr action) name))
+                (when-let ((start (text-property-any (point-min) (point-max)
+                                                     'codeql-session-action t)))
+                  (cons start (or (next-single-property-change start 'codeql-session-action)
+                                  (point-max))))))
+             (lines (codeql--session-definition-lines))
+             (file buffer-file-name)
+             (provenance
+              (list :kind 'session
+                    :session name
+                    :frontend frontend
+                    :input input
+                    :action (car action)
+                    :count (eq quick-eval 'count)
+                    :module (buffer-substring-no-properties (point-min) (point-max))
+                    :check (equal action '(check))))
+             (handler nil))
+        (setq handler
+              (lambda (outcome)
+                ;; a canceled run may still report its outcome
+                (when (eq (codeql--session-pending session) handler)
+                  (setf (codeql--session-pending session) nil)
+                  (funcall callback
+                           (if (eq (plist-get outcome :status) 'error)
+                               (append outcome
+                                       (list :error-keys
+                                             (codeql--session-error-keys
+                                              (plist-get outcome :message) file lines)))
+                             outcome)))))
+        (setf (codeql--session-pending session) handler)
+        (condition-case err
+            (let ((codeql--query-result-handler handler))
+              (codeql--query-server-run-query-from-path
+               file quick-eval nil nil nil provenance))
+          ((error quit)
+           (setf (codeql--session-pending session) nil)
+           (signal (car err) (cdr err))))))))
+
+(defun codeql--session-cancel (session)
+  "Cancel the evaluation that runs in SESSION.
+
+Its outcome is an error whose :cancelled is non-nil."
+  (when-let ((handler (codeql--session-pending session)))
+    (when (buffer-live-p (codeql--session-buffer session))
+      (with-current-buffer (codeql--session-buffer session)
+        (let ((inhibit-message t))
+          (codeql-query-server-cancel-query))))
+    (funcall handler (list :status 'error :message "Evaluation canceled" :cancelled t))))
+
+(defun codeql--session-kill (session)
+  "Kill SESSION, which forgets its definitions."
+  (when (buffer-live-p (codeql--session-buffer session))
+    (kill-buffer (codeql--session-buffer session))))
+
+(defun codeql--session-eval-sync (session input &rest args)
+  "Evaluate INPUT in SESSION like `codeql--session-eval', and return the outcome.
+
+ARGS are passed on.  Quitting cancels the evaluation."
+  (let* ((outcome nil)
+         (done nil))
+    (apply #'codeql--session-eval session input
+           (lambda (result) (setq outcome result done t))
+           args)
+    (condition-case err
+        (while (not done)
+          (accept-process-output nil 0.05))
+      (quit
+       (codeql--session-cancel session)
+       (signal (car err) (cdr err))))
+    outcome))
 
 ;; cleanup on kill
 (defun codeql--cli-server-release ()

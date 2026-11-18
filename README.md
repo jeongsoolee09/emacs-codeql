@@ -389,6 +389,25 @@ The commands aren't bound by default. `codeql-alert-navigation-map` has them on 
 (repeat-mode 1)
 ```
 
+### CodeQL sessions
+
+A session evaluates snippets of CodeQL one after another, like a REPL, against the database of a project, and remembers the definitions it was given. Interactive front ends, such as a REPL, build on sessions. A session needs Emacs 29 or newer with the tree-sitter `ql` grammar.
+
+Each input can define predicates, classes, modules, newtypes and imports, and ask for one of the following:
+
+- a `select` query (`from int x where x in [1 .. 3] select x`);
+- an expression (`count(CallExpr c | manyArgs(c, _))`), which is selected;
+- a formula (`exists(CallExpr c | manyArgs(c, 4))`), whose truth is selected as `holds`;
+- the name of a predicate of the session (`manyArgs`), which is quick evaluated.
+
+A call of a predicate that the session doesn't define could be an expression or a formula. It is tried as an expression first, and then as a formula.
+
+Each evaluation rewrites a query module that holds the session's definitions, followed by the code to evaluate. The module lives in the hidden `.codeql-session/` directory of the CodeQL pack, so it resolves the same libraries as the pack's queries. The directory has a `.gitignore` that ignores everything in it. A session runs on the project's query server and database. Without a database it uses the one last registered in the project, or asks for one.
+
+Definitions are kept as soon as they are entered, without compiling them. When an evaluation fails with compiler errors in definitions that have never compiled successfully, they are rolled back: a new definition is dropped, and a redefinition is replaced by the last version that compiled. With `codeql-session-check-definitions`, definitions are compiled before they are kept. This catches mistakes early, but compiling a new query module can take several seconds.
+
+Session results use the same org results buffers and query history as other runs. Their `Query Source` shows the evaluated input and the query module that ran.
+
 ### Database source archive Xref support
 
 `emacs-codeql` automatically retrieves references and definitions for database source archive files that are opened from a result buffer org link. It achieves this by registering a custom org-link handler for a `codeql:` link type which then performs a ridiculous elisp ritual to trick emacs into thinking it actually has xref support for these files specifically.
@@ -600,7 +619,7 @@ The regression tests in `test/` don't need the CodeQL CLI:
 emacs -Q --batch -L . -l test/emacs-codeql-test.el -f ert-run-tests-batch-and-exit
 ```
 
-The org-ql tests are skipped unless org-ql and its dependencies are on the `load-path` (add them with `-L`).
+The org-ql tests are skipped unless org-ql and its dependencies are on the `load-path` (add them with `-L`). The session tests are skipped unless the tree-sitter `ql` grammar is installed.
 
 ## Known Quirks
 
