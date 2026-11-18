@@ -7792,7 +7792,7 @@ WHAT describes what is waited for."
 The query server of the project is used, or one is started.  DATABASE
 is registered when it is given, else the database of the project, or
 the one last registered in it.  When there is none, one is read from
-the database history."
+the database history, or as a directory when the history is empty."
   (with-current-buffer (codeql--session-buffer session)
     (let ((started nil))
       (unless codeql--query-server
@@ -7807,9 +7807,11 @@ the database history."
                          (if noninteractive
                              (user-error "No database for CodeQL session %s"
                                          (codeql--session-name session))
-                           (codeql--read-database
-                            (format "Database for CodeQL session %s: "
-                                    (codeql--session-name session))))))
+                           (let ((prompt (format "Database for CodeQL session %s: "
+                                                 (codeql--session-name session))))
+                             (if (seq-some #'identity (codeql--database-history-entries))
+                                 (codeql--read-database prompt)
+                               (read-directory-name prompt nil nil t))))))
              (target (codeql--database-history-path target))
              (active-p (lambda ()
                          (and codeql--active-database
