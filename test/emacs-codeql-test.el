@@ -911,7 +911,8 @@ is nil.  `gh' calls are pushed onto `calls'."
 
 The session uses no query server: the query runs it requests are pushed
 onto RUNS as plists of :file, :quick-eval, :target (the code that is
-quick evaluated), :module, :provenance and :handler, whose outcome
+quick evaluated) and the :target-line it starts on, :module, :provenance
+and :handler, whose outcome
 reaches `codeql-test--outcomes'."
   (declare (indent 1) (debug t))
   `(let ((root (make-temp-file "codeql-test-pack" t))
@@ -928,6 +929,10 @@ reaches `codeql-test--outcomes'."
                     (push (list :file file
                                 :quick-eval quick-eval
                                 :target (buffer-substring-no-properties (car bounds) (cdr bounds))
+                                :target-line (save-excursion
+                                               (goto-char (car bounds))
+                                               (buffer-substring-no-properties
+                                                (line-beginning-position) (line-end-position)))
                                 :module (buffer-substring-no-properties (point-min) (point-max))
                                 :provenance provenance
                                 :handler codeql--query-result-handler)
@@ -1005,7 +1010,9 @@ OUTCOME gets the :provenance of RUN."
       (should (equal (parse "foo(1)") '(nil (expression . "foo(1)") t)))
       (should (equal (parse "\"a\".length()") '(nil (expression . "\"a\".length()") t)))
       ;; a predicate of the session is quick evaluated
-      (should (equal (parse "p") '(nil (predicate . "p") nil)))
+      (should (equal (parse "p") '(nil (predicate "p" . 1) nil)))
+      (should (equal (parse "p / 1") '(nil (predicate "p" . 1) nil)))
+      (should-error (parse "p/2") :type 'user-error)
       ;; the values of a type are selected
       (should (equal (parse " Integers\n") '(nil (type . "Integers") nil)))
       (should (equal (parse "DataFlow::Node") '(nil (type . "DataFlow::Node") nil)))
@@ -1269,6 +1276,22 @@ OUTCOME gets the :provenance of RUN."
     (should (eq (plist-get (car runs) :quick-eval) 'count))
     (should (plist-get (plist-get (car runs) :provenance) :count))))
 
+(ert-deftest codeql-test-session-quick-eval-overloaded ()
+  "Predicates with the same name and different arities are told apart."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-session runs
+    (codeql-test--session-eval session "predicate p(int x) { x = 1 }\npredicate p(int x, int y) { x = y }")
+    (should (equal (cadr (should-error (codeql-test--session-eval session "p") :type 'user-error))
+                   "Predicate p is overloaded, enter one of p/1, p/2"))
+    (should-not runs)
+    (codeql-test--session-eval session "p/2")
+    (should (equal (plist-get (car runs) :target) "p"))
+    (should (equal (plist-get (car runs) :target-line) "predicate p(int x, int y) { x = y }"))
+    (codeql-test--finish-run (car runs) :status 'results)
+    (codeql-test--session-eval session "p/1" :count t)
+    (should (equal (plist-get (car runs) :target-line) "predicate p(int x) { x = 1 }"))
+    (should (eq (plist-get (car runs) :quick-eval) 'count))))
+
 (ert-deftest codeql-test-session-cancel ()
   "Canceling reports the evaluation as canceled, and ignores its outcome."
   (skip-unless (codeql-test--session-available-p))
@@ -1440,7 +1463,41 @@ OUTCOME gets the :provenance of RUN."
     (should (equal (text '(:status error :cancelled t)) "Canceled."))
     (should (equal (text '(:status error :message "ERROR: oops (in p/1)\n"
                                    :definitions ("p/1" "q/0") :dropped ("p/1")))
-                   "Defined q/0.\nERROR: oops (in p/1)\nRolled back p/1."))))
+                   "Defined q/0.\nERROR: oops (in p/1)\nRolled back p/1."))
+    (should (equal (text '(:status defined :definitions ("p/1" "C" "D" "q/0" "r/0")
+                                   :redefined ("C" "D") :unchanged ("p/1") :repeated ("q/0")))
+                   (concat "Defined q/0, r/0.\n"
+                           "Redefined C, D, which replaces the previous definitions.\n"
+                           "p/1 was already defined like that.\n"
+                           "q/0 is defined more than once in the input, the last definition counts.")))
+    ;; a rolled back redefinition didn't replace anything
+    (should (equal (text '(:status error :message "ERROR: oops (in C)\n"
+                                   :definitions ("C") :redefined ("C") :dropped ("C")))
+                   "ERROR: oops (in C)\nRolled back C."))))
+
+(ert-deftest codeql-test-session-changes ()
+  "Entered definitions are told apart as new, redefined, unchanged and repeated."
+  (skip-unless (codeql-test--session-available-p))
+  (let* ((p (codeql-test--definition "predicate p(int x) { x = 1 }" t))
+         (c (codeql-test--definition "class C extends int { C() { this = 1 } }" t))
+         (definitions (list p c))
+         (entered (plist-get (codeql--session-parse
+                              (concat "predicate p(int x) {\n  x = 1\n}\n"
+                                      "class C extends int { C() { this = 2 } }\n"
+                                      "predicate p(int x, int y) { x = y }\n"
+                                      "predicate q() { any() }\npredicate q() { none() }")
+                              definitions)
+                             :definitions))
+         (changes (codeql--session-changes definitions entered)))
+    (should (equal (plist-get changes :redefined) '("C")))
+    (should (equal (plist-get changes :unchanged) '("p/1")))
+    (should (equal (plist-get changes :repeated) '("q/0")))
+    ;; what is unchanged isn't merged, and stays verified
+    (should (equal (mapcar (lambda (d) (plist-get d :key)) (plist-get changes :new))
+                   '((type "C") (predicate "p" 2) (predicate "q" 0) (predicate "q" 0))))
+    (let ((merged (codeql--session-merge definitions (plist-get changes :new))))
+      (should (eq (car merged) p))
+      (should (equal (plist-get (car (last merged)) :text) "predicate q() { none() }")))))
 
 (defmacro codeql-test--with-repl (runs &rest body)
   "Run BODY in a REPL buffer of a CodeQL session, see `codeql-test--with-session'.
@@ -1470,15 +1527,37 @@ OUTCOME gets the :provenance of RUN."
   "Enter INPUT in the current REPL buffer, and return the output it prints."
   (let ((start (point-max)))
     (codeql-repl--enter input)
-    (codeql-test--repl-output start)))
+    (codeql-test--repl-output start (1+ (cl-count ?\n input)))))
 
-(defun codeql-test--repl-output (start)
-  "Return what the current REPL buffer printed after START, without the prompt."
+(defun codeql-test--repl-output (start &optional lines)
+  "Return what the current REPL buffer printed after START, without the prompt.
+The first LINES lines (default 1) after START are the echoed input."
   (string-remove-suffix
    codeql-repl-prompt
    (buffer-substring-no-properties
-    (save-excursion (goto-char start) (forward-line 1) (point))
+    (save-excursion (goto-char start) (forward-line (or lines 1)) (point))
     (point-max))))
+
+(ert-deftest codeql-test-repl-redefinitions ()
+  "The REPL warns when definitions replace others, or repeat in the input."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-repl runs
+    (should (equal (codeql-test--repl-enter
+                    "class Integers extends int { Integers() { this in [1 .. 9] } }")
+                   "Defined Integers.\n"))
+    (should (equal (codeql-test--repl-enter
+                    "class Integers extends int {\n  Integers() { this in [1 .. 9] }\n}")
+                   "Integers was already defined like that.\n"))
+    (should (equal (codeql-test--repl-enter
+                    "class Integers extends int { Integers() { this in [1 .. 5] } }")
+                   "Redefined Integers, which replaces the previous definition.\n"))
+    (should (eq (get-text-property (- (point-max) (length codeql-repl-prompt) 2) 'font-lock-face)
+                'warning))
+    (should (equal (codeql-test--repl-enter "predicate q() { any() }\npredicate q() { none() }")
+                   (concat "Defined q/0.\nq/0 is defined more than once in the input, "
+                           "the last definition counts.\n")))
+    (should (equal (codeql-test--session-keys session)
+                   '((import "import javascript") (type "Integers") (predicate "q" 0))))))
 
 (ert-deftest codeql-test-repl-round-trip ()
   "Input is evaluated in the session of the REPL, which prints the outcome."
@@ -1693,6 +1772,8 @@ org text after the block."
         (should (member '(predicate "q" 0) keys))
         (should-not (member '(predicate "p" 0) keys)))
       (should (equal (car (codeql-test--babel root (format block " :session"))) "Defined p/0."))
+      (should (equal (car (codeql-test--babel root (format block " :session")))
+                     "p/0 was already defined like that."))
       (should (equal (car (codeql-test--babel root (format use " :session default")))
                      "Defined q/0."))
       ;; the session of a name is that of the REPL
