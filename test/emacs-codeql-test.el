@@ -660,5 +660,439 @@ sent, and `codeql-load-bqrs' pushes (:loaded BQRS-PATH PROVENANCE)."
             (should (eq (plist-get codeql--raw-results-pagination :style) 'table))
             (should-not (codeql-test--result-properties buffer))))))))
 
+;;; Result handlers
+
+(ert-deftest codeql-test-result-handler ()
+  "A result handler gets the outcome of a run instead of a results buffer."
+  (codeql-test--with-query-buffer
+    (let* ((calls nil)
+           (outcomes nil)
+           (handler (lambda (outcome) (push outcome outcomes)))
+           (dir (make-temp-file "codeql-test-state" t)))
+      (setq codeql--active-database "/dbs/js-db/"
+            codeql--completed-query-history (make-hash-table :test #'equal))
+      (codeql-test--with-stubbed-server calls
+        (let ((full (make-temp-file (expand-file-name "a" dir) nil ".bqrs" "x"))
+              (check (make-temp-file (expand-file-name "b" dir) nil ".bqrs" "x"))
+              (empty (make-temp-file (expand-file-name "c" dir) nil ".bqrs")))
+          (codeql--query-server-request-run
+           (current-buffer) nil full "/q/A.ql" nil nil "/dbs/js-db" nil nil nil nil
+           '(:kind file :path "/q/A.ql") handler)
+          (codeql--query-server-request-run
+           (current-buffer) nil check "/q/A.ql" nil nil "/dbs/js-db" nil nil nil nil
+           '(:kind session :session "default" :check t) handler)
+          (codeql--query-server-request-run
+           (current-buffer) nil empty "/q/A.ql" nil nil "/dbs/js-db" nil nil nil nil
+           '(:kind file :path "/q/A.ql") handler)
+          (dolist (request (reverse calls))
+            (funcall (nth 1 request) nil))
+          (should-not (assq :loaded calls))
+          (should (equal (mapcar (lambda (o) (list (plist-get o :status) (plist-get o :bqrs-path)))
+                                 (reverse outcomes))
+                         `((results ,full) (results ,check) (empty ,empty))))
+          (should (equal (plist-get (car (last outcomes)) :provenance)
+                         '(:kind file :path "/q/A.ql")))
+          ;; definition checks of sessions stay out of the query history
+          (should (equal (mapcar (lambda (run) (plist-get run :bqrs-path))
+                                 (hash-table-values codeql--completed-query-history))
+                         (list full))))))))
+
+(ert-deftest codeql-test-explicit-quick-eval-region ()
+  "`codeql--quick-eval-region' says what to quick evaluate, without a region."
+  (with-temp-buffer
+    (insert "predicate p(int x) { x = 1 }\nselect 1\n")
+    (setq-local transient-mark-mode t)
+    (goto-char (point-max))
+    (let ((codeql--quick-eval-region (cons 11 12)))
+      (let ((provenance (codeql--query-provenance "/q/A.ql" t)))
+        (should (equal (plist-get provenance :source) "p"))
+        (should (equal (plist-get provenance :column) 11)))
+      (let ((target (plist-get (codeql--query-target "/q/A.ql" 'count) :quickEval)))
+        (should (equal (plist-get (plist-get target :quickEvalPos) :line) 1))
+        (should (equal (plist-get (plist-get target :quickEvalPos) :column) 11))
+        (should (equal (plist-get (plist-get target :quickEvalPos) :endColumn) 12))
+        (should (plist-get target :countOnly))))))
+
+;;; Sessions
+
+(defun codeql-test--session-available-p ()
+  "Return non-nil if sessions can parse CodeQL here."
+  (require 'treesit nil t)
+  (codeql--session-treesit-p))
+
+(defun codeql-test--definition (text &optional verified)
+  "Return the session definition that TEXT makes, VERIFIED or not."
+  (let ((definition (car (plist-get (codeql--session-parse text nil) :definitions))))
+    (if verified (codeql--session-verified definition) definition)))
+
+(defvar codeql-test--outcomes nil
+  "The outcomes of session evaluations, the last one first.")
+
+(defmacro codeql-test--with-session (runs &rest body)
+  "Run BODY with `session', a CodeQL session in a stand-in pack.
+
+The session uses no query server: the query runs it requests are pushed
+onto RUNS as plists of :file, :quick-eval, :target (the code that is
+quick evaluated), :module, :provenance and :handler, whose outcome
+reaches `codeql-test--outcomes'."
+  (declare (indent 1) (debug t))
+  `(let ((root (make-temp-file "codeql-test-pack" t))
+         (,runs nil)
+         (codeql-test--outcomes nil)
+         (codeql-session-check-definitions nil))
+     (with-temp-file (expand-file-name "qlpack.yml" root)
+       (insert "name: test/pack\nversion: 0.0.1\n"))
+     (cl-letf (((symbol-function 'codeql--buffer-local-init-hook) #'ignore)
+               ((symbol-function 'codeql-query-server-cancel-query) #'ignore)
+               ((symbol-function 'codeql--query-server-run-query-from-path)
+                (lambda (file quick-eval &optional _template _src-filename _src-buffer provenance)
+                  (let ((bounds (codeql--quick-eval-bounds)))
+                    (push (list :file file
+                                :quick-eval quick-eval
+                                :target (buffer-substring-no-properties (car bounds) (cdr bounds))
+                                :module (buffer-substring-no-properties (point-min) (point-max))
+                                :provenance provenance
+                                :handler codeql--query-result-handler)
+                          ,runs)))))
+       (let ((session (codeql--session-get root)))
+         (unwind-protect
+             (progn
+               (with-current-buffer (codeql--session-buffer session)
+                 (setq codeql--query-server 'server
+                       codeql--active-database "/dbs/js-db/"))
+               (setf (codeql--session-definitions session)
+                     (codeql--session-default-definitions "javascript"))
+               ,@body)
+           (when (buffer-live-p (codeql--session-buffer session))
+             (with-current-buffer (codeql--session-buffer session)
+               (setq codeql--query-server nil)))
+           (codeql--session-kill session)
+           (delete-directory root t))))))
+
+(defun codeql-test--session-eval (session input &rest args)
+  "Evaluate INPUT in SESSION, with ARGS for `codeql--session-eval'."
+  (apply #'codeql--session-eval session input
+         (lambda (outcome) (push outcome codeql-test--outcomes))
+         :frontend "test" args))
+
+(defun codeql-test--finish-run (run &rest outcome)
+  "Report OUTCOME for the query RUN, see `codeql-test--with-session'.
+
+OUTCOME gets the :provenance of RUN."
+  (funcall (plist-get run :handler)
+           (append outcome (list :provenance (plist-get run :provenance)))))
+
+(defun codeql-test--compile-error (run text)
+  "Return a compiler error message for the line of RUN's module with TEXT."
+  (let ((line (with-temp-buffer
+                (insert (plist-get run :module))
+                (goto-char (point-min))
+                (search-forward text)
+                (line-number-at-pos))))
+    (format "ERROR: could not resolve something (%s:%d,1-5)\nWARNING: unused predicate 'q' (%s:1,1-2)\n"
+            (plist-get run :file) line (plist-get run :file))))
+
+(defun codeql-test--session-keys (session)
+  "Return the keys of the definitions of SESSION."
+  (mapcar (lambda (definition) (plist-get definition :key))
+          (codeql--session-definitions session)))
+
+(ert-deftest codeql-test-session-parse ()
+  "Input is split into definitions and what to evaluate."
+  (skip-unless (codeql-test--session-available-p))
+  (let ((definitions (list (codeql-test--definition "predicate p(int x) { x = 1 }")
+                           (codeql-test--definition "int f() { result = 1 }"))))
+    (cl-flet ((parse (input)
+                (let ((parsed (codeql--session-parse input definitions)))
+                  (list (mapcar (lambda (d) (plist-get d :key)) (plist-get parsed :definitions))
+                        (plist-get parsed :action)
+                        (plist-get parsed :guess)))))
+      (should (equal (parse "predicate p(int x, string s) { x = s.length() }")
+                     '(((predicate "p" 2)) nil nil)))
+      (should (equal (parse "int g() { result = 1 }\nclass C extends int { C() { this = 1 } }")
+                     '(((predicate "g" 0) (type "C")) nil nil)))
+      (should (equal (parse "import javascript\nmodule M { predicate q() { any() } }\nnewtype T = A()")
+                     '(((import "import javascript") (module "M") (type "T")) nil nil)))
+      (should (equal (parse "predicate q() { any() }\nselect 1")
+                     '(((predicate "q" 0)) (select . "select 1") nil)))
+      (should (equal (parse "from int x where x = 1 select x")
+                     '(nil (select . "from int x where x = 1 select x") nil)))
+      (should (equal (parse "1 + 2") '(nil (expression . "1 + 2") nil)))
+      (should (equal (parse "f()") '(nil (expression . "f()") nil)))
+      (should (equal (parse "exists(int x | x = 1)")
+                     '(nil (formula . "exists(int x | x = 1)") nil)))
+      (should (equal (parse "p(1)") '(nil (formula . "p(1)") nil)))
+      ;; calls of predicates the session doesn't know might be either
+      (should (equal (parse "foo(1)") '(nil (expression . "foo(1)") t)))
+      (should (equal (parse "\"a\".length()") '(nil (expression . "\"a\".length()") t)))
+      ;; a predicate of the session is quick evaluated
+      (should (equal (parse "p") '(nil (predicate . "p") nil)))
+      ;; broken queries are left to the compiler to explain
+      (should (equal (parse "select 1 +") '(nil (select . "select 1 +") nil))))))
+
+(ert-deftest codeql-test-session-merge ()
+  "New definitions replace those with the same key in place."
+  (let* ((a (list :key "a" :text "a1" :verified t))
+         (b (list :key "b" :text "b1"))
+         (definitions (list a b))
+         (merged (codeql--session-merge definitions (list (list :key "a" :text "a2")
+                                                          (list :key "c" :text "c1")))))
+    (should (equal (mapcar (lambda (d) (plist-get d :text)) definitions) '("a1" "b1")))
+    (should (equal (mapcar (lambda (d) (plist-get d :text)) merged) '("a2" "b1" "c1")))))
+
+(ert-deftest codeql-test-session-merge-remembers-previous ()
+  "A redefinition remembers the last replaced definition that compiled."
+  (let* ((a (list :key "a" :text "a1" :verified t))
+         (once (codeql--session-merge (list a) (list (list :key "a" :text "a2"))))
+         (twice (codeql--session-merge once (list (list :key "a" :text "a3")))))
+    (should (eq (plist-get (car once) :previous) a))
+    (should (eq (plist-get (car twice) :previous) a))
+    (let ((verified (codeql--session-verified (car twice))))
+      (should (plist-get verified :verified))
+      (should-not (plist-member verified :previous))
+      (should-not (plist-get (car twice) :verified)))))
+
+(ert-deftest codeql-test-session-kept-definitions ()
+  "Definitions with errors are rolled back unless they compiled before."
+  (let* ((good (list :key "good" :verified t))
+         (old (list :key "re" :text "old" :verified t))
+         (new (list :key "new"))
+         (re (car (codeql--session-merge (list old) (list (list :key "re" :text "new")))))
+         (definitions (list good re new)))
+    ;; failures that aren't about the definitions keep them all
+    (should (equal (codeql--session-kept-definitions definitions nil) definitions))
+    ;; an unverified definition with errors is dropped
+    (should (equal (codeql--session-kept-definitions definitions '("new"))
+                   (list good re)))
+    ;; a broken redefinition leaves the one it replaced
+    (should (equal (codeql--session-kept-definitions definitions '("re"))
+                   (list good old new)))
+    ;; errors in a verified definition roll back all unverified ones
+    (should (equal (codeql--session-kept-definitions definitions '("good"))
+                   (list good old)))))
+
+(ert-deftest codeql-test-session-module ()
+  "The query module has the definitions, then the code of the action."
+  (let ((definitions (list (list :key '(import "import javascript") :text "import javascript")
+                           (list :key '(predicate "p" 1)
+                                 :text "predicate p(int x) {\n  x = 1\n}"))))
+    (cl-flet ((action-code (action)
+                (let ((module (codeql--session-module "s" definitions action)))
+                  (when-let ((start (text-property-any 0 (length module)
+                                                       'codeql-session-action t module)))
+                    (substring-no-properties
+                     module start (next-single-property-change start 'codeql-session-action
+                                                               module (length module)))))))
+      (should (equal (action-code '(select . "select 1")) "select 1"))
+      (should (equal (action-code '(expression . "1 + 2")) "select\n1 + 2"))
+      (should (string-match-p "\\`from boolean holds\nwhere\n  if (\nexists(int x | p(x))\n"
+                              (action-code '(formula . "exists(int x | p(x))"))))
+      (should (equal (action-code '(predicate . "p")) "select 1"))
+      (should (equal (action-code '(check)) "select 1"))
+      (should-not (action-code nil)))
+    (with-temp-buffer
+      (insert (codeql--session-module "s" definitions '(expression . "p(_)")))
+      (should (string-prefix-p "// The query module of CodeQL session s"
+                               (buffer-string)))
+      (let ((lines (codeql--session-definition-lines)))
+        (should (equal lines '(((import "import javascript") 3 3)
+                               ((predicate "p" 1) 5 7))))
+        (should (equal (codeql--session-error-keys
+                        (concat "ERROR: could not resolve x (/p/.codeql-session/s.ql:6,3-4)\n"
+                                "ERROR: could not resolve y (/p/.codeql-session/s.ql:10,1-2)\n"
+                                "ERROR: could not resolve z (/p/Other.ql:3,1-2)\n")
+                        "/p/.codeql-session/s.ql" lines)
+                       '((predicate "p" 1))))))
+    (should (equal (codeql--session-clean-message
+                    "ERROR: oops (/s.ql:1,1-2)\nWARNING: unused predicate 'p' (/s.ql:3,1-2)\n")
+                   "ERROR: oops (/s.ql:1,1-2)\n"))))
+
+(ert-deftest codeql-test-session-buffer ()
+  "A session lives in a hidden buffer of its pack, and goes with it."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-session runs
+    (let* ((buffer (codeql--session-buffer session))
+           (file (buffer-file-name buffer))
+           (dir (file-name-directory file)))
+      (should (string-prefix-p " " (buffer-name buffer)))
+      (should (equal (expand-file-name "default.ql" (expand-file-name ".codeql-session" root))
+                     file))
+      (should (equal (with-temp-buffer
+                       (insert-file-contents (expand-file-name ".gitignore" dir))
+                       (buffer-string))
+                     "*\n"))
+      (should (eq (codeql--session-get root) session))
+      (should-not (eq (codeql--session-get root "other") session))
+      (codeql--session-kill (codeql--session-get root "other"))
+      (with-current-buffer buffer
+        (setq codeql--query-server nil))
+      (codeql--session-kill session)
+      (should-not (buffer-live-p buffer))
+      (should-not (file-exists-p file))
+      (let ((again (codeql--session-get root)))
+        (should-not (eq again session))
+        (setq session again)))))
+
+(ert-deftest codeql-test-session-definitions ()
+  "Definitions are kept without being compiled, unless that is asked for."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-session runs
+    (codeql-test--session-eval session "predicate p(int x) { x = 1 }")
+    (should-not runs)
+    (let ((outcome (car codeql-test--outcomes)))
+      (should (eq (plist-get outcome :status) 'defined))
+      (should (equal (plist-get outcome :definitions) '("p/1"))))
+    (should (equal (codeql-test--session-keys session)
+                   '((import "import javascript") (predicate "p" 1))))
+    (let ((codeql-session-check-definitions t))
+      (codeql-test--session-eval session "predicate q() { p(1) }")
+      (let ((run (car runs)))
+        (should (string-suffix-p "predicate q() { p(1) }\n\nselect 1\n" (plist-get run :module)))
+        (should (plist-get (plist-get run :provenance) :check))
+        (codeql-test--finish-run run :status 'results)))
+    (should (eq (plist-get (car codeql-test--outcomes) :status) 'defined))
+    (should (seq-every-p (lambda (d) (plist-get d :verified))
+                         (codeql--session-definitions session)))))
+
+(ert-deftest codeql-test-session-expression ()
+  "An expression is selected in a module with the session's definitions."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-session runs
+    (codeql-test--session-eval session "predicate p(int x) { x = 1 }")
+    (codeql-test--session-eval session "count(int x | p(x))")
+    (let* ((run (car runs))
+           (provenance (plist-get run :provenance)))
+      (should (equal (plist-get run :file)
+                     (buffer-file-name (codeql--session-buffer session))))
+      (should-not (plist-get run :quick-eval))
+      (should (equal (plist-get run :target) "select\ncount(int x | p(x))"))
+      (should (string-match-p "^predicate p(int x) { x = 1 }$" (plist-get run :module)))
+      (should (equal (plist-get provenance :kind) 'session))
+      (should (equal (plist-get provenance :session) "default"))
+      (should (equal (plist-get provenance :frontend) "test"))
+      (should (equal (plist-get provenance :input) "count(int x | p(x))"))
+      (should (equal (plist-get provenance :module) (plist-get run :module)))
+      (should (codeql--session-pending session))
+      (should-error (codeql-test--session-eval session "1") :type 'user-error)
+      (codeql-test--finish-run run :status 'results :bqrs-path "/r.bqrs")
+      (should-not (codeql--session-pending session))
+      (let ((outcome (car codeql-test--outcomes)))
+        (should (eq (plist-get outcome :status) 'results))
+        (should (eq (plist-get outcome :action) 'expression))
+        (should (eq (plist-get outcome :session) session))
+        (should (equal (plist-get outcome :bqrs-path) "/r.bqrs")))
+      (should (seq-every-p (lambda (d) (plist-get d :verified))
+                           (codeql--session-definitions session))))))
+
+(ert-deftest codeql-test-session-errors-drop-definitions ()
+  "Definitions that the compiler reports errors in are rolled back."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-session runs
+    (codeql-test--session-eval session "predicate p(int x) { x = 1 }")
+    (codeql-test--session-eval session "count(int x | p(x))")
+    (codeql-test--finish-run (car runs) :status 'results)
+    ;; a broken definition and a broken redefinition of one that compiled
+    (codeql-test--session-eval session "predicate broken() { nope() }")
+    (codeql-test--session-eval session "predicate p(int x) { x = nope }")
+    (codeql-test--session-eval session "1 + 2")
+    (let ((run (car runs)))
+      (codeql-test--finish-run
+       run :status 'error
+       :message (concat (codeql-test--compile-error run "nope()")
+                        (codeql-test--compile-error run "x = nope"))))
+    (let ((outcome (car codeql-test--outcomes)))
+      (should (eq (plist-get outcome :status) 'error))
+      (should (equal (sort (plist-get outcome :dropped) #'string<) '("broken/0" "p/1")))
+      (should-not (string-match-p "WARNING" (plist-get outcome :message))))
+    (should (equal (codeql-test--session-keys session)
+                   '((import "import javascript") (predicate "p" 1))))
+    (should (equal (plist-get (cadr (codeql--session-definitions session)) :text)
+                   "predicate p(int x) { x = 1 }"))
+    ;; errors elsewhere keep the definitions
+    (codeql-test--session-eval session "predicate q() { any() }\nselect nope")
+    (let ((run (car runs)))
+      (codeql-test--finish-run run :status 'error
+                               :message (codeql-test--compile-error run "select nope")))
+    (should-not (plist-get (car codeql-test--outcomes) :dropped))
+    (should (member '(predicate "q" 0) (codeql-test--session-keys session)))))
+
+(ert-deftest codeql-test-session-retry-as-formula ()
+  "A call that doesn't compile as an expression is retried as a formula."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-session runs
+    (codeql-test--session-eval session "foo(1)")
+    (codeql-test--finish-run (car runs) :status 'error :message "ERROR: not an expression\n")
+    (should-not codeql-test--outcomes)
+    (should (equal (length runs) 2))
+    (should (string-match-p "\\`from boolean holds" (plist-get (car runs) :target)))
+    (codeql-test--finish-run (car runs) :status 'results)
+    (should (eq (plist-get (car codeql-test--outcomes) :action) 'formula))
+    ;; when both fail, the error is that of the expression
+    (codeql-test--session-eval session "bar(1)")
+    (codeql-test--finish-run (car runs) :status 'error :message "expression error\n")
+    (codeql-test--finish-run (car runs) :status 'error :message "formula error\n")
+    (let ((outcome (car codeql-test--outcomes)))
+      (should (eq (plist-get outcome :action) 'expression))
+      (should (equal (plist-get outcome :message) "expression error\n")))))
+
+(ert-deftest codeql-test-session-quick-eval ()
+  "A predicate of the session is quick evaluated by name."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-session runs
+    (codeql-test--session-eval session "predicate p(int x) { x = 1 }")
+    (codeql-test--session-eval session "p")
+    (let ((run (car runs)))
+      (should (eq (plist-get run :quick-eval) t))
+      (should (equal (plist-get run :target) "p"))
+      (should (string-suffix-p "\nselect 1\n" (plist-get run :module)))
+      (codeql-test--finish-run run :status 'results))
+    (codeql-test--session-eval session "p" :count t)
+    (should (eq (plist-get (car runs) :quick-eval) 'count))
+    (should (plist-get (plist-get (car runs) :provenance) :count))))
+
+(ert-deftest codeql-test-session-cancel ()
+  "Canceling reports the evaluation as canceled, and ignores its outcome."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-session runs
+    (codeql-test--session-eval session "predicate q() { any() }\nselect 1")
+    (codeql--session-cancel session)
+    (should-not (codeql--session-pending session))
+    (let ((outcome (car codeql-test--outcomes)))
+      (should (eq (plist-get outcome :status) 'error))
+      (should (plist-get outcome :cancelled)))
+    (codeql-test--finish-run (car runs) :status 'results)
+    (should (equal (length codeql-test--outcomes) 1))
+    ;; it wasn't the definitions that failed
+    (should (member '(predicate "q" 0) (codeql-test--session-keys session)))))
+
+(ert-deftest codeql-test-session-eval-sync ()
+  "A synchronous evaluation waits for and returns the outcome."
+  (skip-unless (codeql-test--session-available-p))
+  (codeql-test--with-session runs
+    (run-at-time 0.1 nil (lambda ()
+                           (codeql-test--finish-run (car runs) :status 'results
+                                                    :bqrs-path "/r.bqrs")))
+    (let ((outcome (codeql--session-eval-sync session "1 + 2")))
+      (should (eq (plist-get outcome :status) 'results))
+      (should (equal (plist-get outcome :bqrs-path) "/r.bqrs")))))
+
+(ert-deftest codeql-test-session-provenance ()
+  "The Query Source of session results shows the input and the module."
+  (codeql-test--with-query-buffer
+    (let* ((module "// module\n\nimport javascript\n\nselect\n1 + 2\n")
+           (buffer (codeql-test--render-raw
+                    (list :kind 'session :session "default" :frontend "REPL"
+                          :input "1 + 2" :action 'expression :module module)
+                    'table)))
+      (with-current-buffer buffer
+        (codeql-test--goto-heading "Query Source")
+        (should (equal (org-entry-get nil "CODEQL_EVALUATION") "session"))
+        (should (equal (org-entry-get nil "CODEQL_SESSION") "default"))
+        (should (equal (org-element-map (org-element-parse-buffer) 'src-block
+                         (lambda (b) (org-element-property :value b)))
+                       (list "1 + 2\n" module)))
+        (should (equal (mapcar #'car (codeql-test--headlines buffer))
+                       '(1 2 2 1 1)))))))
+
 (provide 'emacs-codeql-test)
 ;;; emacs-codeql-test.el ends here
