@@ -403,7 +403,7 @@ assert. ... empty")  │ 3
 
 `RET` sends the input when it is complete, and otherwise continues it on a new, indented line: while parentheses, brackets, braces, strings or block comments are open, after an operator or a keyword like `and`, and in a `from` or `where` clause without a `select`. `C-j` always continues the input. `TAB` completes the names of the session's definitions, annotated with their signatures, CodeQL keywords, and commands after a `:`. Predicates with several arities are also completed as `NAME/ARITY`. Entering just the name of such predicates, also with `:count`, asks which of them to evaluate.
 
-The first `codeql-repl-max-rows` results are printed as a table, with cells cut at `codeql-repl-max-column-width`. Result locations are buttons that visit the source archive. `[results]`, `C-c C-v` or `:results` opens all results in an org results buffer. `C-c C-c` cancels the running evaluation. Input is fontified as CodeQL when `codeql-repl-fontify-input` is non-nil.
+The first `codeql-repl-max-rows` results are printed as a table, with cells cut at `codeql-repl-max-column-width`. Result locations are buttons that visit the source archive. `RET` or a click pushes a button, also in Evil's normal state, where evil-collection binds `RET` to send input. `[results]`, `C-c C-v` or `:results` opens all results in an org results buffer. `C-c C-c` cancels the running evaluation. Input is fontified as CodeQL when `codeql-repl-fontify-input` is non-nil.
 
 Input that begins with a colon is a command. Commands can be abbreviated, such as `:d` for `:defs`.
 

@@ -8699,6 +8699,22 @@ ARGS are passed on to `codeql--session-eval'."
   "Return the text for an evaluation that took ELAPSED seconds, or nil."
   (if elapsed (format " in %.1fs" elapsed) ""))
 
+(defvar codeql-repl-button-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map button-map)
+    ;; keymaps binding <return> shadow RET, as evil-collection's comint
+    ;; bindings do in normal state
+    (define-key map [return] #'push-button)
+    map)
+  "Keymap of the buttons in the output of the CodeQL REPL.
+
+It precedes the keymaps of the REPL and of minor modes such as Evil's
+at the buttons, so RET pushes them in any state.")
+
+(define-button-type 'codeql-repl-button
+  'keymap codeql-repl-button-map
+  'follow-link t)
+
 (defun codeql-repl--cell (value)
   "Return the text that the REPL shows for the result VALUE.
 
@@ -8714,13 +8730,13 @@ buffer of the results, which locates their source archive."
     ((pred listp)
      (if-let ((node (codeql--session-value-node value)))
          (make-text-button (codeql--result-node-label node) nil
+                           'type 'codeql-repl-button
                            'action #'codeql-repl--visit
                            'codeql-link (codeql--result-node-link node)
                            'help-echo (format "Visit %s:%s"
                                               (file-name-nondirectory
                                                (codeql--result-node-filename node))
-                                              (codeql--result-node-line node))
-                           'follow-link t)
+                                              (codeql--result-node-line node)))
        (codeql--printable-label (alist-get 'label value))))
     (_ (format "%s" value))))
 
@@ -8782,10 +8798,10 @@ The evaluation took ELAPSED seconds."
                          (mapcar (lambda (tuple) (mapcar #'codeql-repl--cell tuple))
                                  tuples))))
                (button (make-text-button "[results]" nil
+                                         'type 'codeql-repl-button
                                          'action #'codeql-repl--show-outcome
                                          'codeql-outcome outcome
-                                         'help-echo "Open all results in a results buffer"
-                                         'follow-link t)))
+                                         'help-echo "Open all results in a results buffer")))
     (concat
      (codeql-repl--table columns rows)
      "\n"
