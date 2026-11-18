@@ -368,7 +368,7 @@ Each input can define predicates, classes, modules, newtypes and imports, and as
 - a `select` query (`from int x where x in [1 .. 3] select x`);
 - an expression (`count(CallExpr c | manyArgs(c, _))`), which is selected;
 - a formula (`exists(CallExpr c | manyArgs(c, 4))`), whose truth is selected as `holds`;
-- the name of a predicate of the session (`manyArgs`), which is quick evaluated;
+- the name of a predicate of the session (`manyArgs`), which is quick evaluated, or its name and arity (`manyArgs/2`) to pick one of several predicates of that name;
 - the name of a type (`Integers`, `DataFlow::Node`), whose values are selected.
 
 A call of a predicate that the session doesn't define could be an expression or a formula. It is tried as an expression first, and then as a formula.
@@ -376,6 +376,8 @@ A call of a predicate that the session doesn't define could be an expression or 
 Each evaluation rewrites a query module that holds the session's definitions, followed by the code to evaluate. The module lives in the hidden `.codeql-session/` directory of the CodeQL pack, so it resolves the same libraries as the pack's queries. The directory has a `.gitignore` that ignores everything in it. A session runs on the project's query server and database. Without a database it uses the one last registered in the project, or asks for one.
 
 Definitions are kept as soon as they are entered, without compiling them. When an evaluation fails with compiler errors in definitions that have never compiled successfully, they are rolled back: a new definition is dropped, and a redefinition is replaced by the last version that compiled. With `codeql-session-check-definitions`, definitions are compiled before they are kept. This catches mistakes early, but compiling a new query module can take several seconds.
+
+A definition with the same name as one the session already has replaces it: classes, newtypes and modules by name, predicates by name and arity, so `p/1` and `p/2` are distinct. Front ends warn about such a redefinition, and about definitions given more than once in the same input, where the last one counts. Entering a definition again unchanged, up to whitespace, keeps it as it is.
 
 Session results use the same org results buffers and query history as other runs. Their `Query Source` shows the evaluated input and the query module that ran.
 
@@ -449,7 +451,7 @@ manyArgs
 | [[codeql:...][assert. ... empty")]] | 3 |
 ```
 
-A single result is returned as a value, other results as a table whose header holds the names of the columns, or their types. Result locations are `codeql:` links into the source archive, and numbers stay numbers, so the tables can be used by other blocks. Definitions return what was defined. Errors are shown in the `*Org-Babel Error Output*` buffer, with what was rolled back, and return no result.
+A single result is returned as a value, other results as a table whose header holds the names of the columns, or their types. Result locations are `codeql:` links into the source archive, and numbers stay numbers, so the tables can be used by other blocks. Definitions return what was defined, and what was redefined. Redefinitions are also reported in the echo area when the block evaluates something as well. Errors are shown in the `*Org-Babel Error Output*` buffer, with what was rolled back, and return no result.
 
 | Header argument | Description |
 | --- | --- |

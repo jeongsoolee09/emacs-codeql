@@ -193,6 +193,10 @@ See the commentary of ob-codeql.el for the header arguments."
          (outcome (codeql--session-eval-sync session body
                                              :frontend "Org Babel"
                                              :count (ob-codeql--yes-p params :count))))
+    ;; definitions are only reported along with results when they warn
+    (unless (eq (plist-get outcome :status) 'defined)
+      (when-let ((warnings (seq-filter #'cdr (codeql--session-definition-notes outcome))))
+        (message "%s" (mapconcat #'car warnings " "))))
     (pcase (plist-get outcome :status)
       ('results
        (prog1 (ob-codeql--results outcome limit)
@@ -200,11 +204,8 @@ See the commentary of ob-codeql.el for the header arguments."
            (codeql--query-run-show outcome))))
       ('empty nil)
       ('error (ob-codeql--error outcome))
-      (_ (let ((defined (seq-difference (plist-get outcome :definitions)
-                                        (plist-get outcome :dropped))))
-           (if defined
-               (format "Defined %s." (string-join defined ", "))
-             "Nothing new was defined."))))))
+      (_ (let ((notes (mapconcat #'car (codeql--session-definition-notes outcome) "\n")))
+           (if (string-empty-p notes) "Nothing new was defined." notes))))))
 
 ;;;###autoload
 (defalias 'org-babel-execute:ql #'org-babel-execute:codeql)

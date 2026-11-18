@@ -7484,19 +7484,48 @@ predicates can't be told apart."
      ((equal type "qualified_expr") '(expression . t))
      (t '(expression)))))
 
+(defun codeql--session-parse-predicate (input definitions)
+  "Return what INPUT asks for when it names a predicate of DEFINITIONS.
+
+INPUT names a predicate as NAME, or as NAME/ARITY to pick one of the
+predicates NAME with different arities.  See `codeql--session-parse'."
+  (when (string-match (concat "\\`[ \t\n]*\\([A-Za-z_][A-Za-z0-9_]*\\)"
+                              "\\(?:[ \t\n]*/[ \t\n]*\\([0-9]+\\)\\)?[ \t\n]*\\'")
+                      input)
+    (let* ((name (match-string 1 input))
+           (arity (and (match-beginning 2) (string-to-number (match-string 2 input))))
+           (arities (sort (delete-dups
+                           (mapcar (lambda (definition) (plist-get definition :arity))
+                                   (seq-filter
+                                    (lambda (definition)
+                                      (and (eq (plist-get definition :kind) 'predicate)
+                                           (equal (plist-get definition :name) name)
+                                           (or (null arity)
+                                               (eql (plist-get definition :arity) arity))))
+                                    definitions)))
+                          #'<)))
+      (cond
+       ((cdr arities)
+        (user-error "Predicate %s is overloaded, enter one of %s" name
+                    (mapconcat (lambda (arity) (format "%s/%d" name arity)) arities ", ")))
+       (arities (list :action (cons 'predicate (cons name (car arities)))))
+       ;; an identifier divided by a number is no expression
+       (arity (user-error "Predicate %s/%d is not defined in this session" name arity))))))
+
 (defun codeql--session-parse (input definitions)
   "Return what INPUT, entered in a session with DEFINITIONS, asks for.
 
 This is a plist with the :definitions INPUT makes, see
 `codeql--session-definition', and the :action it requests, which is
-nil or a cons (TYPE . TEXT) of one of these types:
+nil or a cons (TYPE . TEXT) of one of these types, but for predicates:
 
 - `select': run the query that the select clause TEXT, along with the
   definitions of the session and of INPUT, makes.
 - `expression' or `formula': show the values of the expression TEXT,
   or whether the formula TEXT holds.  :guess is non-nil when INPUT could
   be either, the action holds the more likely one.
-- `predicate': quick evaluate the predicate named TEXT of the session.
+- `predicate': (predicate NAME . ARITY) quick evaluates that predicate
+  of the session, entered as NAME, or NAME/ARITY when it is overloaded.
 - `type': select the values of the type named TEXT, a class of the
   session or of its imports.
 
@@ -7508,13 +7537,7 @@ the compiler explains what is wrong with it."
     (with-temp-buffer
       (cond
        ((string-empty-p (string-trim input)) nil)
-       ;; a predicate of the session by name
-       ((and (string-match "\\`[ \t\n]*\\([A-Za-z_][A-Za-z0-9_]*\\)[ \t\n]*\\'" input)
-             (seq-find (lambda (definition)
-                         (and (eq (plist-get definition :kind) 'predicate)
-                              (equal (plist-get definition :name) (match-string 1 input))))
-                       definitions))
-        (list :action (cons 'predicate (match-string 1 input))))
+       ((codeql--session-parse-predicate input definitions))
        ;; a type by name, which can't be an expression
        ((let ((case-fold-search nil))
           (string-match (concat "\\`[ \t\n]*\\(\\(?:[A-Za-z_][A-Za-z0-9_]*::\\)*"
@@ -7581,6 +7604,74 @@ replaced definition that compiled as its :previous."
               (setq merged (mapcar (lambda (d) (if (eq d old) replacement d)) merged)))
           (setq merged (append merged (list definition))))))
     merged))
+
+(defun codeql--session-changes (definitions entered)
+  "Return how the ENTERED definitions change the session DEFINITIONS.
+
+This is a plist of the :new definitions to merge, see
+`codeql--session-merge', which leaves out those that are among
+DEFINITIONS as they are, and of the names of the entered definitions
+that are :redefined, :unchanged, or :repeated within ENTERED.
+Definitions are the same when they have the same key: classes and
+other types by name, and predicates by name and arity."
+  (let ((normal (lambda (definition)
+                  (replace-regexp-in-string "[ \t\n]+" " " (plist-get definition :text))))
+        (same (lambda (key) (lambda (definition) (equal (plist-get definition :key) key))))
+        (unchanged-keys nil)
+        (redefined nil)
+        (unchanged nil)
+        (repeated nil))
+    (dolist (definition entered)
+      (let* ((key (plist-get definition :key))
+             (name (codeql--session-definition-name definition))
+             (last (car (last (seq-filter (funcall same key) entered))))
+             (old (seq-find (funcall same key) definitions)))
+        (cond
+         ((not (eq definition last))
+          (when name (cl-pushnew name repeated :test #'equal)))
+         ((and old (equal (funcall normal old) (funcall normal definition)))
+          (push key unchanged-keys)
+          (when name (push name unchanged)))
+         ((and old name)
+          (push name redefined)))))
+    (list :new (seq-remove (lambda (definition)
+                             (member (plist-get definition :key) unchanged-keys))
+                           entered)
+          :redefined (nreverse redefined)
+          :unchanged (nreverse unchanged)
+          :repeated (nreverse repeated))))
+
+(defun codeql--session-definition-notes (outcome)
+  "Return what OUTCOME of `codeql--session-eval' says about definitions.
+
+This is a list of (TEXT . WARNING) lines, WARNING being non-nil for
+redefinitions."
+  (let* ((dropped (plist-get outcome :dropped))
+         (redefined (seq-difference (plist-get outcome :redefined) dropped))
+         (unchanged (plist-get outcome :unchanged))
+         (repeated (plist-get outcome :repeated))
+         (defined (seq-difference (plist-get outcome :definitions)
+                                  (append dropped redefined unchanged)))
+         (names (lambda (names) (string-join names ", ")))
+         (lines nil))
+    (when defined
+      (push (cons (format "Defined %s." (funcall names defined)) nil) lines))
+    (when redefined
+      (push (cons (format "Redefined %s, which replaces the previous definition%s."
+                          (funcall names redefined) (if (cdr redefined) "s" ""))
+                  t)
+            lines))
+    (when unchanged
+      (push (cons (format "%s %s already defined like that." (funcall names unchanged)
+                          (if (cdr unchanged) "were" "was"))
+                  nil)
+            lines))
+    (when repeated
+      (push (cons (format "%s %s defined more than once in the input, the last definition counts."
+                          (funcall names repeated) (if (cdr repeated) "are" "is"))
+                  t)
+            lines))
+    (nreverse lines)))
 
 (defun codeql--session-verified (definition)
   "Return DEFINITION marked as compiled successfully."
@@ -7741,14 +7832,17 @@ rolled back then."
         (format "%s/%s" name (plist-get definition :arity))
       name)))
 
-(defun codeql--session-predicate-name-bounds (name)
-  "Return the bounds of the name of the last predicate NAME defined in this buffer."
+(defun codeql--session-predicate-name-bounds (name arity)
+  "Return the bounds of the name of the last predicate NAME/ARITY in this buffer."
   (let ((root (treesit-parser-root-node (treesit-parser-create 'ql)))
         (found nil))
     (dolist (member (treesit-node-children root t))
       (when-let* ((predicate (codeql--session-child member "classlessPredicate"))
                   (node (codeql--session-child predicate "predicateName")))
-        (when (equal (treesit-node-text node t) name)
+        (when (and (equal (treesit-node-text node t) name)
+                   (= (seq-count (lambda (child) (equal (treesit-node-type child) "varDecl"))
+                                 (treesit-node-children predicate t))
+                      arity))
           (setq found (cons (treesit-node-start node) (treesit-node-end node))))))
     found))
 
@@ -7952,15 +8046,18 @@ reports errors before an evaluation succeeded with them, see
 `codeql--session-kept-definitions'.
 
 The outcome is that of `codeql--query-result-handler', with the
-:session, the :action of INPUT, the names of the :definitions it made
-and of the definitions that were :dropped for errors.  When INPUT only
-makes definitions, the outcome's :status is `defined'.  This returns
-right away, while the evaluation runs."
+:session, the :action of INPUT, the names of the :definitions it made,
+of those that were :redefined, :unchanged or :repeated, see
+`codeql--session-changes', and of the definitions that were :dropped
+for errors.  When INPUT only makes definitions, the outcome's :status
+is `defined'.  This returns right away, while the evaluation runs."
   (when (codeql--session-pending session)
     (user-error "CodeQL session %s is busy" (codeql--session-name session)))
   (let* ((parsed (or (codeql--session-parse input (codeql--session-definitions session))
                      (user-error "Nothing to evaluate")))
-         (new (plist-get parsed :definitions))
+         (entered (plist-get parsed :definitions))
+         (changes (codeql--session-changes (codeql--session-definitions session) entered))
+         (new (plist-get changes :new))
          (definitions (codeql--session-merge (codeql--session-definitions session) new))
          (action (or (plist-get parsed :action)
                      (and new codeql-session-check-definitions '(check))))
@@ -7983,7 +8080,12 @@ right away, while the evaluation runs."
                                      ;; a retried expression runs as a formula
                                      :action (or (plist-get (plist-get outcome :provenance) :action)
                                                  (car (plist-get parsed :action)))
-                                     :definitions (delq nil (mapcar #'codeql--session-definition-name new))
+                                     :definitions (delete-dups
+                                                   (delq nil (mapcar #'codeql--session-definition-name
+                                                                     entered)))
+                                     :redefined (plist-get changes :redefined)
+                                     :unchanged (plist-get changes :unchanged)
+                                     :repeated (plist-get changes :repeated)
                                      :dropped (delq nil (mapcar #'codeql--session-definition-name dropped)))
                                (if (plist-get outcome :message)
                                    (plist-put (copy-sequence outcome) :message
@@ -8027,8 +8129,9 @@ CALLBACK is called with the outcome.  When it is an error, its
       (let* ((quick-eval (and (eq (car action) 'predicate) (if count 'count t)))
              (codeql--quick-eval-region
               (if quick-eval
-                  (or (codeql--session-predicate-name-bounds (cdr action))
-                      (error "Predicate %s is not defined in session %s" (cdr action) name))
+                  (or (codeql--session-predicate-name-bounds (cadr action) (cddr action))
+                      (error "Predicate %s/%d is not defined in session %s"
+                             (cadr action) (cddr action) name))
                 (when-let ((start (text-property-any (point-min) (point-max)
                                                      'codeql-session-action t)))
                   (cons start (or (next-single-property-change start 'codeql-session-action)
@@ -8513,12 +8616,15 @@ ARGS are passed on to `codeql--session-eval'."
   (let* ((elapsed (and codeql-repl--started (- (float-time) codeql-repl--started)))
          (status (plist-get outcome :status))
          (dropped (plist-get outcome :dropped))
-         (defined (seq-difference (plist-get outcome :definitions) dropped))
+         (notes (codeql--session-definition-notes outcome))
          (lines nil))
     (setq codeql-repl--started nil)
     (force-mode-line-update)
-    (when defined
-      (push (codeql-repl--note (format "Defined %s." (string-join defined ", "))) lines))
+    (dolist (note notes)
+      (push (if (cdr note)
+                (propertize (car note) 'font-lock-face 'warning)
+              (codeql-repl--note (car note)))
+            lines))
     (pcase status
       ('results
        (setq codeql-repl--outcome outcome)
@@ -8537,7 +8643,7 @@ ARGS are passed on to `codeql--session-eval'."
            (push (propertize (format "Rolled back %s." (string-join dropped ", "))
                              'font-lock-face 'warning)
                  lines)))))
-    (when (and (eq status 'defined) (not defined))
+    (when (and (eq status 'defined) (not notes))
       (push (codeql-repl--note "Nothing new was defined.") lines))
     (mapconcat #'identity (nreverse lines) "\n")))
 
