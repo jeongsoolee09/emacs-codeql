@@ -27,6 +27,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Remote query development + evaluation via TRAMP
 - Compatible with [github/gh-codeql](https://github.com/github/gh-codeql) for cli version management
 - Database source archive xref backend support
+- Searching the database source archive with `codeql-database-grep`
 - AST Viewer with xref backend support
 - Rendering of graph results with graphviz, and a CFG viewer
 
@@ -307,6 +308,8 @@ There occurs a somewhat awkward situation when you follow a transitive xref, i.e
 Alternatively, any invocation of the default `xref-find-references` or `xref-find-definitions` functions will trigger a call to the `codeql-xref-backend` function as well, since it serves as the `xref-backend-functions` entry for the codeql xref backend. After this initial invocation to the standard bindings, the codeql xref bindings will then take over if `codeql-xref-backend` determined that the file its operating on is inside a codeql database source archive.
 
 It is left as a matter of user preference whether to invoke `codeql-xref-backend` themselves, or to deal with a single layer of indirection and wait for one of the xref API to invoke it for them.
+
+`codeql-database-grep` (`g` in the query server transient) searches the source archive of the active database for a regexp and lists the matches in an xref buffer. With a prefix argument it prompts for a wildcard to restrict the searched files, e.g. `*.java`. Archive files visited from those matches are set up like ones opened from a result buffer, so the codeql xref backend is available in them right away.
 
 ### AST Viewer
 

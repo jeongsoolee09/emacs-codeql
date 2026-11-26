@@ -6904,6 +6904,58 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
         (codeql--database-open-file full-file-path))
     (message "No active database.")))
 
+(declare-function xref-matches-in-directory "xref")
+(declare-function xref-show-xrefs "xref")
+(defvar xref-after-jump-hook)
+
+(defvar codeql--database-grep-query-buffers nil
+  "Alist of (SOURCE-ARCHIVE-ROOT . QUERY-BUFFER) of `codeql-database-grep'.")
+
+(defun codeql--database-grep-after-jump ()
+  "Set up a source archive file visited from `codeql-database-grep' matches.
+
+Like files visited from results, it is associated with the query buffer
+that searched it, made read-only and gets the codeql xref backend."
+  (when-let* ((file (buffer-file-name))
+              ((not (buffer-live-p codeql--org-query-buffer)))
+              (entry (cl-find-if (lambda (entry)
+                                   (and (buffer-live-p (cdr entry))
+                                        (string-prefix-p (file-name-as-directory (car entry))
+                                                         file)))
+                                 codeql--database-grep-query-buffers)))
+    (setq codeql--org-query-buffer (cdr entry))
+    (setq buffer-read-only t)
+    (codeql-xref-backend)))
+
+(defun codeql-database-grep (regexp &optional files)
+  "Search the source archive of the active database for REGEXP.
+
+Matches are shown with `xref-show-xrefs', and the files visited from
+them are set up like those of result locations, see
+`codeql--database-grep-after-jump'.  With a prefix argument, prompt for
+the FILES wildcard to search, which defaults to all files."
+  (interactive
+   (progn
+     (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+     (list (read-regexp "Search database source for regexp: " 'find-tag-default-as-regexp)
+           (when current-prefix-arg
+             (read-string "In files matching wildcard: " "*")))))
+  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (unless (and codeql--active-database
+               codeql--database-source-archive-root
+               (codeql--file-exists-p codeql--database-source-archive-root))
+    (user-error "No active database with an extracted source archive"))
+  (require 'xref)
+  (let ((root (codeql--tramp-wrap codeql--database-source-archive-root)))
+    (setf (alist-get root codeql--database-grep-query-buffers nil nil #'equal)
+          (current-buffer))
+    (add-hook 'xref-after-jump-hook #'codeql--database-grep-after-jump)
+    (xref-show-xrefs
+     (lambda ()
+       (or (xref-matches-in-directory regexp (or files "*") root nil)
+           (user-error "No matches for %s in the database source archive" regexp)))
+     nil)))
+
 (transient-define-prefix codeql-transient-query-server-interact ()
   "Interact with a CodeQL query server via transient menu."
   [:class transient-columns
@@ -6922,6 +6974,7 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
             (lambda ()
               (codeql-query-server-active-database)))
            ("f" "file" codeql-database-open-source-archive-file)
+           ("g" "grep" codeql-database-grep)
            ("k" "known" codeql-database-history)
            ("u" "unlock" codeql-database-delete-lock)]
           ["Query"
