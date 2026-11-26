@@ -404,6 +404,8 @@ project directory, and it is started on demand."
 (defcustom codeql-use-gh-codeql-extension-when-available t
   "If emacs-codeql detects the presence of a codeql enabled gh cli, use it.
 
+Detection happens once per host, see `codeql-clear-cli-cache'.
+
 See https://github.com/github/gh-codeql for more information."
   :type 'boolean
   :group 'emacs-codeql)
@@ -457,6 +459,49 @@ Leave nil for default.")
       (eql 0 (with-temp-buffer
                (process-file "gh" nil `(,(current-buffer) nil) nil "codeql")))
     (error nil)))
+
+(defvar codeql--cli-cache (make-hash-table :test #'equal)
+  "The CodeQL CLI command of each host, see `codeql--cli-for-host'.")
+
+(defun codeql-clear-cli-cache ()
+  "Forget which CodeQL CLI command was picked for each host.
+
+Use this after installing or removing the gh codeql extension, or the
+CodeQL CLI of a remote host, so newly opened QL buffers pick again."
+  (interactive)
+  (clrhash codeql--cli-cache)
+  (message "Cleared the CodeQL CLI cache."))
+
+(defun codeql--cli-for-host ()
+  "Return the CodeQL CLI command to use for `default-directory'.
+
+Deciding involves running gh, and for remote hosts finding the CLI, so
+the decision is cached per host, see `codeql-clear-cli-cache'."
+  (let ((key (list (file-remote-p default-directory)
+                   codeql-cli
+                   codeql-use-gh-codeql-extension-when-available)))
+    (or (gethash key codeql--cli-cache)
+        (puthash key (codeql--cli-for-host-uncached) codeql--cli-cache))))
+
+(defun codeql--cli-for-host-uncached ()
+  "Return the CodeQL CLI command to use for `default-directory'."
+  (cond
+   ;; decide whether we want to use the gh cli to run our codeql commands
+   ((and codeql-use-gh-codeql-extension-when-available
+         (codeql--gh-codeql-cli-available-p))
+    (message "Enabling gh cli codeql extension use.")
+    (list (executable-find "gh" (file-remote-p default-directory)) "codeql"))
+   ;; if we're in a remote context, make absolutely sure we know where the cli lives
+   ((file-remote-p default-directory)
+    (let ((remote-path
+           (string-trim-right
+            (or (executable-find "codeql" t)
+                (expand-file-name
+                 (read-file-name "Need remote path to codeql cli bin: "
+                                 nil default-directory t))))))
+      (message "Setting remote codeql cli path: %s" remote-path)
+      (list (codeql--tramp-unwrap remote-path))))
+   (t (list codeql-cli))))
 
 (defun codeql--cli-buffer-local-as-string ()
   (mapconcat #'identity codeql--cli-buffer-local " "))
@@ -601,26 +646,8 @@ target, which looks like USER@HOST.PID:BOOT-TIME."
 (defun codeql--buffer-local-init-hook ()
   "Set up a codeql buffer context correctly."
 
-  ;; use whatever the current config for codeql-cli and codeql-search-paths is
-  (setq codeql--cli-buffer-local (list codeql-cli))
-
-  ;; decide whether we want to use the gh cli to run our codeql commands
-  (if (and codeql-use-gh-codeql-extension-when-available
-           (codeql--gh-codeql-cli-available-p))
-      (progn
-        (message "Enabling gh cli codeql extension use.")
-        (setq codeql--cli-buffer-local
-              (list (executable-find "gh" (file-remote-p default-directory)) "codeql")))
-    ;; if we're in a remote context, make absolutely sure we know where the cli lives
-    (when (and (file-remote-p default-directory))
-      (let ((remote-path
-             (string-trim-right
-              (or (executable-find "codeql" t)
-                  (expand-file-name
-                   (read-file-name "Need remote path to codeql cli bin: "
-                                   nil default-directory t))))))
-        (message "Setting remote codeql cli path: %s" remote-path)
-        (setq codeql--cli-buffer-local (list (codeql--tramp-unwrap remote-path))))))
+  ;; decide between codeql-cli and the gh cli codeql extension
+  (setq codeql--cli-buffer-local (copy-sequence (codeql--cli-for-host)))
 
   ;; ensure we have somewhere to store result data in both local and remote contexts
   (codeql--init-state-dirs)
