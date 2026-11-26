@@ -28,6 +28,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Compatible with [github/gh-codeql](https://github.com/github/gh-codeql) for cli version management
 - Database source archive xref backend support
 - AST Viewer with xref backend support
+- Rendering of graph results with graphviz, and a CFG viewer
 
 ## Requirements
 
@@ -310,6 +311,12 @@ It is left as a matter of user preference whether to invoke `codeql-xref-backend
 ### AST Viewer
 
 Just like the vscode extension, `emacs-codeql` lets you browse the AST of a database source archive file. Similar to the other results buffers, the AST is rendered as an org-mode tree. You can invoke the AST viewer with `M-x RET codeql-view-ast RET` for a database source archive file.
+
+### Graph results and the CFG Viewer
+
+Results of `@kind graph` queries are interpreted as graphviz dot files with `codeql bqrs interpret --format=dot`. When graphviz's `dot` is installed they are rendered to an image, as set by `codeql-graph-format` (`svg` by default, or `png`), and shown in `image-mode`. Otherwise, or when `codeql-graph-format` is `nil`, the dot file itself is opened.
+
+`M-x RET codeql-view-cfg RET` shows the control flow graph of the function at point in a database source archive file, like the vscode extension's CFG viewer. It runs the printCfg query of the database language's library pack, which is available for e.g. C/C++, C#, Java, Python, Ruby and Swift.
 
 ![screenshot](img/codeql-ast-viewer.png?raw=true "emacs-codeql")
 
