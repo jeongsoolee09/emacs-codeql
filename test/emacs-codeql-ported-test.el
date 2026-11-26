@@ -22,6 +22,9 @@
 (require 'xref)
 (require 'emacs-codeql)
 
+;; org is loaded lazily, bind its hook dynamically before it is
+(defvar org-mode-hook)
+
 (defmacro codeql-ported-test--with-temp-dir (dir &rest body)
   "Run BODY with DIR bound to a new temporary directory, deleted afterwards."
   (declare (indent 1) (debug t))
