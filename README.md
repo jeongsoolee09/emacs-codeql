@@ -29,6 +29,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Database source archive xref backend support
 - Searching the database source archive with `codeql-database-grep`
 - GitHub permalinks to the results of SARIF files with version control provenance
+- A `codeql-doctor` health report of the setup
 - AST Viewer with xref backend support
 - Rendering of graph results with graphviz, and a CFG viewer
 
@@ -340,6 +341,8 @@ All query server interaction for your query buffer routes via an intuitive `tran
 This interface is self-documenting and allows you to start/stop query servers, select databases, run queries, and fetch query history.
 
 Otherwise hidden features such as max path depths for path queries are unobtrusively surfaced to the user.
+
+`codeql-doctor` (`D` in the transient, or `M-x codeql-doctor` from any buffer) reports on the health of your setup, much like Neovim's `:checkhealth`: the tree-sitter and eglot support, the CodeQL CLI and its version, the gh codeql extension, configured search paths, the external tools (`unzip`, `zipinfo`, graphviz `dot`) on the host of the current buffer, and the query server, database and language server state of the current query buffer.
 
 ### Paginated results
 
