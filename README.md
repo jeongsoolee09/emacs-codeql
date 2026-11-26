@@ -252,7 +252,7 @@ Every results buffer is a regular org document with the same layout:
 * Query Source                 ← folded when the buffer is opened
 :PROPERTIES:
 :CODEQL_KIND: query-source
-:CODEQL_EVALUATION: query      ← or quick-eval, quick-eval-count
+:CODEQL_EVALUATION: query      ← or quick-eval, quick-eval-count, sarif, variant-analysis
 :CODEQL_QUERY: /path/to/query.ql
 :CODEQL_DATABASE: /path/to/db
 :END:
@@ -286,7 +286,7 @@ from int x where x in [1 .. 5] select x
 * Results Footer
 ```
 
-`Query Source` records what produced the results: a link to the query file that was run, and for quick evaluations the exact code that was submitted, captured when you ran it, so later edits to the query buffer don't change it. Expand it with `TAB` as usual. Rows of raw results rendered as headings (`outline` style) carry `CODEQL_RESULT_SET`, `CODEQL_ROW`, the location properties of their first location, and one `CODEQL_COL_<NAME>` property per column. `CODEQL_FILE` is the path of the file in the analyzed project, the links point into the source archive of the database.
+`Query Source` records what produced the results: a link to the query file that was run, and for quick evaluations the exact code that was submitted, captured when you ran it, so later edits to the query buffer don't change it. Results of `codeql-load-sarif` and `codeql-mrva` record their origin there too, see below. Expand it with `TAB` as usual. Rows of raw results rendered as headings (`outline` style) carry `CODEQL_RESULT_SET`, `CODEQL_ROW`, the location properties of their first location, and one `CODEQL_COL_<NAME>` property per column. `CODEQL_FILE` is the path of the file in the analyzed project, the links point into the source archive of the database.
 
 ##### Searching results with org-ql
 
@@ -324,6 +324,8 @@ The rows only found in the first run and those only found in the second run are 
 
 When the query buffer has an active database, result locations are taken to be files of its source archive, so that they work with the database source archive xref backend like regular results. With a prefix argument, or without an active database, they are taken to be files of a source checkout instead, which is prompted for when the SARIF has relative locations that its `originalUriBaseIds` don't resolve. Locations missing from the checkout whose contents are embedded in the SARIF (`codeql database analyze --sarif-add-file-contents`) are shown from a read-only copy of those contents.
 
+The `Query Source` section of the results describes the SARIF file: `CODEQL_EVALUATION` is `sarif`, `CODEQL_SARIF` its path, `CODEQL_TOOL` the tools that produced it, `CODEQL_REPOSITORY_URI` and `CODEQL_REVISION_ID` its version control provenance, if any. An `Originating SARIF` heading links to the file, and a `Rules` heading lists the rules that results were reported for, with their names.
+
 When the SARIF records the repository and revision it was produced for in its `versionControlProvenance`, as code scanning and variant analysis results do, `codeql-copy-permalink` copies a GitHub permalink to the result location at point, and `codeql-browse-permalink` opens it in a browser. They work on the links of the results buffer and in source files visited from them, where an active region links to its range of lines. For example:
 
 ```elisp
@@ -336,6 +338,8 @@ When the SARIF records the repository and revision it was produced for in its `v
 `codeql-mrva` (`v` in the query server transient) browses the results of [gh-mrva](https://github.com/GitHubSecurityLab/gh-mrva) sessions, which you submit with `gh mrva submit`. Install the extension with `gh extension install GitHubSecurityLab/gh-mrva`.
 
 After picking a session, its repositories with findings are listed in a `codeql-mrva-mode` buffer, along with their finding and star counts. `RET` downloads the results of the repository at point below `codeql-state-dir` and renders them for the query buffer `codeql-mrva` was called from, like `codeql-load-sarif` does. `g` refreshes the status of the session. The source files of result locations are fetched from GitHub with `gh api` as you visit them, at the revision that was analyzed, and `codeql-copy-permalink` works on them too. Results of queries that aren't problem or path-problem queries are shown decoded.
+
+The `Query Source` section of variant analysis results holds the whole query as it was submitted, in a `Submitted Query` src block. It is taken from the query pack of the run, which is fetched from the controller repository with `gh api` once per run, so later edits to the query file don't change it. When the pack can't be fetched, the query file as it is now is shown instead, and said so. `CODEQL_EVALUATION` is `variant-analysis`, and `CODEQL_MRVA_SESSION`, `CODEQL_MRVA_RUN`, `CODEQL_MRVA_CONTROLLER` and `CODEQL_MRVA_REPOSITORY` record where the results came from, along with the properties of the downloaded SARIF file.
 
 #### Query performance
 

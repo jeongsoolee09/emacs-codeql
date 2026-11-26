@@ -2599,17 +2599,32 @@ comma, which org removes again when the block is read or edited.  The
 
 See `codeql--results-context'."
   (let* ((provenance (plist-get context :provenance))
+         (kind (plist-get provenance :kind))
          (path (plist-get provenance :path))
-         (quick-eval (eq (plist-get provenance :kind) 'quick-eval)))
+         (quick-eval (eq kind 'quick-eval))
+         (sarif (memq kind '(sarif mrva)))
+         (mrva (eq kind 'mrva)))
     (concat
      "* Query Source\n"
      (codeql--org-property-drawer
       `(("CODEQL_KIND" . "query-source")
-        ("CODEQL_EVALUATION" . ,(cond ((not quick-eval) "query")
+        ("CODEQL_EVALUATION" . ,(cond (mrva "variant-analysis")
+                                      (sarif "sarif")
+                                      ((not quick-eval) "query")
                                       ((plist-get provenance :count) "quick-eval-count")
                                       (t "quick-eval")))
         ("CODEQL_QUERY" . ,path)
         ("CODEQL_DATABASE" . ,(plist-get context :database))
+        ,@(when mrva
+            `(("CODEQL_MRVA_SESSION" . ,(plist-get provenance :session))
+              ("CODEQL_MRVA_RUN" . ,(plist-get provenance :run))
+              ("CODEQL_MRVA_CONTROLLER" . ,(plist-get provenance :controller))
+              ("CODEQL_MRVA_REPOSITORY" . ,(plist-get provenance :repository))))
+        ,@(when sarif
+            `(("CODEQL_SARIF" . ,(plist-get provenance :sarif))
+              ("CODEQL_TOOL" . ,(string-join (plist-get provenance :tools) ", "))
+              ("CODEQL_REPOSITORY_URI" . ,(plist-get provenance :repository-uri))
+              ("CODEQL_REVISION_ID" . ,(plist-get provenance :revision-id))))
         ("VISIBILITY" . "folded")))
      (when path
        (concat "** Originating Query\n" (codeql--org-file-link path) "\n"))
@@ -2629,7 +2644,37 @@ See `codeql--results-context'."
                                         (format "%s:%s:%s" (file-name-nondirectory path)
                                                 line (or column 1))))
                     ""))
-          (codeql--org-src-block (or (plist-get provenance :source) ""))))))))
+          (codeql--org-src-block (or (plist-get provenance :source) "")))))
+     (when mrva
+       (concat
+        "** Submitted Query\n"
+        (if-let ((source (plist-get provenance :source)))
+            (concat
+             (if (plist-get provenance :source-submitted)
+                 (format "The query of run %s, as submitted to %s:\n"
+                         (plist-get provenance :run) (plist-get provenance :controller))
+               (format "The query pack of run %s could not be fetched, %s:\n"
+                       (plist-get provenance :run)
+                       "this is the query file as it is now"))
+             (codeql--org-src-block source))
+          (format "The query of run %s could not be found.\n" (plist-get provenance :run)))))
+     (when sarif
+       (concat
+        (when-let ((sarif-path (plist-get provenance :sarif)))
+          (concat "** Originating SARIF\n" (codeql--org-file-link sarif-path) "\n"))
+        (when-let ((rules (plist-get provenance :rules)))
+          (concat "** Rules\n"
+                  (mapconcat (lambda (rule)
+                               (format "- %s%s\n"
+                                       (codeql--org-text (plist-get rule :id))
+                                       (if-let ((name (seq-find
+                                                       (lambda (name)
+                                                         (and name (not (equal name (plist-get rule :id)))))
+                                                       (list (plist-get rule :name)
+                                                             (plist-get rule :description)))))
+                                           (concat ": " (codeql--org-text name))
+                                         "")))
+                             rules ""))))))))
 
 (defun codeql--results-section-org (context)
   "Return the heading of the Results section for the results of CONTEXT."
@@ -5688,7 +5733,56 @@ ARTIFACTS-DIR."
                         "unknown-rule")))
       (nconc result (list (cons 'ruleId rule-id))))))
 
-(defun codeql-load-sarif (sarif-path &optional checkout-dir)
+(defun codeql--sarif-rule-provenance (json results)
+  "Return the rules of the parsed SARIF JSON that RESULTS were reported for.
+
+Each rule is a plist of its :id, and its :name and :description when
+the SARIF has them."
+  (let ((ids (delete-dups (cl-loop for result across results
+                                   collect (alist-get 'ruleId result))))
+        (rules (make-hash-table :test #'equal)))
+    (cl-loop for run across (or (json-pointer-get json "/runs") [])
+             do (cl-loop for component in (cons (json-pointer-get run "/tool/driver")
+                                                (append (json-pointer-get run "/tool/extensions")
+                                                        nil))
+                         do (cl-loop for rule across (or (alist-get 'rules component) [])
+                                     for id = (alist-get 'id rule)
+                                     when (and id (not (gethash id rules)))
+                                     do (puthash id rule rules))))
+    (mapcar (lambda (id)
+              (let ((rule (gethash id rules)))
+                (list :id id
+                      :name (or (alist-get 'name (alist-get 'properties rule))
+                                (alist-get 'name rule))
+                      :description (json-pointer-get rule "/shortDescription/text"))))
+            (sort (delq nil ids) #'string<))))
+
+(defun codeql--sarif-tools (json)
+  "Return the names and versions of the tools that produced the parsed SARIF JSON."
+  (delete-dups
+   (cl-loop for run across (or (json-pointer-get json "/runs") [])
+            for driver = (json-pointer-get run "/tool/driver")
+            for name = (alist-get 'name driver)
+            for version = (or (alist-get 'semanticVersion driver) (alist-get 'version driver))
+            when name
+            collect (if version (format "%s %s" name version) name))))
+
+(defun codeql--sarif-provenance-plist (json sarif-path results)
+  "Return the provenance of the RESULTS of the SARIF JSON at SARIF-PATH.
+
+See `codeql--query-provenance', its :kind is `sarif'.  :sarif is
+SARIF-PATH, :tools the tools that produced it, :rules the rules that
+RESULTS were reported for, see `codeql--sarif-rule-provenance', and
+:repository-uri and :revision-id its version control provenance."
+  (let ((version-control (codeql--sarif-provenance json)))
+    (list :kind 'sarif
+          :sarif sarif-path
+          :tools (codeql--sarif-tools json)
+          :rules (codeql--sarif-rule-provenance json results)
+          :repository-uri (car version-control)
+          :revision-id (cdr version-control))))
+
+(defun codeql-load-sarif (sarif-path &optional checkout-dir provenance)
   "Render the results of the SARIF file at SARIF-PATH.
 
 This shows SARIF produced outside of this query buffer, e.g. by
@@ -5702,7 +5796,12 @@ without an active database, they are taken to be files of the source
 checkout at CHECKOUT-DIR instead, which is prompted for when the SARIF
 contains relative locations its `originalUriBaseIds' don't resolve.
 Locations that are missing from the checkout, but whose contents are
-embedded in the SARIF, are shown from a copy of those contents."
+embedded in the SARIF, are shown from a copy of those contents.
+
+The Query Source section of the results describes the SARIF file, see
+`codeql--sarif-provenance-plist'.  PROVENANCE is a plist that takes
+precedence over that description, e.g. a :kind of `mrva' for the results
+of a variant analysis, see `codeql-mrva-load-results'."
   (interactive
    (list (read-file-name "SARIF file: " nil nil t nil
                          (lambda (f) (or (file-directory-p f)
@@ -5775,7 +5874,13 @@ embedded in the SARIF, are shown from a copy of those contents."
                                   ,artifacts-dir))))))
            "")))
        (file-name-nondirectory sarif-path)
-       (unless database-p "")))))
+       (unless database-p "")
+       (list :provenance (append provenance
+                                 (codeql--sarif-provenance-plist json sarif-path results))
+             :database (and database-p (directory-file-name codeql--active-database))
+             :query-kind (if (seq-some (lambda (result) (alist-get 'codeFlows result)) results)
+                             "path-problem"
+                           "problem"))))))
 
 ;; permalinks to the results of SARIF files with version control provenance
 
@@ -6101,8 +6206,87 @@ refreshes the session status.
   (tabulated-list-init-header)
   (setq header-line-format (codeql--mrva-header-line)))
 
-(defun codeql--mrva-show-results (repo directory query-buffer)
-  "Show the downloaded results of REPO in DIRECTORY for QUERY-BUFFER."
+(defun codeql--mrva-query-pack-query (directory query)
+  "Return the file of QUERY in the query pack extracted to DIRECTORY, or nil.
+
+The dependencies bundled with the pack are left out.  Without a file of
+the same name as QUERY, a pack of a single query has that one."
+  (when (file-directory-p directory)
+    (let ((files (seq-remove (lambda (file) (string-match-p "/\\.codeql/" file))
+                             (directory-files-recursively directory "\\.ql\\'"))))
+      (or (and query
+               (seq-find (lambda (file)
+                           (equal (file-name-nondirectory file) (file-name-nondirectory query)))
+                         files))
+          (and (= (length files) 1) (car files))))))
+
+(defun codeql--mrva-fetch-query-pack (controller run-id directory)
+  "Fetch the query pack of the variant analysis RUN-ID of CONTROLLER.
+
+The pack is extracted to DIRECTORY.  Return non-nil on success."
+  (require 'url)
+  (when-let* ((analysis (codeql--gh-json
+                         "api" (format "repos/%s/code-scanning/codeql/variant-analyses/%s"
+                                       controller run-id)))
+              (url (alist-get 'query_pack_url analysis)))
+    (let ((archive (make-temp-file "codeql-mrva-pack" nil ".tgz")))
+      (unwind-protect
+          (progn
+            (url-copy-file url archive t)
+            (make-directory directory t)
+            (or (eql 0 (call-process "tar" nil nil nil "-xzf" archive "-C" directory))
+                (progn (delete-directory directory t) nil)))
+        (delete-file archive)))))
+
+(defun codeql--mrva-submitted-query (controller run-id query)
+  "Return the text of QUERY as submitted in the variant analysis RUN-ID.
+
+The text is taken from the query pack of the run, which is fetched from
+CONTROLLER once.  Return (TEXT . t) for the submitted text, (TEXT . nil)
+for the text of the QUERY file as it is now when the pack can't be
+fetched, or nil when neither is available."
+  (let ((directory (codeql--mrva-directory "queries" (format "%s" run-id))))
+    (when (and controller (not (file-directory-p directory)))
+      (message "Fetching the query pack of run %s..." run-id)
+      (condition-case err
+          (codeql--mrva-fetch-query-pack controller run-id directory)
+        (error (message "Fetching the query pack of run %s failed: %s"
+                        run-id (error-message-string err)))))
+    (if-let ((file (codeql--mrva-query-pack-query directory query)))
+        (cons (codeql--file-text file) t)
+      (when (and query (file-name-absolute-p query) (file-readable-p query))
+        (cons (codeql--file-text query) nil)))))
+
+(defun codeql--file-text (file)
+  "Return the contents of FILE as a string."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (buffer-string)))
+
+(defun codeql--mrva-provenance (session repo)
+  "Return the provenance of the results of REPO in the gh-mrva SESSION.
+
+See `codeql--query-provenance', its :kind is `mrva'.  :source holds the
+whole query that ran, see `codeql--mrva-submitted-query'."
+  (let* ((run-id (alist-get 'run_id repo))
+         (query (alist-get 'query repo))
+         (controller (alist-get 'controller
+                                (seq-find (lambda (info) (equal (alist-get 'name info) session))
+                                          (ignore-errors (codeql--mrva-sessions)))))
+         (submitted (codeql--mrva-submitted-query controller run-id query)))
+    (list :kind 'mrva
+          :path (and query (file-name-absolute-p query) (file-exists-p query) query)
+          :session session
+          :run run-id
+          :controller controller
+          :repository (alist-get 'nwo repo)
+          :source (car submitted)
+          :source-submitted (cdr submitted))))
+
+(defun codeql--mrva-show-results (repo directory query-buffer &optional session)
+  "Show the downloaded results of REPO in DIRECTORY for QUERY-BUFFER.
+
+SESSION is the gh-mrva session of REPO, see `codeql--mrva-provenance'."
   (let* ((nwo (alist-get 'nwo repo))
          (run-id (alist-get 'run_id repo))
          (base (expand-file-name (format "%s_%s" (string-replace "/" "_" nwo) run-id)
@@ -6115,8 +6299,9 @@ refreshes the session status.
      ((file-exists-p sarif)
       (let ((sources (codeql--mrva-sources-directory nwo run-id)))
         (make-directory sources t)
-        (with-current-buffer query-buffer
-          (codeql-load-sarif sarif sources))))
+        (let ((provenance (codeql--mrva-provenance session repo)))
+          (with-current-buffer query-buffer
+            (codeql-load-sarif sarif sources provenance)))))
      ((file-exists-p bqrs)
       (let ((text (with-current-buffer query-buffer
                     (codeql--cli-command-to-string
@@ -6145,10 +6330,11 @@ was analyzed.  Raw BQRS results are shown decoded."
          (base (expand-file-name (format "%s_%s" (string-replace "/" "_" nwo) run-id)
                                  directory))
          (query-buffer codeql--mrva-query-buffer)
+         (session codeql--mrva-session)
          (gh (or (executable-find "gh")
                  (user-error "The gh CLI was not found, see https://cli.github.com"))))
     (if (or (file-exists-p (concat base ".sarif")) (file-exists-p (concat base ".bqrs")))
-        (codeql--mrva-show-results repo directory query-buffer)
+        (codeql--mrva-show-results repo directory query-buffer session)
       (make-directory directory t)
       (message "Downloading the results of %s..." nwo)
       (let ((output (generate-new-buffer " *codeql-mrva-download*")))
@@ -6169,7 +6355,7 @@ was analyzed.  Raw BQRS results are shown decoded."
                  (message "The results of %s are not ready yet" nwo))
                 ((not (eql (process-exit-status process) 0))
                  (message "Downloading the results of %s failed: %s" nwo text))
-                (t (codeql--mrva-show-results repo directory query-buffer)))))))))))
+                (t (codeql--mrva-show-results repo directory query-buffer session)))))))))))
 
 ;; request cancellation control
 

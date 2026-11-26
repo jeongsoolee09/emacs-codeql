@@ -660,5 +660,183 @@ sent, and `codeql-load-bqrs' pushes (:loaded BQRS-PATH PROVENANCE)."
             (should (eq (plist-get codeql--raw-results-pagination :style) 'table))
             (should-not (codeql-test--result-properties buffer))))))))
 
+;;; Provenance of loaded SARIF and variant analysis results
+
+(defconst codeql-test--sarif-file
+  (format "{\"runs\": [{
+     \"tool\": {\"driver\": {\"name\": \"CodeQL\", \"semanticVersion\": \"2.19.0\",
+                           \"rules\": [{\"id\": \"js/unused\", \"name\": \"js/unused\"}]},
+              \"extensions\": [{\"name\": \"codeql/javascript-queries\",
+                \"rules\": [{\"id\": \"js/xss\",
+                             \"shortDescription\": {\"text\": \"Cross-site scripting\"},
+                             \"properties\": {\"name\": \"Client-side XSS\"}},
+                            {\"id\": \"js/sql-injection\", \"name\": \"js/sql-injection\"}]}]},
+     \"versionControlProvenance\": [{\"repositoryUri\": \"https://github.com/octo/app\",
+                                     \"revisionId\": \"c0ffee\"}],
+     \"results\": %s}]}"
+          codeql-test--sarif)
+  "A SARIF file of `codeql-test--sarif' that describes its tool and rules.")
+
+(defun codeql-test--load-sarif (sarif-path &optional provenance)
+  "Load SARIF-PATH like `codeql-load-sarif' does, return its results buffer."
+  (codeql-test--new-results-buffer
+   (lambda ()
+     (setq codeql--active-database "/dbs/js-db/")
+     (codeql-load-sarif sarif-path nil provenance))))
+
+(defun codeql-test--query-source-properties (buffer)
+  "Return the properties of the Query Source heading of BUFFER."
+  (with-current-buffer buffer
+    (codeql-test--goto-heading "Query Source")
+    (org-entry-properties nil 'standard)))
+
+(ert-deftest codeql-test-sarif-provenance ()
+  "Loaded SARIF results describe the SARIF file in their Query Source section."
+  (codeql-test--with-query-buffer
+    (let* ((dir (make-temp-file "codeql-test-sarif" t))
+           (sarif (expand-file-name "out.sarif" dir)))
+      (with-temp-file sarif (insert codeql-test--sarif-file))
+      (let* ((buffer (codeql-test--load-sarif sarif))
+             (props (codeql-test--query-source-properties buffer)))
+        (should (equal (codeql-test--headlines buffer)
+                       '((1 "query-source") (2 nil) (2 nil)
+                         (1 "results") (2 "result") (3 nil) (2 "result")
+                         (1 nil))))
+        (should (equal (cdr (assoc "CODEQL_EVALUATION" props)) "sarif"))
+        (should (equal (cdr (assoc "CODEQL_SARIF" props)) sarif))
+        (should (equal (cdr (assoc "CODEQL_TOOL" props)) "CodeQL 2.19.0"))
+        (should (equal (cdr (assoc "CODEQL_DATABASE" props)) "/dbs/js-db"))
+        (should (equal (cdr (assoc "CODEQL_REPOSITORY_URI" props)) "https://github.com/octo/app"))
+        (should (equal (cdr (assoc "CODEQL_REVISION_ID" props)) "c0ffee"))
+        (should-not (assoc "CODEQL_QUERY" props))
+        (should (equal (codeql-test--links buffer "file") (list sarif)))
+        (with-current-buffer buffer
+          (codeql-test--goto-heading "Results$")
+          (should (equal (org-entry-get nil "CODEQL_QUERY_KIND") "path-problem"))
+          ;; only the rules that results were reported for, from any tool component
+          (codeql-test--goto-heading "Rules$")
+          (should (equal (string-replace
+                          "\u200b" ""
+                          (buffer-substring-no-properties
+                           (line-beginning-position 2) (progn (org-end-of-subtree) (point))))
+                         "- js/sql-injection\n- js/xss: Client-side XSS")))))))
+
+(ert-deftest codeql-test-sarif-provenance-precedence ()
+  "Provenance passed to `codeql-load-sarif' takes precedence over the SARIF's."
+  (codeql-test--with-query-buffer
+    (let* ((dir (make-temp-file "codeql-test-sarif" t))
+           (sarif (expand-file-name "out.sarif" dir)))
+      (with-temp-file sarif (insert codeql-test--sarif-file))
+      (let ((props (codeql-test--query-source-properties
+                    (codeql-test--load-sarif sarif '(:kind mrva :run 42 :session "s1")))))
+        (should (equal (cdr (assoc "CODEQL_EVALUATION" props)) "variant-analysis"))
+        (should (equal (cdr (assoc "CODEQL_MRVA_RUN" props)) "42"))
+        (should (equal (cdr (assoc "CODEQL_SARIF" props)) sarif))))))
+
+(defmacro codeql-test--with-mrva (pack-query &rest body)
+  "Run BODY with a state dir, gh and downloads stubbed out for gh-mrva.
+
+The query pack of run 42 holds PACK-QUERY as queries/Xss.ql, unless it
+is nil.  `gh' calls are pushed onto `calls'."
+  (declare (indent 1) (debug t))
+  `(let* ((codeql-state-dir (file-name-as-directory (make-temp-file "codeql-test-state" t)))
+          (pack (expand-file-name "pack" codeql-state-dir))
+          (archive (expand-file-name "pack.tgz" codeql-state-dir))
+          (calls nil))
+     (when ,pack-query
+       (make-directory (expand-file-name "queries" pack) t)
+       (make-directory (expand-file-name ".codeql/libraries/dep" pack) t)
+       (with-temp-file (expand-file-name "queries/Xss.ql" pack) (insert ,pack-query))
+       (with-temp-file (expand-file-name ".codeql/libraries/dep/Xss.ql" pack) (insert "dep"))
+       (with-temp-file (expand-file-name "qlpack.yml" pack) (insert "name: q\n"))
+       (should (eql 0 (call-process "tar" nil nil nil "-czf" archive "-C" pack "."))))
+     (cl-letf (((symbol-function 'codeql--gh)
+                (lambda (&rest args)
+                  (push args calls)
+                  (pcase args
+                    (`("mrva" "list" "--json")
+                     "[{\"name\": \"s1\", \"controller\": \"octo/controller\"}]")
+                    (`("api" ,_)
+                     (if (file-exists-p archive)
+                         "{\"query_pack_url\": \"https://objects.example.com/pack?sig=1\"}"
+                       (error "HTTP 404"))))))
+               ((symbol-function 'url-copy-file)
+                (lambda (url file &rest _)
+                  (should (equal url "https://objects.example.com/pack?sig=1"))
+                  (copy-file archive file t)))
+               ((symbol-function 'message) #'ignore))
+       ,@body)))
+
+(ert-deftest codeql-test-mrva-provenance ()
+  "Variant analysis results hold the whole query as it was submitted."
+  (codeql-test--with-mrva "from int x\nselect x\n"
+    (let* ((local (expand-file-name "Xss.ql" codeql-state-dir))
+           (repo `((nwo . "octo/app") (run_id . 42) (query . ,local))))
+      (with-temp-file local (insert "edited since"))
+      (let ((provenance (codeql--mrva-provenance "s1" repo)))
+        (should (equal (plist-get provenance :kind) 'mrva))
+        (should (equal (plist-get provenance :controller) "octo/controller"))
+        (should (equal (plist-get provenance :repository) "octo/app"))
+        (should (equal (plist-get provenance :path) local))
+        (should (equal (plist-get provenance :source) "from int x\nselect x\n"))
+        (should (plist-get provenance :source-submitted))
+        (should (member '("api" "repos/octo/controller/code-scanning/codeql/variant-analyses/42")
+                        calls)))
+      ;; the pack is fetched once
+      (setq calls nil)
+      (should (equal (plist-get (codeql--mrva-provenance "s1" repo) :source)
+                     "from int x\nselect x\n"))
+      (should-not (assoc "api" calls))
+      ;; and shown in the results
+      (codeql-test--with-query-buffer
+        (let* ((sarif (expand-file-name "octo_app_42.sarif" codeql-state-dir))
+               (buffer (progn (with-temp-file sarif (insert codeql-test--sarif-file))
+                              (codeql-test--load-sarif
+                               sarif (codeql--mrva-provenance "s1" repo))))
+               (props (codeql-test--query-source-properties buffer)))
+          (should (equal (cdr (assoc "CODEQL_EVALUATION" props)) "variant-analysis"))
+          (should (equal (cdr (assoc "CODEQL_QUERY" props)) local))
+          (should (equal (cdr (assoc "CODEQL_MRVA_SESSION" props)) "s1"))
+          (should (equal (cdr (assoc "CODEQL_MRVA_RUN" props)) "42"))
+          (should (equal (cdr (assoc "CODEQL_MRVA_CONTROLLER" props)) "octo/controller"))
+          (should (equal (cdr (assoc "CODEQL_MRVA_REPOSITORY" props)) "octo/app"))
+          (should (equal (cdr (assoc "CODEQL_SARIF" props)) sarif))
+          (should (equal (codeql-test--src-block-value buffer) "from int x\nselect x\n"))
+          (with-current-buffer buffer
+            (codeql-test--goto-heading "Submitted Query")
+            (should (looking-at-p ".*\n.*as submitted to octo/controller"))))))))
+
+(ert-deftest codeql-test-mrva-provenance-fallback ()
+  "Without the query pack, the query file as it is now is shown, and said so."
+  (codeql-test--with-mrva nil
+    (let* ((local (expand-file-name "Xss.ql" codeql-state-dir))
+           (repo `((nwo . "octo/app") (run_id . 42) (query . ,local))))
+      (let ((provenance (codeql--mrva-provenance "s1" repo)))
+        (should-not (plist-get provenance :source)))
+      (with-temp-file local (insert "select 1\n"))
+      (let ((provenance (codeql--mrva-provenance "s1" repo)))
+        (should (equal (plist-get provenance :source) "select 1\n"))
+        (should-not (plist-get provenance :source-submitted))
+        (should (string-match-p
+                 "could not be fetched, this is the query file as it is now"
+                 (codeql--results-query-source-org (list :provenance provenance))))))))
+
+(ert-deftest codeql-test-quick-eval-predicate-provenance ()
+  "Quick evaluation of the enclosing predicate records the predicate name."
+  (with-temp-buffer
+    (insert "predicate isSmall(int x) {\n  x in [1 .. 5]\n}\n")
+    (goto-char (point-min))
+    (search-forward "[1")
+    (cl-letf (((symbol-function 'codeql--enclosing-predicate-name-position)
+               (lambda (&rest _) 11)))
+      (let ((provenance (codeql--query-provenance "/q/A.ql" 'predicate)))
+        (should (equal (plist-get provenance :source) "isSmall"))
+        (should (plist-get provenance :predicate))
+        (should (equal (plist-get provenance :line) 1))
+        (should (equal (plist-get provenance :column) 11))
+        (should (string-match-p "Quick evaluation of the enclosing predicate at"
+                                (codeql--results-query-source-org
+                                 (list :provenance provenance))))))))
+
 (provide 'emacs-codeql-test)
 ;;; emacs-codeql-test.el ends here
