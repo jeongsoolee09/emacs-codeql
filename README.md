@@ -333,9 +333,23 @@ Just like the vscode extension, `emacs-codeql` lets you browse the AST of a data
 
 ### Graph results and the CFG Viewer
 
-Results of `@kind graph` queries are interpreted as graphviz dot files with `codeql bqrs interpret --format=dot` and shown in a `codeql-graph-mode` buffer. When graphviz's `dot` is installed the graph is rendered to an image, as set by `codeql-graph-format` (`svg` by default, or `png`); otherwise, or when `codeql-graph-format` is `nil`, the dot source is shown.
+Results of `@kind graph` queries are interpreted as graphviz dot files with `codeql bqrs interpret --format=dot` and shown in a `codeql-graph-mode` buffer. The viewing format is set by `codeql-graph-format`: an `svg` (the default) or `png` image rendered by graphviz's `dot`, a `text` diagram, or `nil` for the dot source. When `dot` is not installed or the frame can't show images, e.g. in a terminal, the graph is drawn as text.
 
-Much like [org-graph-view](https://github.com/alphapapa/org-graph-view), the rendered nodes are clickable: `mouse-1` on a node jumps to its location in the database source archive, and `RET` lets you pick a node by its label with `completing-read`. `f` cycles the viewing format between svg, png and the dot source, and `g` re-renders the graph.
+Much like [org-graph-view](https://github.com/alphapapa/org-graph-view), the rendered nodes are clickable: `mouse-1` on a node jumps to its location in the database source archive, and `RET` lets you pick a node by its label with `completing-read`. `f` cycles the viewing format between svg, png, text and the dot source, and `g` re-renders the graph.
+
+The text diagram is drawn like `undo-tree-visualize`, one node per row with the edges running down the diagram, and edges pointing back up (e.g. of loops) noted as `^ label`:
+
+```
+  x-.  if (x)  a.js:1
+  | |
+  o |  then  a.js:2
+  | |
+  | o  else  a.js:3
+  | |
+  o-'  end  a.js:4
+```
+
+`n`/`p` (or `C-n`/`C-p`) move the selection `x` to the next node and back the way you came, `C-f`/`C-b` switch between the branches of a node, and `RET` or clicking the selected node jumps to its location; `C-u RET` picks a node by label. The predecessors and successors of the selected node are listed below the diagram as buttons. With evil, `j`/`k`/`l`/`h` move like `n`/`p`/`C-f`/`C-b`.
 
 `M-x RET codeql-view-cfg RET` shows the control flow graph of the function at point in a database source archive file, like the vscode extension's CFG viewer. It runs the printCfg query of the database language's library pack, which is available for e.g. C/C++, C#, Java, Python, Ruby and Swift. For JavaScript, which ships no printCfg query, `emacs-codeql` uses its own bundled query from the `queries` directory, so make sure your package recipe includes it (e.g. `:files (:defaults "bin" "queries")`).
 

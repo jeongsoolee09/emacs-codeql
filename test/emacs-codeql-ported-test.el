@@ -797,7 +797,7 @@ OUTPUT is called with the arguments when it is a function."
                  "<svg width=\"96\" height=\"49\"\n viewBox")))
 
 (ert-deftest codeql-ported-test-show-graph-as-dot ()
-  "Without a graph format or graphviz, the dot file is shown."
+  "Without a graph format, or graphviz for graphs not drawn as text, the dot file is shown."
   (codeql-ported-test--with-temp-dir dir
     (let ((dot (codeql-ported-test--write (concat dir "g.dot") "digraph { a -> b }")))
       (let ((codeql-graph-format nil))
@@ -806,9 +806,11 @@ OUTPUT is called with the arguments when it is a function."
           (should (equal (buffer-string) "digraph { a -> b }"))))
       (let ((codeql-graph-format "svg"))
         (cl-letf (((symbol-function 'executable-find) #'ignore))
+          ;; graphs are drawn as text instead, unless their nodes are unknown
           (codeql-ported-test--with-graph-buffer dot nil
             (should-not codeql--graph-format)
-            (should (string-match-p "Install graphviz.*\n\ndigraph" (buffer-string)))))))))
+            (should (string-match-p "\\`This graph can't be drawn as text.*\n\ndigraph"
+                                    (buffer-string)))))))))
 
 (ert-deftest codeql-ported-test-show-graph-rendered ()
   "With graphviz, the graph is rendered with an image map of its nodes."
@@ -818,7 +820,8 @@ OUTPUT is called with the arguments when it is a function."
           (codeql-graph-format "svg")
           inserted)
       (cl-letf (((symbol-function 'codeql--graph-insert-image)
-                 (lambda (image map) (push (cons image map) inserted) (insert "image"))))
+                 (lambda (image map) (push (cons image map) inserted) (insert "image")))
+                ((symbol-function 'codeql--graph-images-p) (lambda (_format) t)))
         (codeql-ported-test--with-graph-buffer dot codeql-ported-test--graph-nodes
           (should (eq codeql--org-query-buffer query-buffer))
           (should (equal codeql--graph-nodes (vconcat codeql-ported-test--graph-nodes)))
@@ -830,15 +833,21 @@ OUTPUT is called with the arguments when it is a function."
                                   (with-temp-buffer
                                     (insert-file-contents (concat dir "g.cmapx"))
                                     (buffer-string))))
-          ;; f cycles through png and the dot file back to svg
+          ;; f cycles through png, text and the dot file back to svg
           (codeql-graph-cycle-format)
           (codeql-ported-test--wait #'codeql-ported-test--graph-rendered-p)
           (should (equal (caar inserted) (concat dir "g.png")))
+          (codeql-graph-cycle-format)
+          (should (equal codeql--graph-format "text"))
+          (should (string-prefix-p "  x  a b  a.js:1\n  |\n  o  say \"hi\"\n" (buffer-string)))
           (codeql-graph-cycle-format)
           (should-not codeql--graph-format)
           (should (string-prefix-p "digraph {" (buffer-string)))
           (codeql-graph-cycle-format)
           (should (equal codeql--graph-format "svg"))
+          ;; moving before the image is shown doesn't scroll a missing image
+          (codeql-graph-next)
+          (codeql-graph-forward)
           (codeql-ported-test--wait #'codeql-ported-test--graph-rendered-p)
           (should (= (length inserted) 3)))))))
 
@@ -898,6 +907,140 @@ OUTPUT is called with the arguments when it is a function."
           ;; unknown nodes
           (setq codeql--graph-nodes nil)
           (should-error (codeql-graph-visit-node) :type 'user-error))))))
+
+(defconst codeql-ported-test--diamond-dot
+  (concat "digraph {\n  compound=true;\n"
+          "  0[\"label\"=\"if (x)\"; ];\n  1[\"label\"=\"then\"; ];\n"
+          "  2[\"label\"=\"else\"; ];\n  3[\"label\"=\"join\"; ];\n"
+          "  0 -> 1[\"label\"=\"true\"; ];\n  0 -> 2[\"label\"=\"false\"; ];\n"
+          "  1 -> 3[];\n  2 -> 3[];\n}\n")
+  "A dot file of an if statement, with labelled branches.")
+
+(defconst codeql-ported-test--diamond-nodes
+  (cl-loop for label in '("if (x)" "then" "else" "join")
+           for line from 1
+           collect (cons label (format "/arch/src/a.js::%d:1:%d:3" line line)))
+  "The nodes of `codeql-ported-test--diamond-dot'.")
+
+(ert-deftest codeql-ported-test-dot-edges ()
+  "Dot edges are read with their labels, unescaped."
+  (codeql-ported-test--with-temp-dir dir
+    (should (equal (codeql--dot-edges
+                    (codeql-ported-test--write
+                     (concat dir "g.dot")
+                     "digraph {\n  0[\"label\"=\"a\"; ];\n  0 -> 1[];\n  1 -> 0[\"label\"=\"say \\\"hi\\\"\"; ];\n}\n"))
+                   '((0 1 nil) (1 0 "say \"hi\""))))))
+
+(ert-deftest codeql-ported-test-graph-text-layout ()
+  "Graphs are laid out with forward edges as lanes and back edges listed."
+  ;; branches split off and merge back into the lane of their node
+  (should (equal (codeql--graph-text-layout [(1 2) (3) (3) nil])
+                 '((0 "o-." "| |" nil) (1 "o |" "| |" nil) (2 "| o" "| |" nil)
+                   (3 "o-'" nil nil))))
+  ;; loops point back up
+  (should (equal (codeql--graph-text-layout [(1) (2 3) (1) nil])
+                 '((0 "o" "|" nil) (1 "o-." "| |" nil) (2 "o |" "  |" (1))
+                   (3 "  o" nil nil))))
+  ;; nodes without predecessors come first, then unreachable cycles by id
+  (should (equal (codeql--graph-text-layout [nil (0) (3) (2)])
+                 '((1 "o" "|" nil) (0 "o" "" nil) (2 "o" "|" nil) (3 "o" nil (2)))))
+  (should (equal (codeql--graph-text-layout [(0)]) '((0 "o" nil (0)))))
+  ;; lanes pass by nodes they don't end at
+  (should (equal (mapcar #'cadr (codeql--graph-text-layout [(1 3) (2) (3) nil]))
+                 '("o-." "o |" "o |" "o-'"))))
+
+(ert-deftest codeql-ported-test-show-graph-as-text ()
+  "Graphs are drawn as text diagrams with the selected node described."
+  (codeql-ported-test--with-temp-dir dir
+    (let ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--diamond-dot))
+          (codeql-graph-format "text"))
+      (codeql-ported-test--with-graph-buffer dot codeql-ported-test--diamond-nodes
+        (should (string-prefix-p
+                 (concat "  x-.  if (x)  a.js:1\n  | |\n  o |  then  a.js:2\n  | |\n"
+                         "  | o  else  a.js:3\n  | |\n  o-'  join  a.js:4\n\n"
+                         "  if (x)\n  Location: a.js:1\n  Predecessors: none\n"
+                         "  Successors: [true] then, [false] else\n")
+                 (buffer-substring-no-properties (point-min) (point-max))))
+        (should (= (point) 3))
+        (should (equal header-line-format '(:eval (codeql--graph-header-line))))
+        (should (equal (substring-no-properties (codeql--graph-header-line))
+                       " if (x)  a.js:1"))
+        ;; graphs with unknown nodes are drawn too
+        (setq codeql--graph-nodes nil)
+        (revert-buffer)
+        (should (string-prefix-p "  x-.  if (x)\n" (buffer-string)))
+        (should (string-match-p "Location: unknown" (buffer-string)))))))
+
+(ert-deftest codeql-ported-test-graph-text-navigation ()
+  "Text diagrams are navigated like `undo-tree-visualize'."
+  (codeql-ported-test--with-temp-dir dir
+    (let ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--diamond-dot))
+          (codeql-graph-format "text")
+          visited)
+      (codeql-ported-test--with-graph-buffer dot codeql-ported-test--diamond-nodes
+        (cl-letf (((symbol-function 'codeql--org-open-file-link)
+                   (lambda (link) (push link visited))))
+          (should (= codeql--graph-selected 0))
+          (codeql-graph-next)
+          (should (equal (list codeql--graph-selected codeql--graph-trail) '(1 (0))))
+          (should (looking-at "x |  then"))
+          (should-error (codeql-graph-backward) :type 'user-error)
+          (codeql-graph-forward)
+          (should (equal (list codeql--graph-selected codeql--graph-trail) '(2 (0))))
+          (should-error (codeql-graph-forward) :type 'user-error)
+          (codeql-graph-next)
+          (should (equal (list codeql--graph-selected codeql--graph-trail) '(3 (2 0))))
+          (should-error (codeql-graph-next) :type 'user-error)
+          ;; back the way we came
+          (codeql-graph-previous)
+          (should (equal (list codeql--graph-selected codeql--graph-trail) '(2 (0))))
+          (codeql-graph-previous)
+          (should (= codeql--graph-selected 0))
+          (should-error (codeql-graph-previous) :type 'user-error)
+          ;; or to the first predecessor
+          (codeql--graph-select 3)
+          (codeql-graph-previous)
+          (should (= codeql--graph-selected 1))
+          ;; RET visits the node of the row at point, or the selected one
+          (codeql-graph-visit-node)
+          (goto-char (point-max))
+          (codeql-graph-visit-node)
+          (goto-char (point-min))
+          (codeql-graph-visit-node)
+          (should (equal visited '("/arch/src/a.js::1:1:1:3" "/arch/src/a.js::2:1:2:3"
+                                   "/arch/src/a.js::2:1:2:3")))
+          ;; clicks select nodes, and visit selected ones
+          (with-selected-window (display-buffer (current-buffer))
+            (let ((click (lambda (pos)
+                           (codeql-graph-visit-node-at-mouse
+                            `(mouse-1 (,(selected-window) ,pos (0 . 0) 0))))))
+              (funcall click (save-excursion (goto-char (point-min))
+                                             (search-forward "else") (point)))
+              (should (equal (list codeql--graph-selected codeql--graph-trail) '(2 (1))))
+              (should (= (length visited) 3))
+              (funcall click (point))
+              (should (equal (car visited) "/arch/src/a.js::3:1:3:3"))))
+          ;; detail buttons select nodes
+          (goto-char (point-min))
+          (search-forward "Predecessors: [false] ")
+          (push-button)
+          (should (= codeql--graph-selected 0))
+          (search-forward "[true] ")
+          (push-button)
+          (should (= codeql--graph-selected 1)))))))
+
+(ert-deftest codeql-ported-test-graph-cycle-format-without-images ()
+  "Image formats are skipped where they can't be shown."
+  (codeql-ported-test--with-temp-dir dir
+    (let ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--diamond-dot))
+          (codeql-graph-format "svg"))
+      (cl-letf (((symbol-function 'codeql--graph-images-p) #'ignore))
+        (codeql-ported-test--with-graph-buffer dot nil
+          (should (equal codeql--graph-format "text"))
+          (codeql-graph-cycle-format)
+          (should-not codeql--graph-format)
+          (codeql-graph-cycle-format)
+          (should (equal codeql--graph-format "text")))))))
 
 (ert-deftest codeql-ported-test-find-templated-query ()
   "Templated queries of library packs take precedence over bundled ones."
