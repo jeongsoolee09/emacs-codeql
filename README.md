@@ -247,7 +247,7 @@ If there is no active region, `emacs-codeql` will attempt to run the full query 
 
 The `e` (quick eval) transient command, `codeql-query-server-quick-eval`, always quick evaluates: the active region if there is one, and otherwise the predicate or expression at point, e.g. with point on the name of a predicate. The `n` (quick eval count) command, `codeql-query-server-quick-eval-count`, does the same but only counts the results, which is much faster for predicates with many tuples. The counts are shown as a table of the total number of tuples and the distinct values of each column. Quick evaluation counts need the `query-server2` query server.
 
-The `E` (quick eval predicate) transient command, `codeql-query-server-quick-eval-predicate`, quick evaluates the predicate enclosing point, so point can be anywhere in its parameters or body rather than on its name. In a class, the characteristic predicate and member predicates are evaluated the same way. Outside of any predicate, e.g. in the select clause, it runs the whole query instead. With an active region it behaves like `e`.
+The `p` (quick eval predicate) transient command, `codeql-query-server-quick-eval-predicate`, quick evaluates the predicate enclosing point, so point can be anywhere in its parameters or body rather than on its name. In a class, the characteristic predicate and member predicates are evaluated the same way. Outside of any predicate, e.g. in the select clause, it runs the whole query instead. With an active region it behaves like `e`.
 
 #### Result rendering
 
