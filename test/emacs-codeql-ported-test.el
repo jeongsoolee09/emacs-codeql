@@ -22,6 +22,9 @@
 (require 'xref)
 (require 'emacs-codeql)
 
+;; org is loaded lazily, bind its hook dynamically before it is
+(defvar org-mode-hook)
+
 (defmacro codeql-ported-test--with-temp-dir (dir &rest body)
   "Run BODY with DIR bound to a new temporary directory, deleted afterwards."
   (declare (indent 1) (debug t))
@@ -612,7 +615,7 @@ OUTPUT is called with the arguments when it is a function."
                    (lambda (&rest args) (push (cons (current-buffer) args) loaded))))
           (with-temp-buffer
             (codeql--mrva-show-results repo directory query-buffer))
-          (should (equal loaded
+          (should (equal (mapcar (lambda (call) (seq-take call 3)) loaded)
                          `((,query-buffer ,(expand-file-name "octo_app_42.sarif" directory)
                                           ,(concat state "mrva/sources/octo_app_42/")))))
           (should (file-directory-p (concat state "mrva/sources/octo_app_42/")))))
@@ -650,7 +653,7 @@ OUTPUT is called with the arguments when it is a function."
         (setq codeql--mrva-session "s1")
         (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) gh))
                   ((symbol-function 'codeql--mrva-show-results)
-                   (lambda (repo directory _) (push (list repo directory) shown)))
+                   (lambda (repo directory &rest _) (push (list repo directory) shown)))
                   ((symbol-function 'message) #'ignore))
           (codeql-mrva-load-results repo)
           (codeql-ported-test--wait (lambda () shown))

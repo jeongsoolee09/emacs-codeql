@@ -10,6 +10,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Query execution
 - Quick query evaluation of regions or of the predicate at point, and quick evaluation counts
 - Query history for the local session
+- A CodeQL REPL and Org Babel source blocks, on sessions that remember definitions
 - Comparing the results of two query runs
 - Loading SARIF files, e.g. from `codeql database analyze` or code scanning, as browsable results
 - Query performance summaries from evaluator logs
@@ -186,7 +187,7 @@ In org documents, `#+begin_src codeql` and `#+begin_src ql` blocks use this mode
 
 You can register a database for your current project via `M-x codeql-transient-query-server-interact` and selecting `d` to register an active database. Ensure you have started a query server first by using `s` from the same menu. If a database is active in another query buffer, it will automatically be deregistered there and registered for your current buffer.
 
-Database selection is buffer-local per query file and you can run as many concurrent query projects as you have resources available.
+Database selection is per project by default (see [Sharing a query server](#sharing-a-query-server-across-query-and-library-files)), and you can run as many concurrent query projects as you have resources available.
 
 #### Database history
 
@@ -204,19 +205,37 @@ You can also register a zipped database archive (`.zip`) with `d`. It is unpacke
 
 A query server that crashed or was killed can leave its database locked, so that other query servers fail to evaluate queries against it. Select `u` (unlock), or `M-x codeql-database-delete-lock`, to delete the evaluation cache lock (`db-<language>/default/cache/.lock`) of the active database. With a prefix argument, or without an active database, you pick the database from the history instead. You are asked to confirm first, and warned when a query server in this Emacs still uses the database, or when another process (as reported by `lsof`) still has the lock open.
 
-`emacs-codeql` buffer-local approach means you can work on e.g. a `cpp` and `javascript` project concurrently, and you can an arbitrary amount of concurrent results buffers as you toggle between your query buffers.
+`emacs-codeql`'s per-project approach means you can work on e.g. a `cpp` and `javascript` project concurrently, and you can an arbitrary amount of concurrent results buffers as you toggle between your query buffers.
 
 #### Sharing a query server across query and library files
 
-When a query grows into helper `.qll` files, you'll want those buffers to use the same query server and database, e.g. to quick-eval a library predicate. Select `i` (inherit) in the transient of a buffer without a query server to share the server, active database and query history of another query buffer on the same host.
+When a query grows into helper `.qll` files, you'll want those buffers to use the same query server and database, e.g. to quick-eval a library predicate. By default, query servers are per project, much like eglot manages one language server per project: all query buffers of the same project, on the same host and with the same CodeQL CLI, share a single query server, database and query history. A project is a version-controlled directory tree, or else a CodeQL pack. A server started in one of them is picked up by the others, including buffers you open later, and registering a database in any of them makes it active in all of them. Stopping the server stops it for all of them.
 
-To share them automatically, set `codeql-share-query-server`:
+Query servers are disposed of manually: killing the last buffer that uses a server keeps it running in the background, detached, with its database and query history, much like eglot keeps its language servers. A buffer of its project that you open later uses it again (or pick it with `u` in `codeql-query-servers` when sharing is off), and registering its database from another server takes the database over. Shut it down with `codeql-query-servers` or `codeql-query-server-shutdown`. To shut a server down with the last buffer that uses it instead, set `codeql-query-server-autoshutdown`:
 
 ```elisp
-(setq codeql-share-query-server t)
+(setq codeql-query-server-autoshutdown t)
 ```
 
-All query buffers on the same host that use the same CodeQL CLI then share a single query server, database and query history, as in the VS Code extension. A server started in one of them is picked up by the others, including buffers you open later, and registering a database in any of them makes it active in all of them. Stopping the server stops it for all of them. Killing a buffer only shuts the server down when no other buffer uses it.
+`codeql-share-query-server` controls this:
+
+```elisp
+(setq codeql-share-query-server 'project) ; the default: one server per project
+(setq codeql-share-query-server t)        ; one server across projects, as in the VS Code extension
+(setq codeql-share-query-server nil)      ; one server per buffer
+```
+
+Select `i` (inherit) in the transient of a buffer without a query server to share the server, active database and query history of any other query buffer on the same host, whatever its project.
+
+`M-x codeql-query-server-start` starts a query server without the transient, with the options in `codeql-query-server-default-args`; with a prefix argument it opens the transient to pick the options.
+
+#### Managing query servers
+
+`M-x codeql-query-servers` (`m` in the transient) lists the running query servers, those of the current project first and the one of the current buffer first of all. Each is annotated with its active database, the number of query buffers that use it (or `detached` when none does) and how long it has been running. After picking one, choose an action: `b` to switch to one of its buffers, `r` to restart it, `k` to shut it down, `e` for its JSON-RPC events, `l` for its stderr, or `u` to use it in the current buffer. The actions are also commands of their own: `codeql-query-server-switch-to-buffer`, `codeql-query-server-restart`, `codeql-query-server-shutdown`, `codeql-query-server-events-buffer`, `codeql-query-server-stderr-buffer` and `codeql-query-server-use`. `codeql-query-server-shutdown-all` shuts down all of them.
+
+Restarting a server starts a new one with the same options, used by the same buffers, which keep their query history, and registers their database again.
+
+When [consult](https://github.com/minad/consult) is installed the picker uses it, and you can narrow to the current project with `p` or to other projects with `o`. With [embark](https://github.com/oantolin/embark), the candidates offer the actions in `codeql-query-server-map`, with the same keys.
 
 You can find existing databases for a ton of open source projects on [LGTM.com](https://codeql.github.com/docs/codeql-cli/creating-codeql-databases/#obtaining-databases-from-lgtm-com), or you can [create your own](https://codeql.github.com/docs/codeql-cli/creating-codeql-databases/#creating-codeql-databases) using the codeql cli.
 
@@ -244,7 +263,65 @@ Results buffers use `codeql-results-mode`, a major mode derived from `org-mode`.
 
 The following query "kinds" are supported: `path-problem`, `problem`, and raw tuple results.
 
-kind: `problem` and `path-problem` are rendered as org trees, raw tuple results are rendered as org tables.
+kind: `problem` and `path-problem` are rendered as org trees, raw tuple results are rendered as org tables. Set `codeql-raw-results-style` to `outline` to render raw tuples as one org heading per row instead, or toggle the style of a results buffer with `codeql-results-toggle-raw-style`. Tables are easier to scan and sort, headings carry properties that can be searched (see below).
+
+Every results buffer is a regular org document with the same layout:
+
+```org
+* Query Source                 ← folded when the buffer is opened
+:PROPERTIES:
+:CODEQL_KIND: query-source
+:CODEQL_EVALUATION: query      ← or quick-eval, quick-eval-count, sarif, variant-analysis
+:CODEQL_QUERY: /path/to/query.ql
+:CODEQL_DATABASE: /path/to/db
+:END:
+** Originating Query
+[[file:/path/to/query.ql][query.ql]]
+** Evaluated Code              ← quick evaluations only
+Quick evaluation of the region at [[file:/path/to/query.ql::12][query.ql:12:5]]:
+#+begin_src ql -i
+from int x where x in [1 .. 5] select x
+#+end_src
+* Results
+:PROPERTIES:
+:CODEQL_KIND: results
+:CODEQL_QUERY_KIND: problem    ← or path-problem, raw
+:END:
+** ≔ [js/xss] Cross-site scripting ... [[codeql:...][app.js]]:3:5
+:PROPERTIES:
+:CODEQL_KIND: result
+:CODEQL_QUERY_KIND: problem
+:CODEQL_RESULT: 1
+:CODEQL_RULE_ID: js/xss
+:CODEQL_MESSAGE: Cross-site scripting vulnerability due to user-provided value.
+:CODEQL_FILE: /src/app.js
+:CODEQL_LINE: 3
+:CODEQL_COLUMN: 5
+:CODEQL_END_LINE: 3
+:CODEQL_END_COLUMN: 10
+:END:
+*** Path #0
+...
+* Results Footer
+```
+
+`Query Source` records what produced the results: a link to the query file that was run, and for quick evaluations the exact code that was submitted, captured when you ran it, so later edits to the query buffer don't change it. Results of `codeql-load-sarif` and `codeql-mrva` record their origin there too, see below. Expand it with `TAB` as usual. Rows of raw results rendered as headings (`outline` style) carry `CODEQL_RESULT_SET`, `CODEQL_ROW`, the location properties of their first location, and one `CODEQL_COL_<NAME>` property per column. `CODEQL_FILE` is the path of the file in the analyzed project, the links point into the source archive of the database.
+
+##### Searching results with org-ql
+
+When [org-ql](https://github.com/alphapapa/org-ql) is installed, `codeql-results-org-ql` searches the results of the current results buffer and shows the matches as a sparse tree; with a prefix argument the matches are shown in an `org-ql-search` view instead. Queries are restricted to result headings (`CODEQL_KIND` = `result`), and can be written in the org-ql string syntax or as a sexp, e.g.:
+
+```
+xss                                         ; plain text search
+(property "CODEQL_FILE" "/src/app.js")      ; exact property values
+(property "CODEQL_RULE_ID" "js/xss")
+(regexp "user-provided")
+(and (property "CODEQL_QUERY_KIND" "raw") (regexp "eval"))
+```
+
+Raw results rendered as a table are switched to the `outline` style first, since org-ql only sees headings. Results buffers are org buffers, so `org-ql-select`, `org-ql-search` and friends work on them directly, too. org-ql is an optional dependency.
+
+Only the current page of paginated results is part of the buffer, and therefore searchable.
 
 Results contain source code locations in the form of org links, which can be visited with the normal org mode operations for link handling (e.g. `org-open-at-point`)
 
@@ -266,6 +343,8 @@ The rows only found in the first run and those only found in the second run are 
 
 When the query buffer has an active database, result locations are taken to be files of its source archive, so that they work with the database source archive xref backend like regular results. With a prefix argument, or without an active database, they are taken to be files of a source checkout instead, which is prompted for when the SARIF has relative locations that its `originalUriBaseIds` don't resolve. Locations missing from the checkout whose contents are embedded in the SARIF (`codeql database analyze --sarif-add-file-contents`) are shown from a read-only copy of those contents.
 
+The `Query Source` section of the results describes the SARIF file: `CODEQL_EVALUATION` is `sarif`, `CODEQL_SARIF` its path, `CODEQL_TOOL` the tools that produced it, `CODEQL_REPOSITORY_URI` and `CODEQL_REVISION_ID` its version control provenance, if any. An `Originating SARIF` heading links to the file, and a `Rules` heading lists the rules that results were reported for, with their names.
+
 When the SARIF records the repository and revision it was produced for in its `versionControlProvenance`, as code scanning and variant analysis results do, `codeql-copy-permalink` copies a GitHub permalink to the result location at point, and `codeql-browse-permalink` opens it in a browser. They work on the links of the results buffer and in source files visited from them, where an active region links to its range of lines. For example:
 
 ```elisp
@@ -278,6 +357,8 @@ When the SARIF records the repository and revision it was produced for in its `v
 `codeql-mrva` (`v` in the query server transient) browses the results of [gh-mrva](https://github.com/GitHubSecurityLab/gh-mrva) sessions, which you submit with `gh mrva submit`. Install the extension with `gh extension install GitHubSecurityLab/gh-mrva`.
 
 After picking a session, its repositories with findings are listed in a `codeql-mrva-mode` buffer, along with their finding and star counts. `RET` downloads the results of the repository at point below `codeql-state-dir` and renders them for the query buffer `codeql-mrva` was called from, like `codeql-load-sarif` does. `g` refreshes the status of the session. The source files of result locations are fetched from GitHub with `gh api` as you visit them, at the revision that was analyzed, and `codeql-copy-permalink` works on them too. Results of queries that aren't problem or path-problem queries are shown decoded.
+
+The `Query Source` section of variant analysis results holds the whole query as it was submitted, in a `Submitted Query` src block. It is taken from the query pack of the run, which is fetched from the controller repository with `gh api` once per run, so later edits to the query file don't change it. When the pack can't be fetched, the query file as it is now is shown instead, and said so. `CODEQL_EVALUATION` is `variant-analysis`, and `CODEQL_MRVA_SESSION`, `CODEQL_MRVA_RUN`, `CODEQL_MRVA_CONTROLLER` and `CODEQL_MRVA_REPOSITORY` record where the results came from, along with the properties of the downloaded SARIF file.
 
 #### Query performance
 
@@ -308,6 +389,113 @@ The commands aren't bound by default. `codeql-alert-navigation-map` has them on 
 (keymap-global-set "C-c n" codeql-alert-navigation-map)
 (repeat-mode 1)
 ```
+
+### CodeQL sessions
+
+A session evaluates snippets of CodeQL one after another, like a REPL, against the database of a project, and remembers the definitions it was given. Interactive front ends, such as a REPL, build on sessions. A session needs Emacs 29 or newer with the tree-sitter `ql` grammar.
+
+Each input can define predicates, classes, modules, newtypes and imports, and ask for one of the following:
+
+- a `select` query (`from int x where x in [1 .. 3] select x`);
+- an expression (`count(CallExpr c | manyArgs(c, _))`), which is selected;
+- a formula (`exists(CallExpr c | manyArgs(c, 4))`), whose truth is selected as `holds`;
+- the name of a predicate of the session (`manyArgs`), which is quick evaluated, or its name and arity (`manyArgs/2`) to pick one of several predicates of that name;
+- the name of a type (`Integers`, `DataFlow::Node`), whose values are selected.
+
+A call of a predicate that the session doesn't define could be an expression or a formula. It is tried as an expression first, and then as a formula.
+
+Each evaluation rewrites a query module that holds the session's definitions, followed by the code to evaluate. The module lives in the hidden `.codeql-session/` directory of the CodeQL pack, so it resolves the same libraries as the pack's queries. The directory has a `.gitignore` that ignores everything in it. A session runs on the project's query server and database. Without a database it uses the one last registered in the project, or asks for one.
+
+Definitions are kept as soon as they are entered, without compiling them. When an evaluation fails with compiler errors in definitions that have never compiled successfully, they are rolled back: a new definition is dropped, and a redefinition is replaced by the last version that compiled. With `codeql-session-check-definitions`, definitions are compiled before they are kept. This catches mistakes early, but compiling a new query module can take several seconds.
+
+A definition with the same name as one the session already has replaces it: classes, newtypes and modules by name, predicates by name and arity, so `p/1` and `p/2` are distinct. Front ends warn about such a redefinition, and about definitions given more than once in the same input, where the last one counts. Entering a definition again unchanged, up to whitespace, keeps it as it is.
+
+Session results use the same org results buffers and query history as other runs. Their `Query Source` shows the evaluated input and the query module that ran.
+
+Compiler errors are reported in terms of the session: a location in a definition names it, such as `(in manyArgs/2, line 3)`, and other locations are `(in the input)`.
+
+### CodeQL REPL
+
+`M-x codeql-repl` opens a REPL for the CodeQL pack of the current buffer, which evaluates its input in a session of the pack (with a prefix argument, it asks for the name of the session). Several REPLs, each with its own session, can run in a pack.
+
+```
+ql> predicate manyArgs(CallExpr c, int n) { n = c.getNumArgument() and n > 2 }
+Defined manyArgs/2.
+ql> count(CallExpr c | manyArgs(c, _))
+37
+1 result in 9.8s [results]
+ql> manyArgs
+c                    │ n
+─────────────────────┼──
+assert. ... empty")  │ 3
+...
+37 results, 10 shown in 1.1s [results]
+```
+
+`RET` sends the input when it is complete, and otherwise continues it on a new, indented line: while parentheses, brackets, braces, strings or block comments are open, after an operator or a keyword like `and`, and in a `from` or `where` clause without a `select`. `C-j` always continues the input. `TAB` completes the names of the session's definitions, annotated with their signatures, CodeQL keywords, and commands after a `:`. Predicates with several arities are also completed as `NAME/ARITY`. Entering just the name of such predicates, also with `:count`, asks which of them to evaluate.
+
+The first `codeql-repl-max-rows` results are printed as a table, with cells cut at `codeql-repl-max-column-width`. Result locations are buttons that visit the source archive. `RET` or a click pushes a button, also in Evil's normal state, where evil-collection binds `RET` to send input. `[results]`, `C-c C-v` or `:results` opens all results in an org results buffer. `C-c C-c` cancels the running evaluation. Input is fontified as CodeQL when `codeql-repl-fontify-input` is non-nil.
+
+Input that begins with a colon is a command. Commands can be abbreviated, such as `:d` for `:defs`.
+
+| Command | Description |
+| --- | --- |
+| `:help` | List the commands |
+| `:defs [NAME]` | List the definitions of the session, or show the code of those named NAME |
+| `:undef NAME` | Remove the definitions named NAME |
+| `:reset` | Remove all definitions but the default import |
+| `:count PREDICATE[/ARITY]\|TYPE` | Count the results of a predicate of the session, or the values of a type |
+| `:results` | Open the last results in a results buffer |
+| `:module` | Show the query module of the last evaluation |
+| `:db [PATH]` | Show the database, or register the one at PATH for the project |
+| `:cancel` | Cancel the running evaluation |
+| `:clear` | Clear the REPL buffer |
+
+`M-x codeql-repl-send-region` evaluates the region of a query buffer in the REPL of its pack, or the top-level definition or query at point when the region isn't active. The query server menu has these as `R` and `E`.
+
+The input history, which keeps multi-line inputs whole, is saved in `codeql-repl-history-file`. The prompt is `codeql-repl-prompt`. Killing a REPL ends its session.
+
+### Org Babel
+
+`ob-codeql.el` evaluates `codeql` (or `ql`) source blocks in sessions, so a block can hold anything that a REPL input can. Enable it with:
+
+```elisp
+(org-babel-do-load-languages 'org-babel-load-languages '((codeql . t)))
+```
+
+```org
+#+begin_src codeql :session
+predicate manyArgs(CallExpr c, int n) { n = c.getNumArgument() and n > 2 }
+#+end_src
+
+#+RESULTS:
+: Defined manyArgs/2.
+
+#+begin_src codeql :session :limit 2
+manyArgs
+#+end_src
+
+#+RESULTS:
+| c                   | n |
+|---------------------+---|
+| [[codeql:...][assert. ... empty")]] | 3 |
+| [[codeql:...][assert. ... empty")]] | 3 |
+```
+
+A single result is returned as a value, other results as a table whose header holds the names of the columns, or their types. Result locations are `codeql:` links into the source archive, and numbers stay numbers, so the tables can be used by other blocks. Definitions return what was defined, and what was redefined. Redefinitions are also reported in the echo area when the block evaluates something as well. Errors are shown in the `*Org-Babel Error Output*` buffer, with what was rolled back, and return no result.
+
+| Header argument | Description |
+| --- | --- |
+| `:session [NAME]` | Evaluate in the session NAME (`default` without a name), which keeps definitions for later blocks and is shared with the REPL of that name. Without a session, each block is evaluated on its own. |
+| `:database PATH` | The database to evaluate on, else that of the project |
+| `:pack DIR` | The CodeQL pack to evaluate in, else that of the org file |
+| `:limit N` | The number of result rows, `ob-codeql-default-limit` by default |
+| `:count yes` | Count the results of a quick evaluated predicate, or the values of a type |
+| `:open yes` | Also open all results in an org results buffer |
+
+Outside of CodeQL packs, blocks need a `:database` (or ask for one), and are evaluated in a pack that `ob-codeql` makes in `codeql-state-dir` for the language of the database. The pack depends on the latest standard library of the language, which `codeql pack install` installs the first time. When a query server already has the database, blocks use that query server.
+
+Evaluation is synchronous: `C-g` cancels it. `:var` is not supported.
 
 ### Database source archive Xref support
 
@@ -527,6 +715,16 @@ Alternatively you can compile `tree-sitter` 0.19.5 from scratch on an M1 mac by 
 After building the QL artifact(s) for the architectures and platforms you need to support, you'll want to grab `bin/ql.*` and move those into `~/.emacs.d/elpa/tree-sitter-langs*/bin/` and restart emacs.
 
 QL syntax highlighting and indentation should now work fine.
+
+## Running the tests
+
+The regression tests in `test/` don't need the CodeQL CLI:
+
+```
+emacs -Q --batch -L . -l test/emacs-codeql-test.el -f ert-run-tests-batch-and-exit
+```
+
+The org-ql tests are skipped unless org-ql and its dependencies are on the `load-path` (add them with `-L`). The session, REPL and Org Babel tests are skipped unless the tree-sitter `ql` grammar is installed.
 
 ## Known Quirks
 
