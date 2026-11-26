@@ -28,6 +28,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Compatible with [github/gh-codeql](https://github.com/github/gh-codeql) for cli version management
 - Database source archive xref backend support
 - Searching the database source archive with `codeql-database-grep`
+- GitHub permalinks to the results of SARIF files with version control provenance
 - AST Viewer with xref backend support
 - Rendering of graph results with graphviz, and a CFG viewer
 
@@ -262,6 +263,13 @@ The rows only found in the first run and those only found in the second run are 
 `codeql-load-sarif` (`l` in the query server transient) renders an existing SARIF file, e.g. the output of `codeql database analyze` or a code scanning run, like the results of a problem or path-problem query, with pagination, alert navigation and diagnostics.
 
 When the query buffer has an active database, result locations are taken to be files of its source archive, so that they work with the database source archive xref backend like regular results. With a prefix argument, or without an active database, they are taken to be files of a source checkout instead, which is prompted for when the SARIF has relative locations that its `originalUriBaseIds` don't resolve. Locations missing from the checkout whose contents are embedded in the SARIF (`codeql database analyze --sarif-add-file-contents`) are shown from a read-only copy of those contents.
+
+When the SARIF records the repository and revision it was produced for in its `versionControlProvenance`, as code scanning and variant analysis results do, `codeql-copy-permalink` copies a GitHub permalink to the result location at point, and `codeql-browse-permalink` opens it in a browser. They work on the links of the results buffer and in source files visited from them, where an active region links to its range of lines. For example:
+
+```elisp
+(with-eval-after-load 'emacs-codeql
+  (define-key codeql-results-mode-map (kbd "C-c C-l") #'codeql-copy-permalink))
+```
 
 #### Query performance
 
