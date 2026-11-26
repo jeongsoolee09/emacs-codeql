@@ -453,6 +453,8 @@ Leave nil for default.")
 ;; we use buffer-local copies of these so we can play context dependent tricks
 (defvar-local codeql--cli-buffer-local nil)
 (defvar-local codeql--search-paths-buffer-local nil)
+(defvar-local codeql--search-paths-pending nil
+  "Non-nil while the library paths of the buffer are being resolved.")
 
 (defun codeql--gh-codeql-cli-available-p ()
   (condition-case nil
@@ -683,38 +685,76 @@ target, which looks like USER@HOST.PID:BOOT-TIME."
                     unless (member path codeql-search-paths)
                     collect path)))
 
-    ;; library paths should contain everything we need in terms of search paths
-    (let ((library-paths
-           (codeql--resolve-library-paths
-            (codeql--tramp-unwrap
-             (expand-file-name
-              (codeql--tramp-wrap (buffer-file-name)))))))
-      (setq codeql--search-paths-buffer-local
-            (append
-             codeql--search-paths-buffer-local
-             (cl-loop for library-path across library-paths
-                      unless (member library-path codeql--search-paths-buffer-local)
-                      collect library-path))))
-
-    ;; dedupe and remove nil from search paths
-    (setq codeql--search-paths-buffer-local
-          (delq nil (delete-dups
-                     codeql--search-paths-buffer-local))))
+    (let ((query-path (codeql--tramp-unwrap
+                       (expand-file-name
+                        (codeql--tramp-wrap (buffer-file-name))))))
+      (if (file-remote-p default-directory)
+          (codeql--add-library-paths (codeql--resolve-library-paths query-path))
+        ;; resolving takes a while, so let the buffer show up in the meantime
+        (setq codeql--search-paths-pending t)
+        (let ((buffer (current-buffer)))
+          (codeql--cli-command-async
+           (codeql--resolve-library-paths-args query-path)
+           (lambda (json)
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (setq codeql--search-paths-pending nil)
+                 (codeql--add-library-paths (codeql--parse-library-paths json))
+                 ;; out of the process filter, eglot may wait for the server
+                 (run-at-time 0 nil #'codeql--lsp-start buffer t)))))))))
 
   ;; pick up a running query server of another QL buffer if we share them
   (codeql--query-server-adopt)
 
-  ;; now that we have all our search paths, let's try and start up our LSP server
-  ;; this will rely on our project.el integration to determine the workspace paths
-  (condition-case nil
-      (when (and codeql-configure-eglot-lsp
-                 (or (and (file-remote-p (buffer-file-name))
-                          (yes-or-no-p "[WARNING] Do you want to use LSP remotely? This can be very slow!"))
-                     (not (file-remote-p (buffer-file-name)))))
-        ;; turn eglot on if local or we really want it remote
-        (eglot-ensure))
-    ;; no LSP for us due to error
-    (error (message "Ignoring failed LSP initialization and plowing ahead!"))))
+  (unless codeql--search-paths-pending
+    (codeql--lsp-start (current-buffer))))
+
+(defun codeql--add-library-paths (library-paths)
+  "Add the vector LIBRARY-PATHS to the search paths of the buffer."
+  ;; library paths should contain everything we need in terms of search paths
+  (setq codeql--search-paths-buffer-local
+        (append
+         codeql--search-paths-buffer-local
+         (cl-loop for library-path across library-paths
+                  unless (member library-path codeql--search-paths-buffer-local)
+                  collect library-path)))
+  ;; dedupe and remove nil from search paths
+  (setq codeql--search-paths-buffer-local
+        (delq nil (delete-dups
+                   codeql--search-paths-buffer-local))))
+
+(defun codeql--await-search-paths ()
+  "Wait until the search paths of the buffer are resolved."
+  (let ((deadline (+ (float-time) 60)))
+    (while (and codeql--search-paths-pending (< (float-time) deadline))
+      (accept-process-output nil 0.05))))
+
+(declare-function eglot--guess-contact "eglot")
+(declare-function eglot--connect "eglot")
+(defvar eglot--managed-mode)
+(defvar eglot-sync-connect)
+
+(defun codeql--lsp-start (buffer &optional now)
+  "Start the language server of BUFFER, now that its search paths are known.
+
+This relies on our project.el integration to determine the workspace paths.
+With NOW, connect right away and without waiting for the server, instead of
+after the current command."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (condition-case nil
+          (when (and codeql-configure-eglot-lsp
+                     (or (and (file-remote-p (buffer-file-name))
+                              (yes-or-no-p "[WARNING] Do you want to use LSP remotely? This can be very slow!"))
+                         (not (file-remote-p (buffer-file-name)))))
+            ;; turn eglot on if local or we really want it remote
+            (cond ((not now) (eglot-ensure))
+                  ;; the buffer may have joined a running server of its project
+                  (eglot--managed-mode)
+                  (t (let ((eglot-sync-connect nil))
+                       (apply #'eglot--connect (eglot--guess-contact))))))
+        ;; no LSP for us due to error
+        (error (message "Ignoring failed LSP initialization and plowing ahead!"))))))
 
 (defun codeql--maybe-buffer-local-init ()
   "Run `codeql--buffer-local-init-hook' in buffers that visit a file.
@@ -1362,6 +1402,119 @@ Uses a persistent CLI server when `codeql-use-cli-server' is non-nil."
        (mapconcat #'shell-quote-argument (append codeql--cli-buffer-local args) " ")
        verbose))))
 
+;; Run a CLI command without blocking
+
+(defun codeql--cli-server-run-async (args callback)
+  "Run CLI ARGS on the CLI server and call CALLBACK with stdout, or nil on failure.
+
+Like `codeql--cli-server-run', but returns right away.  The server is busy
+until CALLBACK is called, so other commands meanwhile get processes of
+their own."
+  (let* ((key (codeql--cli-server-key))
+         (proc (codeql--cli-server))
+         (stdout (process-buffer proc))
+         (stderr (process-get proc 'codeql-stderr))
+         (finished nil)
+         (finish
+          (lambda (output)
+            (unless finished
+              (setq finished t)
+              (set-process-filter proc #'internal-default-process-filter)
+              (set-process-sentinel proc #'ignore)
+              (process-put proc 'codeql-busy nil)
+              (funcall callback output)))))
+    (process-put proc 'codeql-busy t)
+    (with-current-buffer stdout (erase-buffer))
+    (with-current-buffer stderr (erase-buffer))
+    (set-process-filter
+     proc (lambda (proc string)
+            (internal-default-process-filter proc string)
+            (when (codeql--cli-server-command-complete-p proc)
+              (funcall finish (with-current-buffer stdout
+                                (buffer-substring-no-properties
+                                 (point-min) (1- (point-max))))))))
+    ;; the server exits when a command fails
+    (set-process-sentinel
+     proc (lambda (proc _event)
+            (unless (or finished (process-live-p proc))
+              (let ((output (and (buffer-live-p stdout)
+                                 (codeql--cli-server-command-complete-p proc)
+                                 (with-current-buffer stdout
+                                   (buffer-substring-no-properties
+                                    (point-min) (1- (point-max)))))))
+                (unless output
+                  (message "CLI server command failed: %s"
+                           (if (buffer-live-p stderr)
+                               (with-current-buffer stderr (string-trim (buffer-string)))
+                             "")))
+                (codeql--cli-server-kill proc)
+                (when (eq (gethash key codeql--cli-servers) proc)
+                  (remhash key codeql--cli-servers))
+                (funcall finish output)))))
+    (condition-case err
+        (process-send-string
+         proc (concat (encode-coding-string (json-serialize (vconcat args)) 'utf-8)
+                      "\0"))
+      (error
+       (message "CLI server command failed: %s" (error-message-string err))
+       (codeql--cli-server-kill proc)
+       (remhash key codeql--cli-servers)
+       (funcall finish nil)))))
+
+(defun codeql--cli-process-run-async (args callback)
+  "Run CLI ARGS in a new process and call CALLBACK with stdout, or nil on failure."
+  (let* ((command (append codeql--cli-buffer-local args))
+         (stdout (generate-new-buffer " *codeql cli*"))
+         (stderr (generate-new-buffer " *codeql cli stderr*")))
+    (when codeql-verbose-commands
+      (message "Running async cli cmd: %s" (string-join command " ")))
+    (condition-case err
+        (make-process
+         :name "codeql cli"
+         :buffer stdout
+         :stderr stderr
+         :command command
+         :connection-type 'pipe
+         :noquery t
+         :file-handler t
+         :sentinel
+         (lambda (proc _event)
+           (unless (process-live-p proc)
+             (let ((output (and (eq (process-status proc) 'exit)
+                                (zerop (process-exit-status proc))
+                                (with-current-buffer stdout
+                                  (buffer-substring-no-properties
+                                   (point-min) (point-max))))))
+               (unless output
+                 (message "CLI command failed: %s"
+                          (with-current-buffer stderr (string-trim (buffer-string)))))
+               (when-let ((stderr-proc (get-buffer-process stderr)))
+                 (delete-process stderr-proc))
+               (kill-buffer stdout)
+               (kill-buffer stderr)
+               (funcall callback output)))))
+      (error
+       (message "CLI command failed: %s" (error-message-string err))
+       (kill-buffer stdout)
+       (kill-buffer stderr)
+       (funcall callback nil)))))
+
+(defun codeql--cli-command-async (args callback)
+  "Run the buffer-local CodeQL CLI with ARGS without blocking.
+
+CALLBACK is called with stdout, or nil on failure, from a process filter or
+sentinel, so it can't rely on the current buffer.  Uses a persistent CLI
+server when `codeql-use-cli-server' is non-nil and it isn't busy."
+  (cl-assert codeql--cli-buffer-local t)
+  (let ((proc (gethash (codeql--cli-server-key) codeql--cli-servers)))
+    (when codeql-verbose-commands
+      (message "Running async cli cmd: %s" (string-join args " ")))
+    (if (and codeql-use-cli-server
+             (not (and (codeql--cli-server-live-p proc)
+                       (process-get proc 'codeql-busy))))
+        (codeql--cli-server-run-async args callback)
+      (codeql--cli-process-run-async args callback))))
+
 (defun codeql-cli-servers-shutdown ()
   "Shut down all running CodeQL CLI servers."
   (interactive)
@@ -1383,6 +1536,7 @@ Uses a persistent CLI server when `codeql-use-cli-server' is non-nil."
 This version is used as part of actual query resolution and sets buffer local
 context variables."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (codeql--await-search-paths)
   ;; only resolve once for current query buffer
   (unless (and codeql--library-path codeql--dbscheme)
     (message "Resolving query paths.")
@@ -1406,16 +1560,23 @@ context variables."
 This version is used in early buffer local init of search paths and has no
 side effects."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (let ((json (codeql--cli-command-to-string
-               (list "resolve" "library-path" "-v" "--log-to-stderr" "--format=json"
-                     (format "--query=%s" query-path)))))
-    (when json
-      (condition-case nil
-          (cl-destructuring-bind (&key libraryPath &allow-other-keys)
-              (json-parse-string json :object-type 'plist)
-            ;; this is a vector
-            libraryPath)
-        (error (progn (message "error parsing json: %s" json) nil))))))
+  (codeql--parse-library-paths
+   (codeql--cli-command-to-string (codeql--resolve-library-paths-args query-path))))
+
+(defun codeql--resolve-library-paths-args (query-path)
+  "Return the CLI arguments that resolve the library paths of QUERY-PATH."
+  (list "resolve" "library-path" "-v" "--log-to-stderr" "--format=json"
+        (format "--query=%s" query-path)))
+
+(defun codeql--parse-library-paths (json)
+  "Return the library paths in the JSON output of `codeql resolve library-path'."
+  (when json
+    (condition-case nil
+        (cl-destructuring-bind (&key libraryPath &allow-other-keys)
+            (json-parse-string json :object-type 'plist)
+          ;; this is a vector
+          libraryPath)
+      (error (progn (message "error parsing json: %s" json) nil)))))
 
 (defun codeql--resolve-qlpack-paths (dir)
   "Resolve qlpack paths from DIR."
@@ -2938,6 +3099,7 @@ unescaped [ can start a link."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (cl-assert codeql--active-database t)
 
+  (codeql--await-search-paths)
   (when-let ((query-path (codeql--templated-query-path language query-name)))
     (cl-loop for search-path in codeql--search-paths-buffer-local
              for full-path = (format "%s/%s" search-path query-path)
