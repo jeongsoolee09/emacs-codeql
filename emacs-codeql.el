@@ -670,8 +670,17 @@ target, which looks like USER@HOST.PID:BOOT-TIME."
   ;; used in setup for ql-tree-sitter-mode so we can not assert the mode here yet.
   (codeql--cli-command-to-string (list "version")))
 
+(defvar codeql--inhibit-lsp nil
+  "Non-nil to not start language servers for buffers set up meanwhile.")
+
+(defvar-local codeql--lsp-inhibited nil
+  "Non-nil if the buffer should not get a language server.")
+
 (defun codeql--buffer-local-init-hook ()
   "Set up a codeql buffer context correctly."
+
+  ;; remember this for when the search paths are resolved
+  (setq codeql--lsp-inhibited codeql--inhibit-lsp)
 
   ;; decide between codeql-cli and the gh cli codeql extension
   (setq codeql--cli-buffer-local (copy-sequence (codeql--cli-for-host)))
@@ -756,6 +765,9 @@ target, which looks like USER@HOST.PID:BOOT-TIME."
 
 (declare-function eglot--guess-contact "eglot")
 (declare-function eglot--connect "eglot")
+(declare-function eglot--maybe-activate-editing-mode "eglot")
+(declare-function eglot--project "eglot")
+(declare-function eglot-lsp-server-p "eglot")
 (defvar eglot--managed-mode)
 (defvar eglot-sync-connect)
 
@@ -767,19 +779,60 @@ With NOW, connect right away and without waiting for the server, instead of
 after the current command."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (condition-case nil
-          (when (and codeql-configure-eglot-lsp
-                     (or (and (file-remote-p (buffer-file-name))
-                              (yes-or-no-p "[WARNING] Do you want to use LSP remotely? This can be very slow!"))
-                         (not (file-remote-p (buffer-file-name)))))
-            ;; turn eglot on if local or we really want it remote
-            (cond ((not now) (eglot-ensure))
-                  ;; the buffer may have joined a running server of its project
-                  (eglot--managed-mode)
-                  (t (let ((eglot-sync-connect nil))
-                       (apply #'eglot--connect (eglot--guess-contact))))))
-        ;; no LSP for us due to error
-        (error (message "Ignoring failed LSP initialization and plowing ahead!"))))))
+      (when (and codeql-configure-eglot-lsp
+                 (not codeql--lsp-inhibited)
+                 (or (and (file-remote-p (buffer-file-name))
+                          (yes-or-no-p "[WARNING] Do you want to use LSP remotely? This can be very slow!"))
+                     (not (file-remote-p (buffer-file-name)))))
+        ;; turn eglot on if local or we really want it remote
+        (if now
+            (codeql--lsp-connect nil)
+          (add-hook 'post-command-hook #'codeql--lsp-connect-after-command
+                    'append t))))))
+
+(defun codeql--lsp-connect-after-command ()
+  "Connect the buffer to its language server, the way `eglot-ensure' does."
+  (remove-hook 'post-command-hook #'codeql--lsp-connect-after-command t)
+  (codeql--lsp-connect eglot-sync-connect))
+
+(defun codeql--lsp-server-process-p (process modes project)
+  "Return non-nil if PROCESS is a live eglot server for MODES in PROJECT.
+This includes servers that are still initializing, which eglot only
+registers for their project once they are up."
+  (let ((server (process-get process 'jsonrpc-connection)))
+    (and (process-live-p process)
+         (eglot-lsp-server-p server)
+         (equal (eglot--project server) project)
+         (cl-intersection (eglot--major-modes server) modes))))
+
+(defun codeql--lsp-connect (sync)
+  "Connect the buffer to a language server, unless one is already on its way.
+SYNC is used as `eglot-sync-connect'."
+  (condition-case nil
+      (progn
+        ;; join a running server of the project
+        (eglot--maybe-activate-editing-mode)
+        (unless eglot--managed-mode
+          (let ((contact (eglot--guess-contact)))
+            ;; a starting server picks up all of its buffers once it is up
+            (unless (cl-loop for process in (process-list)
+                             thereis (codeql--lsp-server-process-p
+                                      process (nth 0 contact) (nth 1 contact)))
+              (let ((eglot-sync-connect sync))
+                (apply #'eglot--connect contact))))))
+    ;; no LSP for us due to error
+    (error (message "Ignoring failed LSP initialization and plowing ahead!"))))
+
+(defun codeql--eglot-ensure-skip-p ()
+  "Return non-nil if `eglot-ensure' should leave the buffer to us.
+We start the language server of CodeQL buffers ourselves once their
+search paths are known, so an `eglot-ensure' from the major mode hook
+would start a server without them, or a second one."
+  (and codeql-configure-eglot-lsp
+       buffer-file-name
+       (derived-mode-p 'ql-tree-sitter-mode)))
+
+(advice-add 'eglot-ensure :before-until #'codeql--eglot-ensure-skip-p)
 
 (defun codeql--maybe-buffer-local-init ()
   "Run `codeql--buffer-local-init-hook' in buffers that visit a file.
@@ -3599,7 +3652,8 @@ Our implementation simply returns the thing at point as a candidate."
   (cl-letf (((symbol-function #'eglot-ensure)
              (lambda ()
                (message "Disabled eglot for codeql org link."))))
-    (let ((value (find-file-noselect filename nil nil wildcards))
+    (let ((value (let ((codeql--inhibit-lsp t))
+                   (find-file-noselect filename nil nil wildcards)))
           (show (if codeql--find-file-same-window
                     #'pop-to-buffer-same-window
                   #'switch-to-buffer-other-window)))
