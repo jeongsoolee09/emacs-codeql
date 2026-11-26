@@ -95,12 +95,28 @@
 (require 'cl-lib)
 (require 'url-util)
 (require 'url-parse)
-(require 'org)
-(require 'ol)
+;; org is only needed for results, diagnostics, AST and performance buffers,
+;; and loading it takes a noticeable while, see `codeql--require-org'
+(eval-when-compile
+  (require 'org)
+  (require 'ol)
+  (require 'org-table))
+(declare-function org-at-table-p "org")
+(declare-function org-link-escape "ol")
+(declare-function org-link-set-parameters "ol")
+(declare-function org-link-unescape "ol")
+(declare-function org-reveal "org")
+(declare-function treesit-ready-p "treesit")
 (require 'files)
 (require 'project)
 (require 'flymake)
 (require 'pulse)
+
+(defun codeql--require-org ()
+  "Load the parts of org that results and other org buffers rely on."
+  (require 'org)
+  (require 'ol)
+  (require 'org-table))
 
 ;; bundled
 (require 'json-pointer)
@@ -1829,6 +1845,7 @@ displayed as ¦ instead."
 
 Bracket links only show their description, as long as
 `org-link-descriptive' is set."
+  (codeql--require-org)
   (string-width
    (if (and (default-value 'org-link-descriptive)
             (string-match-p "\\[\\[" cell))
@@ -1844,6 +1861,7 @@ Bracket links only show their description, as long as
 That is \"r\" when enough of CELLS are numbers, see
 `org-table-number-fraction', \"l\" otherwise, unless a cookie such as
 <r> fixes the alignment."
+  (codeql--require-org)
   (let ((numbers 0) (non-empty 0) fixed)
     (cl-loop for cell in cells until fixed do
              (cond ((string-empty-p cell))
@@ -1863,7 +1881,7 @@ ROWS is a list of rows and HEADER a row, where a row is a list of cell
 strings that are already valid org, see `codeql--org-table-cell'.  The
 result is what `org-table-align' would produce, but building it directly
 avoids the cost of parsing and measuring a table in an org buffer."
-  (require 'org-table)
+  (codeql--require-org)
   (let* ((all-rows (if header (cons header rows) rows))
          (ncols (apply #'max 1 (mapcar #'length all-rows)))
          (all-rows (mapcar (lambda (row)
@@ -1982,6 +2000,7 @@ checked once rather than for every result node.")
 
 (defun codeql--result-node-to-org (node &optional custom-description)
   "Transform a result node into an org compatible link|string representation."
+  (codeql--require-org)
   ;; https://orgmode.org/guide/Hyperlinks.html
   (if (codeql--result-node-visitable node)
       ;; since we have our own link type, also add in a column, and the end
@@ -3428,7 +3447,8 @@ See `codeql-highlight-visited-location'."
           ;; enable our xref backend, this kicks in templated queries for refs and defs
           (codeql-xref-backend))))))
 
-(org-link-set-parameters "codeql" :follow #'codeql--org-open-file-link)
+(with-eval-after-load 'ol
+  (org-link-set-parameters "codeql" :follow #'codeql--org-open-file-link))
 
 ;;; Jumping to result locations, with optional consult and embark support
 
@@ -3685,6 +3705,7 @@ entries, see `codeql--parse-link-location' for the positions.")
 
 (defun codeql--diagnostics-text (text)
   "Return org TEXT as plain text, with links replaced by their descriptions."
+  (codeql--require-org)
   (string-trim
    (replace-regexp-in-string
     "[ \t]+" " "
@@ -3714,6 +3735,7 @@ Whole file locations are shown as just their FILE after \"... \"."
 
 (defun codeql--diagnostics-table-header ()
   "Return the column names of the org table at point, or nil if it has none."
+  (codeql--require-org)
   (save-excursion
     (goto-char (org-table-begin))
     (when (looking-at-p "[ \t]*|-")
@@ -3748,7 +3770,7 @@ Whole file locations are shown as just their FILE after \"... \"."
 The result is a hash table as described in `codeql--results-diagnostics'.
 The locations of raw result rows and of problem results are `:warning'
 diagnostics, path steps and related locations are `:note' diagnostics."
-  (require 'org-table)
+  (codeql--require-org)
   (let ((diagnostics (make-hash-table :test #'equal))
         (seen (make-hash-table :test #'equal))
         (header-cache nil))
@@ -3961,6 +3983,7 @@ the location within the alert.")
 
 (defun codeql--line-links ()
   "Return the codeql: links on the current line, see `codeql--alert'."
+  (codeql--require-org)
   (let (links)
     (save-excursion
       (beginning-of-line)
@@ -4150,6 +4173,7 @@ The indices are -1 when there is no current alert."
 
 The current buffer is the results buffer LINK is followed from, and the
 alert at point is preferred when it has the location of LINK."
+  (codeql--require-org)
   (when (codeql--results-buffer-p (current-buffer))
     (let* ((alerts (codeql--results-alerts))
            (link (org-link-unescape link))
@@ -4189,6 +4213,7 @@ alert at point is preferred when it has the location of LINK."
 
 (defun codeql--alert-visit (results alert-index location-index)
   "Visit the location at LOCATION-INDEX of the alert at ALERT-INDEX of RESULTS."
+  (codeql--require-org)
   (with-current-buffer results
     (let* ((alerts (codeql--results-alerts))
            (alert (aref alerts alert-index))
@@ -5597,6 +5622,7 @@ Interactively, prompt for a run, defaulting to the most recent one."
 
 (defun codeql--performance-predicate-at-point ()
   "Return the name of the predicate in the table row at point, if any."
+  (codeql--require-org)
   (when (org-at-table-p)
     (let ((cell (car (last (split-string
                             (buffer-substring-no-properties (line-beginning-position)
