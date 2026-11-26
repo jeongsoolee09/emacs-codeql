@@ -61,7 +61,7 @@ Emacs 29.1+ comes with `use-package`, `tree-sitter` and `eglot` built-in, which 
   (emacs-codeql :repo "anticomputer/emacs-codeql"
 		:fetcher github-ssh
 		:branch "main"
-		:files (:defaults "bin"))
+		:files (:defaults "bin" "queries"))
   :demand t
   :init
   (setq codeql-transient-binding "C-c q")
@@ -78,7 +78,7 @@ Emacs 29.1+ comes with `use-package`, `tree-sitter` and `eglot` built-in, which 
   (emacs-codeql :repo "anticomputer/emacs-codeql"
 		:fetcher github-ssh
 		:branch "main"
-		:files (:defaults "bin"))
+		:files (:defaults "bin" "queries"))
   :after tree-sitter-langs
   :demand t
   :init
@@ -110,7 +110,7 @@ Users of `straight.el` can use the below `use-package` declaration:
 		:host github
 		:repo "anticomputer/emacs-codeql"
 		:branch "main"
-        :files (:defaults "bin"))
+        :files (:defaults "bin" "queries"))
   :after tree-sitter-langs
   :demand t
   :init
@@ -333,9 +333,11 @@ Just like the vscode extension, `emacs-codeql` lets you browse the AST of a data
 
 ### Graph results and the CFG Viewer
 
-Results of `@kind graph` queries are interpreted as graphviz dot files with `codeql bqrs interpret --format=dot`. When graphviz's `dot` is installed they are rendered to an image, as set by `codeql-graph-format` (`svg` by default, or `png`), and shown in `image-mode`. Otherwise, or when `codeql-graph-format` is `nil`, the dot file itself is opened.
+Results of `@kind graph` queries are interpreted as graphviz dot files with `codeql bqrs interpret --format=dot` and shown in a `codeql-graph-mode` buffer. When graphviz's `dot` is installed the graph is rendered to an image, as set by `codeql-graph-format` (`svg` by default, or `png`); otherwise, or when `codeql-graph-format` is `nil`, the dot source is shown.
 
-`M-x RET codeql-view-cfg RET` shows the control flow graph of the function at point in a database source archive file, like the vscode extension's CFG viewer. It runs the printCfg query of the database language's library pack, which is available for e.g. C/C++, C#, Java, Python, Ruby and Swift.
+Much like [org-graph-view](https://github.com/alphapapa/org-graph-view), the rendered nodes are clickable: `mouse-1` on a node jumps to its location in the database source archive, and `RET` lets you pick a node by its label with `completing-read`. `f` cycles the viewing format between svg, png and the dot source, and `g` re-renders the graph.
+
+`M-x RET codeql-view-cfg RET` shows the control flow graph of the function at point in a database source archive file, like the vscode extension's CFG viewer. It runs the printCfg query of the database language's library pack, which is available for e.g. C/C++, C#, Java, Python, Ruby and Swift. For JavaScript, which ships no printCfg query, `emacs-codeql` uses its own bundled query from the `queries` directory, so make sure your package recipe includes it (e.g. `:files (:defaults "bin" "queries")`).
 
 ![screenshot](img/codeql-ast-viewer.png?raw=true "emacs-codeql")
 

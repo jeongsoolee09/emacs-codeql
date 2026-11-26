@@ -709,43 +709,154 @@ OUTPUT is called with the arguments when it is a function."
       (cl-letf (((symbol-function 'codeql--cli-command-to-string) #'ignore))
         (should-not (codeql--bqrs-to-dot bqrs "rb/print-cfg" "graph"))))))
 
-(defmacro codeql-ported-test--capturing-shown (shown &rest body)
-  "Run BODY, pushing the files it shows in other windows onto SHOWN."
-  (declare (indent 1) (debug t))
-  `(let ((,shown nil))
-     (cl-letf (((symbol-function 'find-file-noselect) #'identity)
-               ((symbol-function 'switch-to-buffer-other-window)
-                (lambda (file) (push file ,shown)))
+(defmacro codeql-ported-test--with-graph-buffer (dot nodes &rest body)
+  "Run BODY in the `codeql-graph-mode' buffer of the dot file DOT with NODES."
+  (declare (indent 2) (debug t))
+  `(codeql-ported-test--with-query-buffer
+     (cl-letf (((symbol-function 'switch-to-buffer-other-window) #'ignore)
                ((symbol-function 'message) #'ignore))
-       ,@body)))
+       (codeql--show-graph ,dot ,nodes query-buffer)
+       (with-current-buffer (format "*codeql-graph: %s*" (file-name-base ,dot))
+         ,@body))))
+
+(defun codeql-ported-test--graph-rendered-p ()
+  "Return non-nil when the graph of the current buffer has been rendered."
+  (not (process-live-p codeql--graph-render-process)))
+
+(defconst codeql-ported-test--dot
+  "digraph {\n  compound=true;\n  0[\"label\"=\"a\\\\n b\"; ];\n  1[\"label\"=\"say \\\"hi\\\"\"; ];\n  0 -> 1[];\n}\n"
+  "A dot file as written by `codeql bqrs interpret'.")
+
+(defconst codeql-ported-test--graph-nodes
+  '(("a\\n      b" . "/arch/src/a.js::1:1:1:3") ("say \"hi\"" . nil))
+  "The nodes of `codeql-ported-test--dot', the second has no location.")
+
+(ert-deftest codeql-ported-test-dot-node-labels ()
+  "Dot node labels are read by node id, unescaped."
+  (codeql-ported-test--with-temp-dir dir
+    (should (equal (codeql--dot-node-labels
+                    (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--dot))
+                   '("a\\n b" "say \"hi\"")))
+    ;; dot files not numbered from 0 like those of bqrs interpret
+    (should-not (codeql--dot-node-labels
+                 (codeql-ported-test--write (concat dir "h.dot")
+                                            "digraph {\n  1[\"label\"=\"a\"; ];\n}\n")))))
+
+(ert-deftest codeql-ported-test-bqrs-graph-nodes ()
+  "Graph nodes are the distinct entities of the nodes result set."
+  (cl-letf (((symbol-function 'codeql--source-link-prefix) (lambda () "/arch"))
+            ((symbol-function 'codeql--bqrs-to-json)
+             (lambda (_bqrs entities result-set)
+               (should (equal entities "id,url,string"))
+               (should (equal result-set "nodes"))
+               (json-encode
+                `((tuples
+                   . [[((id . 1) (label . "f()")
+                        (url (uri . "file:///src/a.js") (startLine . 2) (startColumn . 3)
+                             (endLine . 2) (endColumn . 5)))
+                       "semmle.order" "1"]
+                      [((id . 2) (label . "entry")
+                        (url (uri . "file:///src/a.js") (startLine . 1) (startColumn . 1)
+                             (endLine . 4) (endColumn . 1)))
+                       "semmle.label" "entry of f"]
+                      [((id . 1) (label . "f()")) "semmle.label" "call to f"]
+                      [((id . 3) (label . "nowhere") (url (uri . "file:///")))
+                       "semmle.label" "nowhere"]]))))))
+    (should (equal (codeql--bqrs-graph-nodes "r.bqrs")
+                   '(("call to f" . "/arch/src/a.js::2:3:2:5")
+                     ("entry of f" . "/arch/src/a.js::1:1:4:1")
+                     ("nowhere"))))))
+
+(ert-deftest codeql-ported-test-graph-match-nodes ()
+  "Graph nodes are only known when they match the dot nodes in order."
+  (codeql-ported-test--with-temp-dir dir
+    (let ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--dot)))
+      ;; whitespace is collapsed in dot labels
+      (should (equal (codeql--graph-match-nodes dot codeql-ported-test--graph-nodes)
+                     (vconcat codeql-ported-test--graph-nodes)))
+      (should-not (codeql--graph-match-nodes dot (reverse codeql-ported-test--graph-nodes)))
+      (should-not (codeql--graph-match-nodes dot (cdr codeql-ported-test--graph-nodes))))))
+
+(ert-deftest codeql-ported-test-parse-image-map ()
+  "Graphviz image maps become image :map areas with node tooltips."
+  (let ((map (codeql--parse-image-map
+              (concat "<map id=\"%1\" name=\"%1\">\n"
+                      "<area shape=\"poly\" id=\"0\" href=\"0\" title=\"a\" coords=\"1,2,3,4,5,6\"/>\n"
+                      "<area shape=\"rect\" id=\"1\" href=\"1\" title=\"b\" coords=\"1,2,3,4\"/>\n"
+                      "<area shape=\"circle\" id=\"2\" href=\"2\" title=\"c\" coords=\"5,6,7\"/>\n"
+                      "</map>\n")
+              (vconcat codeql-ported-test--graph-nodes))))
+    (should (equal map
+                   '(((poly . [1 2 3 4 5 6]) "0" (help-echo "a\\n      b\n/arch/src/a.js"))
+                     ((rect (1 . 2) 3 . 4) "1" (help-echo "say \"hi\"\nNo location"))
+                     ((circle (5 . 6) . 7) "2" (help-echo "c")))))))
+
+(ert-deftest codeql-ported-test-svg-size-to-pixels ()
+  "SVG sizes in points become pixels, like the coordinates of image maps."
+  (should (equal (codeql--svg-size-to-pixels "<svg width=\"72pt\" height=\"36.5pt\"\n viewBox")
+                 "<svg width=\"96\" height=\"49\"\n viewBox")))
 
 (ert-deftest codeql-ported-test-show-graph-as-dot ()
   "Without a graph format or graphviz, the dot file is shown."
   (codeql-ported-test--with-temp-dir dir
     (let ((dot (codeql-ported-test--write (concat dir "g.dot") "digraph { a -> b }")))
       (let ((codeql-graph-format nil))
-        (codeql-ported-test--capturing-shown shown
-          (codeql--show-graph dot)
-          (should (equal shown (list dot)))))
+        (codeql-ported-test--with-graph-buffer dot nil
+          (should (eq major-mode 'codeql-graph-mode))
+          (should (equal (buffer-string) "digraph { a -> b }"))))
       (let ((codeql-graph-format "svg"))
-        (codeql-ported-test--capturing-shown shown
-          (cl-letf (((symbol-function 'executable-find) #'ignore))
-            (codeql--show-graph dot))
-          (should (equal shown (list dot))))))))
+        (cl-letf (((symbol-function 'executable-find) #'ignore))
+          (codeql-ported-test--with-graph-buffer dot nil
+            (should-not codeql--graph-format)
+            (should (string-match-p "Install graphviz.*\n\ndigraph" (buffer-string)))))))))
 
 (ert-deftest codeql-ported-test-show-graph-rendered ()
-  "With graphviz, the graph is rendered in `codeql-graph-format'."
+  "With graphviz, the graph is rendered with an image map of its nodes."
   (skip-unless (executable-find "dot"))
   (codeql-ported-test--with-temp-dir dir
-    (let ((dot (codeql-ported-test--write (concat dir "g.dot") "digraph { a -> b }"))
-          (codeql-graph-format "svg"))
-      (codeql-ported-test--capturing-shown shown
-        (codeql--show-graph dot)
-        (codeql-ported-test--wait (lambda () shown))
-        (should (equal shown (list (concat dir "g.svg"))))
-        (should (string-match-p "<svg" (with-temp-buffer
-                                         (insert-file-contents (car shown))
-                                         (buffer-string))))))))
+    (let ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--dot))
+          (codeql-graph-format "svg")
+          inserted)
+      (cl-letf (((symbol-function 'codeql--graph-insert-image)
+                 (lambda (image map) (push (cons image map) inserted) (insert "image"))))
+        (codeql-ported-test--with-graph-buffer dot codeql-ported-test--graph-nodes
+          (should (eq codeql--org-query-buffer query-buffer))
+          (should (equal codeql--graph-nodes (vconcat codeql-ported-test--graph-nodes)))
+          (codeql-ported-test--wait #'codeql-ported-test--graph-rendered-p)
+          (should (equal inserted `((,(concat dir "g.svg") . ,(concat dir "g.cmapx")))))
+          (should (equal (buffer-string) "image"))
+          ;; areas link to their node ids
+          (should (string-match-p "href=\"1\""
+                                  (with-temp-buffer
+                                    (insert-file-contents (concat dir "g.cmapx"))
+                                    (buffer-string))))
+          ;; f cycles through png and the dot file back to svg
+          (codeql-graph-cycle-format)
+          (codeql-ported-test--wait #'codeql-ported-test--graph-rendered-p)
+          (should (equal (caar inserted) (concat dir "g.png")))
+          (codeql-graph-cycle-format)
+          (should-not codeql--graph-format)
+          (should (string-prefix-p "digraph {" (buffer-string)))
+          (codeql-graph-cycle-format)
+          (should (equal codeql--graph-format "svg"))
+          (codeql-ported-test--wait #'codeql-ported-test--graph-rendered-p)
+          (should (= (length inserted) 3)))))))
+
+(ert-deftest codeql-ported-test-graph-insert-image ()
+  "Rendered graphs are shown as images with a clickable map of their nodes."
+  (skip-unless (and (executable-find "dot") (display-graphic-p)
+                    (image-type-available-p 'svg)))
+  (codeql-ported-test--with-temp-dir dir
+    (let ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--dot)))
+      (should (zerop (call-process "dot" nil nil nil "-NURL=\\N" "-Tsvg" "-o"
+                                   (concat dir "g.svg") "-Tcmapx" "-o" (concat dir "g.cmapx")
+                                   dot)))
+      (with-temp-buffer
+        (setq codeql--graph-nodes (vconcat codeql-ported-test--graph-nodes))
+        (codeql--graph-insert-image (concat dir "g.svg") (concat dir "g.cmapx"))
+        (let ((image (get-text-property (point-min) 'display)))
+          (should (eq (image-property image :type) 'svg))
+          (should (equal (mapcar #'cadr (image-property image :map)) '("0" "1"))))))))
 
 (ert-deftest codeql-ported-test-show-graph-render-failure ()
   "When graphviz fails, the dot file is shown instead."
@@ -753,10 +864,84 @@ OUTPUT is called with the arguments when it is a function."
   (codeql-ported-test--with-temp-dir dir
     (let ((dot (codeql-ported-test--write (concat dir "g.dot") "digraph { a -> b }"))
           (codeql-graph-format "no-such-format"))
-      (codeql-ported-test--capturing-shown shown
-        (codeql--show-graph dot)
-        (codeql-ported-test--wait (lambda () shown))
-        (should (equal shown (list dot)))))))
+      (codeql-ported-test--with-graph-buffer dot nil
+        (codeql-ported-test--wait #'codeql-ported-test--graph-rendered-p)
+        (should-not codeql--graph-format)
+        (should (string-match-p "\\`Failed to render graph.*\n\ndigraph" (buffer-string)))))))
+
+(ert-deftest codeql-ported-test-graph-visit-node ()
+  "Graph nodes are visited by clicking them or choosing their label."
+  (codeql-ported-test--with-temp-dir dir
+    (let ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--dot))
+          (codeql-graph-format nil)
+          visited)
+      (codeql-ported-test--with-graph-buffer dot codeql-ported-test--graph-nodes
+        (cl-letf (((symbol-function 'codeql--org-open-file-link)
+                   (lambda (link) (push link visited))))
+          (let ((click (lambda (area)
+                         (codeql-graph-visit-node-at-mouse
+                          `(mouse-1 (,(selected-window) ,area (0 . 0) 0))))))
+            (with-selected-window (display-buffer (current-buffer))
+              (funcall click "0")
+              (should (equal visited '("/arch/src/a.js::1:1:1:3")))
+              (should-error (funcall click "1") :type 'user-error)
+              ;; clicks outside of nodes
+              (funcall click 1)
+              (should (equal (length visited) 1))))
+          ;; only nodes with locations can be chosen
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (_prompt candidates &rest _)
+                       (should (= (length candidates) 1))
+                       (car (car candidates)))))
+            (codeql-graph-visit-node))
+          (should (equal visited '("/arch/src/a.js::1:1:1:3" "/arch/src/a.js::1:1:1:3")))
+          ;; unknown nodes
+          (setq codeql--graph-nodes nil)
+          (should-error (codeql-graph-visit-node) :type 'user-error))))))
+
+(ert-deftest codeql-ported-test-find-templated-query ()
+  "Templated queries of library packs take precedence over bundled ones."
+  (codeql-ported-test--with-temp-dir dir
+    (codeql-ported-test--with-query-buffer
+      (setq codeql--search-paths-buffer-local (list (concat dir "pack")))
+      (cl-letf (((symbol-function 'codeql--file-exists-p) #'file-exists-p))
+        (should (equal (codeql--find-templated-query :javascript "printCfg")
+                       (expand-file-name "javascript/printCfg.ql"
+                                         codeql--bundled-queries-directory)))
+        (should (file-exists-p (codeql--find-templated-query :javascript "printCfg")))
+        (should-not (codeql--find-templated-query :javascript "noSuchQuery"))
+        (should-not (codeql--find-templated-query :ruby "printCfg"))
+        (let ((pack-query (codeql-ported-test--write (concat dir "pack/printCfg.ql") "")))
+          (should (equal (codeql--find-templated-query :javascript "printCfg")
+                         pack-query)))))))
+
+(ert-deftest codeql-ported-test-run-bundled-templated-query ()
+  "Bundled templated queries run with the library path of the query buffer."
+  (codeql-ported-test--with-query-buffer
+    (setq codeql--active-database "/dbs/js-db/"
+          codeql--database-source-archive-root "/dbs/js-db/src"
+          codeql--search-paths-buffer-local nil
+          buffer-file-name "/work/pack/Query.ql")
+    (let ((codeql-query-server "query-server2")
+          resolved run)
+      (cl-letf (((symbol-function 'codeql--await-search-paths) #'ignore)
+                ((symbol-function 'message) #'ignore)
+                ((symbol-function 'codeql--resolve-query-paths)
+                 (lambda (path) (push path resolved) t))
+                ((symbol-function 'codeql--query-server-run-query-from-path)
+                 (lambda (path quick-eval values &rest _)
+                   (setq run (list path quick-eval values)))))
+        (codeql--run-templated-query :javascript "printCfg" "/dbs/js-db/src/app/a.js"
+                                     (current-buffer) '(3 . 7))
+        (should (equal resolved '("/work/pack/Query.ql")))
+        (should (equal run `(,(expand-file-name "javascript/printCfg.ql"
+                                                codeql--bundled-queries-directory)
+                             nil
+                             (:selectedSourceFile "/app/a.js"
+                              :selectedSourceLine "3" :selectedSourceColumn "7"))))
+        (should-error (codeql--run-templated-query :javascript "noSuchQuery"
+                                                   "/dbs/js-db/src/app/a.js" (current-buffer)))))))
+
 
 ;;; Searching the database source archive
 
