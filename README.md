@@ -29,6 +29,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Database source archive xref backend support
 - Searching the database source archive with `codeql-database-grep`
 - GitHub permalinks to the results of SARIF files with version control provenance
+- Browsing multi-repository variant analysis results of gh-mrva sessions
 - A `codeql-doctor` health report of the setup
 - AST Viewer with xref backend support
 - Rendering of graph results with graphviz, and a CFG viewer
@@ -271,6 +272,12 @@ When the SARIF records the repository and revision it was produced for in its `v
 (with-eval-after-load 'emacs-codeql
   (define-key codeql-results-mode-map (kbd "C-c C-l") #'codeql-copy-permalink))
 ```
+
+#### Multi-repository variant analysis
+
+`codeql-mrva` (`v` in the query server transient) browses the results of [gh-mrva](https://github.com/GitHubSecurityLab/gh-mrva) sessions, which you submit with `gh mrva submit`. Install the extension with `gh extension install GitHubSecurityLab/gh-mrva`.
+
+After picking a session, its repositories with findings are listed in a `codeql-mrva-mode` buffer, along with their finding and star counts. `RET` downloads the results of the repository at point below `codeql-state-dir` and renders them for the query buffer `codeql-mrva` was called from, like `codeql-load-sarif` does. `g` refreshes the status of the session. The source files of result locations are fetched from GitHub with `gh api` as you visit them, at the revision that was analyzed, and `codeql-copy-permalink` works on them too. Results of queries that aren't problem or path-problem queries are shown decoded.
 
 #### Query performance
 

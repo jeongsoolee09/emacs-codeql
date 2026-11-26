@@ -3680,7 +3680,9 @@ See `codeql-highlight-visited-location'."
     (when (directory-name-p filename)
       (user-error "This location has no source file"))
     ;; rather than visiting a new empty file
-    (unless (file-exists-p filename)
+    (unless (or (file-exists-p filename)
+                ;; the sources of variant analysis results, see `codeql-mrva'
+                (codeql--permalink-fetch-file filename (codeql--results-permalink-info)))
       (user-error "Source file not found: %s" filename))
 
     (codeql--alerts-note-visit link)
@@ -5444,6 +5446,275 @@ See `codeql-copy-permalink'."
   (interactive)
   (browse-url (codeql--permalink-at-point)))
 
+;;; Multi-repository variant analysis with gh-mrva
+
+;; see https://github.com/GitHubSecurityLab/gh-mrva, sessions are submitted
+;; with `gh mrva submit' and browsed from here
+
+(defvar-local codeql--mrva-session nil
+  "The name of the gh-mrva session of a `codeql-mrva-mode' buffer.")
+
+(defvar-local codeql--mrva-query-buffer nil
+  "The query buffer that the results of a `codeql-mrva-mode' buffer render in.")
+
+(defvar-local codeql--mrva-status nil
+  "The parsed `gh mrva status' of the session of a `codeql-mrva-mode' buffer.")
+
+(defun codeql--mrva-directory (&rest components)
+  "Return the local directory of gh-mrva downloads, joined with COMPONENTS."
+  (let ((directory (expand-file-name "mrva" codeql-state-dir)))
+    (dolist (component components)
+      (setq directory (expand-file-name component directory)))
+    directory))
+
+(defun codeql--mrva-sources-directory (nwo run-id)
+  "Return the directory that the sources of NWO in RUN-ID are fetched to."
+  (file-name-as-directory
+   (codeql--mrva-directory "sources" (format "%s_%s" (string-replace "/" "_" nwo) run-id))))
+
+(defun codeql--gh (&rest args)
+  "Run the local gh with ARGS and return its stdout.
+
+Signal an error with its output when it fails."
+  (let ((gh (or (executable-find "gh")
+                (user-error "gh not found, see https://cli.github.com"))))
+    (with-temp-buffer
+      (let* ((stderr (make-temp-file "codeql-gh-stderr"))
+             (code (unwind-protect
+                       (let ((default-directory (expand-file-name "~/")))
+                         (apply #'call-process gh nil (list t stderr) nil args))
+                     (setq stderr (prog1 (with-temp-buffer
+                                           (insert-file-contents stderr)
+                                           (string-trim (buffer-string)))
+                                    (delete-file stderr))))))
+        (unless (eql code 0)
+          (error "gh %s failed: %s" (string-join args " ")
+                 (if (string-empty-p stderr) (string-trim (buffer-string)) stderr)))
+        (buffer-string)))))
+
+(defun codeql--gh-json (&rest args)
+  "Run the local gh with ARGS and return its parsed JSON output, or nil."
+  (let ((output (string-trim (apply #'codeql--gh args))))
+    (unless (or (string-empty-p output) (equal output "null"))
+      (json-parse-string output :object-type 'alist :null-object nil))))
+
+(defun codeql--permalink-fetch-file (file info)
+  "Fetch the missing FILE from the GitHub repository of permalink INFO.
+
+This only fetches into the gh-mrva sources directory, where FILE is
+relative to one of the roots of INFO, see
+`codeql--results-permalink-info'.  Return non-nil if FILE was fetched."
+  (when-let* ((info)
+              ((not (file-remote-p file)))
+              ((string-prefix-p (file-name-as-directory (codeql--mrva-directory "sources"))
+                                (expand-file-name file)))
+              (path (codeql--permalink-relative-path file (plist-get info :roots)))
+              (url (url-generic-parse-url (plist-get info :repository)))
+              ((member (url-type url) '("http" "https")))
+              (nwo (replace-regexp-in-string
+                    "\\`/+\\|\\(?:\\.git\\)?/*\\'" "" (url-filename url))))
+    (message "Fetching %s from %s at %s" path nwo (plist-get info :revision))
+    (let ((contents (condition-case err
+                        (apply #'codeql--gh
+                               `("api"
+                                 ,@(unless (equal (url-host url) "github.com")
+                                     (list "--hostname" (url-host url)))
+                                 "-H" "Accept: application/vnd.github.raw"
+                                 ,(format "repos/%s/contents/%s?ref=%s"
+                                          nwo
+                                          (mapconcat #'url-hexify-string
+                                                     (split-string path "/") "/")
+                                          (url-hexify-string (plist-get info :revision)))))
+                      (error (message "%s" (error-message-string err)) nil))))
+      (when contents
+        (make-directory (file-name-directory file) t)
+        (let ((coding-system-for-write 'no-conversion))
+          (with-temp-file file
+            (set-buffer-multibyte nil)
+            (insert contents)))
+        t))))
+
+(defun codeql--mrva-sessions ()
+  "Return the saved gh-mrva sessions, newest first."
+  (sort (append (codeql--gh-json "mrva" "list" "--json") nil)
+        (lambda (a b)
+          (string> (or (alist-get 'timestamp a) "") (or (alist-get 'timestamp b) "")))))
+
+(defun codeql-mrva (session)
+  "Browse the results of the gh-mrva SESSION.
+
+Sessions are submitted with `gh mrva submit'.  The repositories with
+findings are listed in a `codeql-mrva-mode' buffer, from which their
+results are downloaded and rendered for the current query buffer."
+  (interactive
+   (progn
+     (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+     (let* ((sessions (or (codeql--mrva-sessions)
+                          (user-error "No gh-mrva sessions, submit one with gh mrva submit")))
+            (table (mapcar (lambda (session) (cons (alist-get 'name session) session))
+                           sessions)))
+       (list (completing-read
+              "gh-mrva session: "
+              (lambda (string pred action)
+                (if (eq action 'metadata)
+                    `(metadata
+                      (display-sort-function . identity)
+                      (annotation-function
+                       . ,(lambda (name)
+                            (let ((session (cdr (assoc name table))))
+                              (format "  %s  %s  %s repositories"
+                                      (replace-regexp-in-string
+                                       "T\\([0-9:]+\\).*" " \\1"
+                                       (or (alist-get 'timestamp session) ""))
+                                      (or (alist-get 'language session) "")
+                                      (or (alist-get 'repository_count session) "?"))))))
+                  (complete-with-action action table string pred)))
+              nil t)))))
+  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (let ((query-buffer (current-buffer)))
+    (with-current-buffer (get-buffer-create (format "*codeql-mrva: %s*" session))
+      (codeql-mrva-mode)
+      (setq codeql--mrva-session session)
+      (setq codeql--mrva-query-buffer query-buffer)
+      (revert-buffer)
+      (pop-to-buffer (current-buffer)))))
+
+(defun codeql--mrva-header-line ()
+  "Return the `header-line-format' summary of the session status."
+  (let ((status codeql--mrva-status))
+    (if (not status)
+        (format "%s: fetching status..." codeql--mrva-session)
+      (format "%s: %s, %d findings in %d repositories, %d scans, %d failed, %d skipped"
+              codeql--mrva-session
+              (alist-get 'status status)
+              (or (alist-get 'total_findings_count status) 0)
+              (or (alist-get 'total_repositories_with_findings status) 0)
+              (or (alist-get 'total_successful_scans status) 0)
+              (or (alist-get 'total_failed_scans status) 0)
+              (or (alist-get 'total_skipped_repositories status) 0)))))
+
+(defun codeql--mrva-refresh ()
+  "Fetch the status of the session of the current `codeql-mrva-mode' buffer."
+  (let ((status (car (append (codeql--gh-json "mrva" "status" "--json"
+                                              "--session" codeql--mrva-session)
+                             nil))))
+    (setq codeql--mrva-status status)
+    (cl-loop for run across (or (alist-get 'runs status) [])
+             when (equal (alist-get 'status run) "failed")
+             do (message "Run %s of %s failed: %s"
+                         (alist-get 'id run) (alist-get 'query_id run)
+                         (alist-get 'failure_reason run)))
+    (setq tabulated-list-entries
+          (cl-loop for repo across (or (alist-get 'repositories_with_findings status) [])
+                   collect (list repo
+                                 (vector (alist-get 'nwo repo)
+                                         (number-to-string (alist-get 'count repo))
+                                         (number-to-string (or (alist-get 'stars repo) 0))
+                                         (or (alist-get 'query_id repo) "")
+                                         (number-to-string (alist-get 'run_id repo))))))
+    (setq header-line-format (codeql--mrva-header-line))))
+
+(defun codeql--mrva-numeric-sort (column)
+  "Return a `tabulated-list-format' sort predicate of the numeric COLUMN."
+  (lambda (a b)
+    (< (string-to-number (aref (cadr a) column))
+       (string-to-number (aref (cadr b) column)))))
+
+(defvar codeql-mrva-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'codeql-mrva-load-results)
+    map)
+  "Keymap for `codeql-mrva-mode'.")
+
+(define-derived-mode codeql-mrva-mode tabulated-list-mode "CodeQL-MRVA"
+  "Major mode for the repositories with findings of a gh-mrva session.
+
+\\<codeql-mrva-mode-map>\\[codeql-mrva-load-results] shows the results of the repository at point, \\[revert-buffer]
+refreshes the session status.
+
+\\{codeql-mrva-mode-map}"
+  (setq tabulated-list-format
+        (vector '("Repository" 40 t)
+                (list "Findings" 9 (codeql--mrva-numeric-sort 1) :right-align t)
+                (list "Stars" 7 (codeql--mrva-numeric-sort 2) :right-align t)
+                '("Query" 35 t)
+                '("Run" 12 t)))
+  (setq tabulated-list-sort-key '("Stars" . t))
+  (setq tabulated-list-padding 1)
+  (add-hook 'tabulated-list-revert-hook #'codeql--mrva-refresh nil t)
+  (tabulated-list-init-header)
+  (setq header-line-format (codeql--mrva-header-line)))
+
+(defun codeql--mrva-show-results (repo directory query-buffer)
+  "Show the downloaded results of REPO in DIRECTORY for QUERY-BUFFER."
+  (let* ((nwo (alist-get 'nwo repo))
+         (run-id (alist-get 'run_id repo))
+         (base (expand-file-name (format "%s_%s" (string-replace "/" "_" nwo) run-id)
+                                 directory))
+         (sarif (concat base ".sarif"))
+         (bqrs (concat base ".bqrs")))
+    (unless (buffer-live-p query-buffer)
+      (user-error "The query buffer of this session is gone, use M-x codeql-mrva again"))
+    (cond
+     ((file-exists-p sarif)
+      (let ((sources (codeql--mrva-sources-directory nwo run-id)))
+        (make-directory sources t)
+        (with-current-buffer query-buffer
+          (codeql-load-sarif sarif sources))))
+     ((file-exists-p bqrs)
+      (let ((text (with-current-buffer query-buffer
+                    (codeql--cli-command-to-string
+                     (list "bqrs" "decode" "--format=text" "--entities=string,url" bqrs)))))
+        (with-current-buffer (get-buffer-create (format "*codeql-mrva: %s %s*" nwo run-id))
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (insert (or text (format "Could not decode %s" bqrs))))
+          (goto-char (point-min))
+          (special-mode)
+          (pop-to-buffer (current-buffer)))))
+     (t (message "No results were downloaded for %s" nwo)))))
+
+(defun codeql-mrva-load-results (repo)
+  "Download and show the results of the gh-mrva REPO at point.
+
+Results are downloaded below `codeql-state-dir' once.  SARIF results
+are rendered like `codeql-load-sarif' does for a source checkout, whose
+files are fetched from GitHub as they are visited, at the revision that
+was analyzed.  Raw BQRS results are shown decoded."
+  (interactive (list (or (tabulated-list-get-id)
+                         (user-error "No repository at point"))))
+  (let* ((nwo (alist-get 'nwo repo))
+         (run-id (alist-get 'run_id repo))
+         (directory (codeql--mrva-directory codeql--mrva-session))
+         (base (expand-file-name (format "%s_%s" (string-replace "/" "_" nwo) run-id)
+                                 directory))
+         (query-buffer codeql--mrva-query-buffer)
+         (gh (or (executable-find "gh")
+                 (user-error "gh not found, see https://cli.github.com"))))
+    (if (or (file-exists-p (concat base ".sarif")) (file-exists-p (concat base ".bqrs")))
+        (codeql--mrva-show-results repo directory query-buffer)
+      (make-directory directory t)
+      (message "Downloading the results of %s..." nwo)
+      (let ((output (generate-new-buffer " *codeql-mrva-download*")))
+        (make-process
+         :name "codeql-mrva-download"
+         :buffer output
+         :command (list gh "mrva" "download"
+                        "--run" (number-to-string run-id)
+                        "--nwo" nwo
+                        "--output-dir" directory)
+         :sentinel
+         (lambda (process _event)
+           (unless (process-live-p process)
+             (let ((text (with-current-buffer output (string-trim (buffer-string)))))
+               (kill-buffer output)
+               (cond
+                ((string-match-p "try again later" text)
+                 (message "The results of %s are not ready yet" nwo))
+                ((not (eql (process-exit-status process) 0))
+                 (message "Downloading the results of %s failed: %s" nwo text))
+                (t (codeql--mrva-show-results repo directory query-buffer)))))))))))
+
 ;; request cancellation control
 
 (defvar-local codeql--query-server-jsonrpc-current-id nil)
@@ -6864,7 +7135,10 @@ STATUS is one of the symbols ok, info, warn or error."
           '(info "gh codeql" "not installed"))
          (codeql-use-gh-codeql-extension-when-available
           '(ok "gh codeql" "installed and preferred"))
-         (t '(info "gh codeql" "disabled by `codeql-use-gh-codeql-extension-when-available'")))))
+         (t '(info "gh codeql" "disabled by `codeql-use-gh-codeql-extension-when-available'")))
+        (if (and (not remote) (eql 0 (car-safe (codeql--doctor-run gh "mrva" "--help"))))
+            '(ok "gh mrva" "installed")
+          '(info "gh mrva" "not installed, it's needed for `codeql-mrva'"))))
      (mapcar (lambda (path)
                (if (codeql--file-exists-p path)
                    (list 'ok "Search path" path)
@@ -7305,6 +7579,7 @@ the FILES wildcard to search, which defaults to all files."
            ("h" "history" codeql-query-history)
            ("C" "compare" codeql-query-history-compare)
            ("l" "load sarif" codeql-load-sarif)
+           ("v" "variant analysis" codeql-mrva)
            ("t" "performance" codeql-query-performance)
            ("T" "compare performance" codeql-query-performance-compare)
            ("c" "cancel" codeql-query-server-cancel-query)]
