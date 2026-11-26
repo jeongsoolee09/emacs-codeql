@@ -107,6 +107,19 @@
 (declare-function org-link-unescape "ol")
 (declare-function org-reveal "org")
 (declare-function treesit-ready-p "treesit")
+(declare-function treesit-parser-list "treesit.c")
+(declare-function treesit-node-at "treesit")
+(declare-function treesit-node-parent "treesit.c")
+(declare-function treesit-node-type "treesit.c")
+(declare-function treesit-node-start "treesit.c")
+(declare-function treesit-node-child "treesit.c")
+(declare-function treesit-node-child-by-field-name "treesit.c")
+(declare-function tree-sitter-node-at-pos "tree-sitter")
+(declare-function tsc-get-parent "tsc")
+(declare-function tsc-node-type "tsc")
+(declare-function tsc-node-start-position "tsc")
+(declare-function tsc-get-child-by-field "tsc")
+(declare-function tsc-get-nth-named-child "tsc")
 (require 'files)
 (require 'project)
 (require 'flymake)
@@ -5035,6 +5048,7 @@ commands can be repeated without the prefix key.")
   (pcase quick-eval
     ('nil "full-query")
     ('count "quick-eval count")
+    ('predicate "quick-eval predicate")
     (_ "quick-eval")))
 
 (defun codeql--query-target (query-path quick-eval)
@@ -5043,11 +5057,19 @@ commands can be repeated without the prefix key.")
 When QUICK-EVAL is nil the whole query runs.  Otherwise the active
 region, or point when there is none, is quick evaluated: the query
 server evaluates the predicate or expression found there.  When
+QUICK-EVAL is `predicate', the predicate enclosing point is evaluated
+instead, see `codeql--enclosing-predicate-name-position'.  When
 QUICK-EVAL is `count', only the number of results is computed."
   (if quick-eval
-      (let* ((bounds (if (use-region-p)
-                         (car (region-bounds))
-                       (cons (point) (point))))
+      (let* ((pred-pos (and (eq quick-eval 'predicate)
+                            (not (use-region-p))
+                            (codeql--enclosing-predicate-name-position)))
+             (bounds (cond ((use-region-p)
+                            (car (region-bounds)))
+                           (pred-pos
+                            (cons pred-pos pred-pos))
+                           (t
+                            (cons (point) (point)))))
              (min (car bounds))
              (max (cdr bounds)))
         ;; positions in CodeQL are 1-based
@@ -5451,6 +5473,52 @@ no region is active, see `codeql--query-target'."
 To evaluate a predicate, put point on its name."
   (interactive)
   (codeql-query-server-run-query t))
+
+(defun codeql--enclosing-predicate-name-position (&optional pos)
+  "Return the position of the name of the predicate enclosing POS, or nil.
+
+POS defaults to point.  Predicates are member predicates, classless
+predicates and characteristic predicates, whose name is their class
+name.  Return nil when POS is outside of any predicate, e.g. in the
+select clause, or when no QL syntax tree is available."
+  (let ((pos (or pos (point))))
+    (cond
+     ;; builtin tree-sitter, emacs 29+
+     ((and (fboundp 'treesit-parser-list)
+           (treesit-parser-list nil 'ql))
+      (cl-loop for node = (treesit-node-at pos 'ql) then (treesit-node-parent node)
+               while node
+               for type = (treesit-node-type node)
+               when (member type '("memberPredicate" "classlessPredicate"))
+               return (treesit-node-start (treesit-node-child-by-field-name node "name"))
+               when (equal type "charpred")
+               return (treesit-node-start (treesit-node-child node 0 t))))
+     ;; emacs-tree-sitter, emacs 28-
+     ((and (bound-and-true-p tree-sitter-tree)
+           (fboundp 'tree-sitter-node-at-pos))
+      (cl-loop for node = (tree-sitter-node-at-pos nil pos) then (tsc-get-parent node)
+               while node
+               for type = (tsc-node-type node)
+               when (memq type '(memberPredicate classlessPredicate))
+               return (tsc-node-start-position (tsc-get-child-by-field node :name))
+               when (eq type 'charpred)
+               return (tsc-node-start-position (tsc-get-nth-named-child node 0)))))))
+
+(defun codeql-query-server-quick-eval-predicate ()
+  "Quick evaluate the predicate enclosing point, or the active region.
+
+Unlike `codeql-query-server-quick-eval', point can be anywhere in the
+predicate, not just on its name.  Outside of any predicate, e.g. in the
+select clause, the whole query runs."
+  (interactive)
+  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (cond ((use-region-p)
+         (codeql-query-server-run-query t))
+        ((codeql--enclosing-predicate-name-position)
+         (codeql-query-server-run-query 'predicate))
+        (t
+         (message "Not in a predicate, running the whole query.")
+         (codeql-query-server-run-query))))
 
 (defun codeql-query-server-quick-eval-count ()
   "Count the results of quick evaluating the region or what is at point.
@@ -6564,6 +6632,7 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
           ["Query"
            ("r" "run" codeql-query-server-run-query)
            ("e" "quick eval" codeql-query-server-quick-eval)
+           ("E" "quick eval predicate" codeql-query-server-quick-eval-predicate)
            ("n" "quick eval count" codeql-query-server-quick-eval-count)
            ("h" "history" codeql-query-history)
            ("C" "compare" codeql-query-history-compare)
