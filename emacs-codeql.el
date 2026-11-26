@@ -6807,6 +6807,170 @@ can corrupt the cache.  Delete anyway? "
 (with-eval-after-load 'embark
   (add-to-list 'embark-keymap-alist '(codeql-database . codeql-database-map)))
 
+;;; Checking the health of the setup
+
+(declare-function eglot-current-server "eglot")
+
+(defun codeql--doctor-run (program &rest args)
+  "Run PROGRAM with ARGS in `default-directory'.
+
+Return (EXIT-CODE . FIRST-LINE-OF-OUTPUT), or nil when it can't run."
+  (condition-case nil
+      (with-temp-buffer
+        (let ((code (apply #'process-file program nil (list (current-buffer) nil) nil args)))
+          (cons code (car (split-string (buffer-string) "\n" t "[ \t\r]+")))))
+    (error nil)))
+
+(defun codeql--doctor-line (status label &optional detail)
+  "Return a report line of STATUS for LABEL, with optional DETAIL.
+
+STATUS is one of the symbols ok, info, warn or error."
+  (format "  %s %s%s\n"
+          (propertize (format "%-7s" (format "[%s]" status))
+                      'face (pcase status
+                              ('ok 'success)
+                              ('warn 'warning)
+                              ('error 'error)
+                              (_ 'shadow)))
+          label
+          (if detail (format ": %s" detail) "")))
+
+(defun codeql--doctor-cli-checks (cli)
+  "Return the `codeql-doctor' checks of the CodeQL CLI command CLI."
+  (let ((remote (file-remote-p default-directory))
+        (gh (executable-find "gh" (file-remote-p default-directory)))
+        (version (and (car cli)
+                      (apply #'codeql--doctor-run
+                             (codeql--tramp-unwrap (car cli))
+                             (append (cdr cli) '("version" "--format=terse"))))))
+    (append
+     (list
+      (cond
+       ((null (car cli))
+        '(error "CLI" "not found, set `codeql-cli' or install the gh codeql extension"))
+       ((eql 0 (car-safe version))
+        (list 'ok "CLI" (format "%s, version %s"
+                                (mapconcat #'identity cli " ") (cdr version))))
+       (t (list 'error "CLI" (format "%s doesn't run: %s"
+                                     (mapconcat #'identity cli " ")
+                                     (or (cdr-safe version) "no output")))))
+      (if gh
+          (list 'ok "gh" gh)
+        '(info "gh" "not found, it's only needed for the gh codeql extension")))
+     (when gh
+       (list
+        (cond
+         ((not (codeql--gh-codeql-cli-available-p))
+          '(info "gh codeql" "not installed"))
+         (codeql-use-gh-codeql-extension-when-available
+          '(ok "gh codeql" "installed and preferred"))
+         (t '(info "gh codeql" "disabled by `codeql-use-gh-codeql-extension-when-available'")))))
+     (mapcar (lambda (path)
+               (if (codeql--file-exists-p path)
+                   (list 'ok "Search path" path)
+                 (list 'warn "Search path" (format "%s doesn't exist" path))))
+             codeql-search-paths)
+     (when remote
+       (list (list 'info "Host" remote))))))
+
+(defun codeql--doctor-tool-checks ()
+  "Return the `codeql-doctor' checks of the external tools."
+  (let ((remote (file-remote-p default-directory)))
+    (list
+     (if-let ((unzip (executable-find "unzip" remote)))
+         (list 'ok "unzip" unzip)
+       '(error "unzip" "not found, database source archives can't be extracted"))
+     (if-let ((zipinfo (executable-find "zipinfo" remote)))
+         (list 'ok "zipinfo" zipinfo)
+       '(info "zipinfo" "not found, unzip is used to list source archives"))
+     (cond
+      ((not codeql-graph-format)
+       '(info "dot" "graph results are shown as dot files, see `codeql-graph-format'"))
+      ((executable-find "dot" remote)
+       (list 'ok "dot" (executable-find "dot" remote)))
+      (t '(warn "dot" "graphviz not found, graph results are shown as dot files"))))))
+
+(defun codeql--doctor-buffer-checks ()
+  "Return the `codeql-doctor' checks of the state of the current QL buffer."
+  (list
+   (if (and codeql--query-server (jsonrpc-running-p codeql--query-server))
+       (list 'ok "Query server" (format "running (%s)" codeql-query-server))
+     '(info "Query server" "not running"))
+   (if codeql--active-database
+       (list 'ok "Database" codeql--active-database)
+     '(info "Database" "none registered"))
+   (cond
+    ((not (featurep 'eglot)) '(info "Language server" "no eglot"))
+    ((eglot-current-server) '(ok "Language server" "connected"))
+    (t '(info "Language server" "not connected")))
+   (list 'info "Search paths" (format "%d configured"
+                                      (length codeql--search-paths-buffer-local)))))
+
+(defun codeql--doctor-checks (ql-buffer)
+  "Return the sections of the `codeql-doctor' report.
+
+Each is a (TITLE . CHECKS) cons, where CHECKS are (STATUS LABEL DETAIL)
+lists.  QL-BUFFER is the QL buffer whose state is checked, or nil."
+  (let ((cli (or (and ql-buffer (buffer-local-value 'codeql--cli-buffer-local ql-buffer))
+                 (ignore-errors (codeql--cli-for-host))))
+        (live-cli-servers (cl-loop for proc being the hash-values of codeql--cli-servers
+                                   count (codeql--cli-server-live-p proc))))
+    (append
+     (list
+      (list "Emacs"
+            (list 'info "Emacs" emacs-version)
+            (cond
+             ((and (fboundp 'treesit-ready-p) (treesit-ready-p 'ql t))
+              '(ok "Tree-sitter" "builtin treesit with the ql grammar"))
+             ((featurep 'tree-sitter)
+              '(ok "Tree-sitter" "elisp-tree-sitter"))
+             (t '(error "Tree-sitter" "no ql grammar available")))
+            (cond
+             ((not codeql-configure-eglot-lsp)
+              '(info "Eglot" "the language server is disabled by `codeql-configure-eglot-lsp'"))
+             ((featurep 'eglot) '(ok "Eglot" "configured for the CodeQL language server"))
+             (t '(warn "Eglot" "not available, there is no language server support"))))
+      (cons "CodeQL CLI" (codeql--doctor-cli-checks cli))
+      (cons "Tools" (codeql--doctor-tool-checks)))
+     (when ql-buffer
+       (list (cons (format "Buffer %s" (buffer-name ql-buffer))
+                   (with-current-buffer ql-buffer
+                     (codeql--doctor-buffer-checks)))))
+     (list
+      (list "CLI servers"
+            (list 'info "Running"
+                  (format "%d%s" live-cli-servers
+                          (if codeql-use-cli-server
+                              ""
+                            ", disabled by `codeql-use-cli-server'"))))))))
+
+(defun codeql-doctor ()
+  "Report on the health of the emacs-codeql setup, like nvim's :checkhealth.
+
+This checks the CodeQL CLI and the tools emacs-codeql depends on for the
+host of the current buffer, and the query server, database and language
+server state of the current QL buffer."
+  (interactive)
+  (let* ((ql-buffer (and (eq major-mode 'ql-tree-sitter-mode) (current-buffer)))
+         (sections (codeql--doctor-checks ql-buffer))
+         (checks (apply #'append (mapcar #'cdr sections)))
+         (errors (cl-count 'error checks :key #'car))
+         (warnings (cl-count 'warn checks :key #'car)))
+    (with-current-buffer (get-buffer-create "*codeql-doctor*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "emacs-codeql doctor, %s: %d error%s, %d warning%s\n"
+                        (format-time-string "%F %T")
+                        errors (if (= errors 1) "" "s")
+                        warnings (if (= warnings 1) "" "s")))
+        (pcase-dolist (`(,title . ,section-checks) sections)
+          (insert "\n" (propertize title 'face 'bold) "\n")
+          (dolist (check section-checks)
+            (insert (apply #'codeql--doctor-line check))))
+        (goto-char (point-min)))
+      (special-mode)
+      (display-buffer (current-buffer)))))
+
 ;;; transient ui for buffer-local server state management
 
 (transient-define-argument codeql-transient-query-server:--threads ()
@@ -7149,7 +7313,8 @@ the FILES wildcard to search, which defaults to all files."
             :description
             (lambda ()
               (format "--max-paths=%s"
-                      codeql--path-problem-max-paths)))]]
+                      codeql--path-problem-max-paths)))
+           ("D" "doctor" codeql-doctor)]]
   (interactive)
   (when (eq major-mode 'ql-tree-sitter-mode)
     (with-current-buffer (current-buffer)
