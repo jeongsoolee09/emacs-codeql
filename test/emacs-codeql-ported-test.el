@@ -936,21 +936,33 @@ OUTPUT is called with the arguments when it is a function."
 
 (ert-deftest codeql-ported-test-graph-text-layout ()
   "Graphs are laid out with forward edges as lanes and back edges listed."
-  ;; branches split off and merge back into the lane of their node
+  ;; branches split off side by side and merge back into the lane of their node
   (should (equal (codeql--graph-text-layout [(1 2) (3) (3) nil])
-                 '((0 "o-." "| |" nil) (1 "o |" "| |" nil) (2 "| o" "| |" nil)
-                   (3 "o-'" nil nil))))
+                 '((((0 0 nil)) "o-." "| |")
+                   (((1 0 nil) (2 1 nil)) "o o" "| |")
+                   (((3 0 nil)) "o-'" nil))))
   ;; loops point back up
   (should (equal (codeql--graph-text-layout [(1) (2 3) (1) nil])
-                 '((0 "o" "|" nil) (1 "o-." "| |" nil) (2 "o |" "  |" (1))
-                   (3 "  o" nil nil))))
+                 '((((0 0 nil)) "o" "|")
+                   (((1 0 nil)) "o-." "| |")
+                   (((2 0 (1)) (3 1 nil)) "o o" nil))))
   ;; nodes without predecessors come first, then unreachable cycles by id
   (should (equal (codeql--graph-text-layout [nil (0) (3) (2)])
-                 '((1 "o" "|" nil) (0 "o" "" nil) (2 "o" "|" nil) (3 "o" nil (2)))))
-  (should (equal (codeql--graph-text-layout [(0)]) '((0 "o" nil (0)))))
+                 '((((1 0 nil)) "o" "|") (((0 0 nil)) "o" "")
+                   (((2 0 nil)) "o" "|") (((3 0 (2))) "o" nil))))
+  (should (equal (codeql--graph-text-layout [(0)]) '((((0 0 (0))) "o" nil))))
   ;; lanes pass by nodes they don't end at
   (should (equal (mapcar #'cadr (codeql--graph-text-layout [(1 3) (2) (3) nil]))
-                 '("o-." "o |" "o |" "o-'"))))
+                 '("o-." "o |" "o |" "o-'")))
+  ;; nested branches get room so as not to cross the branches beside them
+  (should (equal (mapcar #'cadr (codeql--graph-text-layout [(1 4) (2 3) (5) (5) (5) nil]))
+                 '("o---." "o-. o" "o o |" "o-'-'")))
+  ;; but not beyond where they join
+  (should (equal (mapcar #'cadr (codeql--graph-text-layout [(1 2) (3) (3) (4 5) (6) (6) nil]))
+                 '("o-." "o o" "o-'-." "o   o" "o---'")))
+  ;; separate parts of a graph get rows of their own
+  (should (equal (codeql--graph-text-layout [nil (2) nil])
+                 '((((0 0 nil)) "o" "") (((1 0 nil)) "o" "|") (((2 0 nil)) "o" nil)))))
 
 (ert-deftest codeql-ported-test-show-graph-as-text ()
   "Graphs are drawn as text diagrams with the selected node described."
@@ -959,8 +971,8 @@ OUTPUT is called with the arguments when it is a function."
           (codeql-graph-format "text"))
       (codeql-ported-test--with-graph-buffer dot codeql-ported-test--diamond-nodes
         (should (string-prefix-p
-                 (concat "  x-.  if (x)  a.js:1\n  | |\n  o |  then  a.js:2\n  | |\n"
-                         "  | o  else  a.js:3\n  | |\n  o-'  join  a.js:4\n\n"
+                 (concat "  x-.  if (x)  a.js:1\n  | |\n"
+                         "  o o  then  a.js:2 │ else  a.js:3\n  | |\n  o-'  join  a.js:4\n\n"
                          "  if (x)\n  Location: a.js:1\n  Predecessors: none\n"
                          "  Successors: [true] then, [false] else\n")
                  (buffer-substring-no-properties (point-min) (point-max))))
@@ -986,7 +998,7 @@ OUTPUT is called with the arguments when it is a function."
           (should (= codeql--graph-selected 0))
           (codeql-graph-next)
           (should (equal (list codeql--graph-selected codeql--graph-trail) '(1 (0))))
-          (should (looking-at "x |  then"))
+          (should (looking-at "x o  then"))
           (should-error (codeql-graph-backward) :type 'user-error)
           (codeql-graph-forward)
           (should (equal (list codeql--graph-selected codeql--graph-trail) '(2 (0))))
@@ -1031,6 +1043,40 @@ OUTPUT is called with the arguments when it is a function."
           (search-forward "[true] ")
           (push-button)
           (should (= codeql--graph-selected 1)))))))
+
+(defconst codeql-ported-test--parts-dot
+  (concat "digraph {\n"
+          "  0[\"label\"=\"f\"; ];\n  1[\"label\"=\"entry\"; ];\n"
+          "  2[\"label\"=\"if (x)\"; ];\n  3[\"label\"=\"then\"; ];\n"
+          "  4[\"label\"=\"exit\"; ];\n  5[\"label\"=\"other\"; ];\n"
+          "  1 -> 2[];\n  2 -> 3[];\n  2 -> 4[];\n  3 -> 4[];\n}\n")
+  "A dot file of a graph of three parts, like those of `codeql-view-cfg'.")
+
+(ert-deftest codeql-ported-test-graph-text-roots ()
+  "The roots of a text diagram are jumped between."
+  (codeql-ported-test--with-temp-dir dir
+    (let ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--parts-dot))
+          (codeql-graph-format "text"))
+      (codeql-ported-test--with-graph-buffer dot nil
+        (should (equal (plist-get codeql--graph-text :roots) '(0 1 5)))
+        (should (= codeql--graph-selected 0))
+        (should-error (codeql-graph-previous-root) :type 'user-error)
+        (codeql-graph-next-root)
+        (should (= codeql--graph-selected 1))
+        (should (looking-at "x +entry"))
+        (codeql-graph-next)
+        (codeql-graph-next)
+        (should (= codeql--graph-selected 3))
+        ;; back from inside a part goes to its root
+        (codeql-graph-previous-root)
+        (should (= codeql--graph-selected 1))
+        (should-not codeql--graph-trail)
+        (codeql--graph-select 3)
+        (codeql-graph-next-root)
+        (should (= codeql--graph-selected 5))
+        (should-error (codeql-graph-next-root) :type 'user-error)
+        ;; nothing beside a node without parallel branches
+        (should-error (codeql-graph-forward) :type 'user-error)))))
 
 (ert-deftest codeql-ported-test-graph-cycle-format-without-images ()
   "Image formats are skipped where they can't be shown."

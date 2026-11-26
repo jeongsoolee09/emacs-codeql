@@ -525,19 +525,17 @@ Results of `@kind graph` queries are interpreted as graphviz dot files with `cod
 
 Much like [org-graph-view](https://github.com/alphapapa/org-graph-view), the rendered nodes are clickable: `mouse-1` on a node jumps to its location in the database source archive, and `RET` lets you pick a node by its label with `completing-read`. `f` cycles the viewing format between svg, png, text and the dot source, and `g` re-renders the graph.
 
-The text diagram is drawn like `undo-tree-visualize`, one node per row with the edges running down the diagram, and edges pointing back up (e.g. of loops) noted as `^ label`:
+The text diagram is drawn like `undo-tree-visualize`, with the edges running down the diagram and edges pointing back up (e.g. of loops) noted as `^ label`. Branches run side by side, so the nodes at the same depth of each branch share a row, with their labels listed from left to right. Separate parts of a graph, like the nodes of a function and its body in a CFG, are drawn one below the other:
 
 ```
   x-.  if (x)  a.js:1
   | |
-  o |  then  a.js:2
-  | |
-  | o  else  a.js:3
+  o o  then  a.js:2 │ else  a.js:3
   | |
   o-'  end  a.js:4
 ```
 
-`n`/`p` (or `C-n`/`C-p`) move the selection `x` to the next node and back the way you came, `C-f`/`C-b` switch between the branches of a node, and `RET` or clicking the selected node jumps to its location; `C-u RET` picks a node by label. The predecessors and successors of the selected node are listed below the diagram as buttons. With evil, `j`/`k`/`l`/`h` move like `n`/`p`/`C-f`/`C-b`.
+`n`/`p` (or `C-n`/`C-p`) move the selection `x` to the next node and back the way you came, `C-f`/`C-b` move to the node beside it on the same row, `N`/`P` (or `M-n`/`M-p`) jump between the roots of the graph, the nodes no edge leads down to, and `RET` or clicking the selected node jumps to its location; `C-u RET` picks a node by label. The predecessors and successors of the selected node are listed below the diagram as buttons. With evil, `j`/`k`/`l`/`h` move like `n`/`p`/`C-f`/`C-b`, and `J`/`K` like `N`/`P`.
 
 `M-x RET codeql-view-cfg RET` shows the control flow graph of the function at point in a database source archive file, like the vscode extension's CFG viewer. It runs the printCfg query of the database language's library pack, which is available for e.g. C/C++, C#, Java, Python, Ruby and Swift. For JavaScript, which ships no printCfg query, `emacs-codeql` uses its own bundled query from the `queries` directory, so make sure your package recipe includes it (e.g. `:files (:defaults "bin" "queries")`).
 

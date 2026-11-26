@@ -5618,8 +5618,10 @@ nil when the nodes of the dot file are not known, see
 This is a plist of the :labels of the nodes of the graph and their
 :successors and :predecessors, vectors by dot node id, its :edges as
 returned by `codeql--dot-edges' and the :rows of its diagram as returned
-by `codeql--graph-text-layout'.  It is nil until the graph is first
-shown as text.")
+by `codeql--graph-text-layout'.  Its :places are the (ROW . LANE) of the
+nodes and :back the successors their edges point back up to, vectors by
+dot node id, and its :roots the nodes no edge leads down the diagram to,
+from top to bottom.  It is nil until the graph is first shown as text.")
 
 (defvar-local codeql--graph-selected nil
   "The dot node id of the selected node of a text graph diagram.")
@@ -5627,8 +5629,7 @@ shown as text.")
 (defvar-local codeql--graph-trail nil
   "The nodes selected before `codeql--graph-selected', most recent first.
 
-`codeql-graph-previous' goes back along it, and the branches switched
-between by `codeql-graph-forward' are the successors of its first node.")
+`codeql-graph-previous' goes back along it.")
 
 (defun codeql--location-link-path (url)
   "Return the codeql: link path of the location URL, see `codeql--location-url'.
@@ -5788,22 +5789,22 @@ resolution than the 96 dpi pixels of its image maps."
     (goto-char (point-min))))
 
 ;; text diagrams of graphs, drawn like those of `undo-tree-visualize':
-;; one node per row, with an `o' in the lane of each node and the edges
-;; pointing down the diagram as lanes of `|' between them
+;; the nodes are drawn as `o' in their lanes, in rows by the length of
+;; the longest path to them, so that branches run side by side, and the
+;; edges pointing down the diagram as lanes of `|' between them
 ;;
 ;;   o      while (i < n)
 ;;   |
 ;;   o-.    if (x)
 ;;   | |
-;;   o |    then
-;;   | |
-;;   | o    else
+;;   o o    then │ else
 ;;   | |
 ;;   o-'    i++  ^ while (i < n)
 ;;
 ;; `.' starts the lane of another successor, `'' ends that of another
 ;; predecessor, and edges pointing up the diagram are listed after the
-;; label as `^ LABEL'
+;; label as `^ LABEL'.  The weakly connected components of a graph are
+;; drawn one after another.
 
 (defun codeql--dot-edges (dot-path)
   "Return the edges of the dot file at DOT-PATH as (FROM TO LABEL) lists.
@@ -5863,74 +5864,174 @@ successor where possible."
             (cl-loop for id below count
                      unless (aref visited id) append (funcall search (list id))))))
 
+(defun codeql--graph-text-ranks (successors order)
+  "Return the rows of the nodes of a graph in its text diagram, by id.
+
+SUCCESSORS is a vector of the lists of successors of the nodes, by dot
+node id, and ORDER their order as returned by `codeql--graph-text-order'.
+The edges pointing forward in ORDER are those drawn down the diagram.
+A node is in the row below the lowest of its predecessors along them, so
+the nodes of parallel branches share rows.  The weakly connected
+components of the graph get rows of their own, in ORDER of their nodes."
+  (let* ((count (length successors))
+         (position (make-vector count 0))
+         (neighbors (make-vector count nil))
+         (component (make-vector count nil))
+         (depth (make-vector count 0))
+         (height (make-hash-table))
+         (bases (make-hash-table))
+         (base 0)
+         (rank (make-vector count 0)))
+    (cl-loop for id in order for index from 0 do (aset position id index))
+    (dotimes (id count)
+      (dolist (successor (aref successors id))
+        (push successor (aref neighbors id))
+        (push id (aref neighbors successor))))
+    (dolist (id order)
+      (unless (aref component id)
+        (aset component id id)
+        (let ((stack (list id)))
+          (while stack
+            (dolist (neighbor (aref neighbors (pop stack)))
+              (unless (aref component neighbor)
+                (aset component neighbor id)
+                (push neighbor stack)))))))
+    ;; the forward predecessors of a node come before it in ORDER
+    (dolist (id order)
+      (dolist (successor (aref successors id))
+        (when (> (aref position successor) (aref position id))
+          (aset depth successor (max (aref depth successor) (1+ (aref depth id)))))))
+    (dolist (id order)
+      (puthash (aref component id)
+               (max (aref depth id) (gethash (aref component id) height 0))
+               height))
+    (dolist (id order)
+      (let ((key (aref component id)))
+        (unless (gethash key bases)
+          (puthash key base bases)
+          (setq base (+ base 1 (gethash key height))))))
+    (dotimes (id count)
+      (aset rank id (+ (gethash (aref component id) bases) (aref depth id))))
+    rank))
+
 (defun codeql--graph-text-layout (successors)
   "Return the rows of the text diagram of a graph.
 
 SUCCESSORS is a vector of the lists of successors of the nodes, by dot
-node id.  Each row is a (ID NODE-LINE LINK-LINE BACK) list: the dot node
-ID drawn in it, the diagram of its NODE-LINE, the LINK-LINE drawn below
-it, which is nil for the last row, and the successors of ID that edges
+node id.  Each row is a (NODES NODE-LINE LINK-LINE) list: the NODES drawn
+in it from left to right, the diagram of its NODE-LINE, and the
+LINK-LINE drawn below it, which is nil for the last row.  Each of NODES
+is an (ID LANE BACK) list of the dot node ID, the LANE it is drawn in,
+whose `o' is at twice LANE in NODE-LINE, and its successors that edges
 point BACK up to, which aren't drawn."
   (let* ((order (codeql--graph-text-order successors))
-         (position (make-vector (length successors) 0))
+         (count (length successors))
+         (position (make-vector count 0))
+         (rank (codeql--graph-text-ranks successors order))
+         (by-rank (make-vector (1+ (apply #'max -1 (append rank nil))) nil))
          ;; the target nodes of the edges drawn in each lane
+         (width (make-vector count 1))
          (lanes [])
-         (diagram (lambda (slot)
-                    (string-trim-right
-                     (mapconcat (lambda (k) (string (funcall slot k)))
-                                (number-sequence 0 (1- (length lanes)))
-                                " "))))
+         (grow (lambda (size)
+                 (when (< (length lanes) size)
+                   (setq lanes (vconcat lanes (make-vector (- size (length lanes)) nil))))))
          rows)
-    (cl-loop for id in order for row from 0 do (aset position id row))
-    (dolist (id order)
-      (let* ((forward (cl-remove-if-not (lambda (successor)
-                                          (> (aref position successor) (aref position id)))
-                                        (aref successors id)))
-             (ends (cl-loop for k below (length lanes)
-                            when (eql (aref lanes k) id) collect k))
-             (column (or (car ends) (cl-position nil lanes) (length lanes)))
+    (cl-loop for id in order for index from 0 do (aset position id index))
+    (dolist (id (reverse order))
+      (push id (aref by-rank (aref rank id))))
+    ;; the lanes taken by the branches below each node up to where they
+    ;; join others, so that its branches start far enough apart not to
+    ;; cross those of the branches beside them
+    (let ((parent (make-vector count nil))
+          (joins (make-bool-vector count nil)))
+      (dolist (id order)
+        (dolist (successor (aref successors id))
+          (when (> (aref position successor) (aref position id))
+            (if (aref parent successor)
+                (aset joins successor t)
+              (aset parent successor id)))))
+      (dotimes (id count)
+        (when (aref joins id)
+          (aset parent id nil)))
+      (let ((sums (make-vector count 0)))
+        (dolist (id (reverse order))
+          (aset width id (max 1 (aref sums id)))
+          (when-let ((up (aref parent id)))
+            (aset sums up (+ (aref sums up) (aref width id)))))))
+    (dolist (ids (append by-rank nil))
+      (let* ((ends (mapcar (lambda (id)
+                             (cons id (cl-loop for k below (length lanes)
+                                               when (eql (aref lanes k) id) collect k)))
+                           ids))
              (through (cl-loop for k below (length lanes)
-                               when (and (aref lanes k) (not (eql (aref lanes k) id)))
+                               when (and (aref lanes k) (not (memq (aref lanes k) ids)))
                                collect k))
-             starts)
-        (setq ends (delq column ends))
-        (when (= column (length lanes))
-          (setq lanes (vconcat lanes [nil])))
-        (aset lanes column (car forward))
-        (dolist (k ends)
-          (aset lanes k nil))
-        (dolist (successor (cdr forward))
-          (let ((k (or (cl-loop for k from (1+ column) below (length lanes)
-                                unless (or (aref lanes k) (memq k ends)) return k)
-                       (length lanes))))
-            (when (= k (length lanes))
-              (setq lanes (vconcat lanes [nil])))
-            (aset lanes k successor)
-            (push k starts)))
-        (let* ((marks (append ends starts))
-               (low (apply #'min column marks))
-               (high (apply #'max column marks))
-               (node-line
-                (let ((line (funcall diagram
-                                     (lambda (k)
-                                       (cond ((= k column) ?o)
-                                             ((memq k through) ?|)
-                                             ((memq k ends) ?')
-                                             ((memq k starts) ?.)
-                                             ((< low k high) ?-)
-                                             (t ?\s))))))
-                  ;; join the lanes to the node
-                  (dotimes (k (- high low))
-                    (aset line (+ (* 2 (+ low k)) 1) ?-))
-                  line)))
-          (while (and (> (length lanes) 0) (null (aref lanes (1- (length lanes)))))
-            (setq lanes (substring lanes 0 -1)))
-          (push (list id node-line
-                      (funcall diagram (lambda (k) (if (aref lanes k) ?| ?\s)))
-                      (cl-remove-if-not (lambda (successor)
-                                          (<= (aref position successor) (aref position id)))
-                                        (aref successors id)))
-                rows))))
+             (columns (cl-loop for (id . lanes-in) in ends
+                               when lanes-in collect (cons id (car lanes-in))))
+             nodes)
+        ;; nodes no lane leads to start in the first free lane
+        (dolist (id ids)
+          (unless (assq id columns)
+            (let ((k (cl-loop for k from 0
+                              unless (or (and (< k (length lanes)) (aref lanes k))
+                                         (rassq k columns))
+                              return k)))
+              (push (cons id k) columns))))
+        (setq columns (sort columns (lambda (a b) (< (cdr a) (cdr b)))))
+        (funcall grow (1+ (apply #'max (mapcar #'cdr columns))))
+        (let ((merges (mapcar (lambda (entry) (cons (car entry) (cdr (cdr entry)))) ends))
+              starts)
+          (pcase-dolist (`(,id . ,k) columns)
+            (aset lanes k (cl-find-if (lambda (successor)
+                                        (> (aref position successor) (aref position id)))
+                                      (aref successors id)))
+            (dolist (end (alist-get id merges))
+              (aset lanes end nil)))
+          (pcase-dolist (`(,id . ,column) columns)
+            (let ((forward (cl-remove-if-not (lambda (successor)
+                                               (> (aref position successor) (aref position id)))
+                                             (aref successors id))))
+              (dolist (successor (cdr forward))
+                (let ((k (cl-loop for k from (+ column
+                                                (cl-loop for previous in forward
+                                                         until (eq previous successor)
+                                                         sum (aref width previous)))
+                                  unless (or (and (< k (length lanes)) (aref lanes k))
+                                             (rassq k columns)
+                                             (memq k (apply #'append (mapcar #'cdr merges))))
+                                  return k)))
+                  (funcall grow (1+ k))
+                  (aset lanes k successor)
+                  (push (cons id k) starts)))))
+          (let ((line (make-string (max 0 (1- (* 2 (length lanes)))) ?\s)))
+            (dolist (k through)
+              (aset line (* 2 k) ?|))
+            (pcase-dolist (`(,id . ,column) columns)
+              (let* ((marks (append (alist-get id merges)
+                                    (cl-loop for (from . k) in starts
+                                             when (eq from id) collect k)))
+                     (low (apply #'min column marks))
+                     (high (apply #'max column marks)))
+                (dolist (k (alist-get id merges))
+                  (aset line (* 2 k) ?'))
+                (cl-loop for (from . k) in starts
+                         when (eq from id) do (aset line (* 2 k) ?.))
+                (cl-loop for p from (* 2 low) to (* 2 high)
+                         when (eq (aref line p) ?\s) do (aset line p ?-))
+                (aset line (* 2 column) ?o)
+                (push (list id column
+                            (cl-remove-if-not (lambda (successor)
+                                                (<= (aref position successor)
+                                                    (aref position id)))
+                                              (aref successors id)))
+                      nodes)))
+            (while (and (> (length lanes) 0) (null (aref lanes (1- (length lanes)))))
+              (setq lanes (substring lanes 0 -1)))
+            (push (list (nreverse nodes)
+                        (string-trim-right line)
+                        (string-trim-right
+                         (mapconcat (lambda (target) (if target "|" " ")) lanes " ")))
+                  rows)))))
     (when rows
       (setf (nth 2 (car rows)) nil))
     (nreverse rows)))
@@ -5950,15 +6051,33 @@ numbered from 0, see `codeql--dot-node-labels'."
       (dolist (edge (reverse edges))
         (cl-pushnew (nth 1 edge) (aref successors (car edge)))
         (cl-pushnew (car edge) (aref predecessors (nth 1 edge))))
-      (list :labels (vconcat (mapcar (lambda (label)
-                                       ;; dot labels break lines with \n
-                                       (string-trim (replace-regexp-in-string
-                                                     "\\(?:\\\\n\\|[ \t\n]\\)+" " " label)))
-                                     labels))
-            :edges edges
-            :successors successors
-            :predecessors predecessors
-            :rows (codeql--graph-text-layout successors)))))
+      (let* ((rows (codeql--graph-text-layout successors))
+             (places (make-vector count nil))
+             (back (make-vector count nil))
+             roots)
+        (cl-loop for row in rows for index from 0 do
+                 (pcase-dolist (`(,id ,lane ,up) (car row))
+                   (aset places id (cons index lane))
+                   (aset back id up)))
+        ;; the nodes no edge leads down the diagram to, top to bottom
+        (pcase-dolist (`(,nodes . ,_) rows)
+          (pcase-dolist (`(,id . ,_) nodes)
+            (unless (cl-find-if (lambda (predecessor)
+                                  (< (car (aref places predecessor)) (car (aref places id))))
+                                (aref predecessors id))
+              (push id roots))))
+        (list :labels (vconcat (mapcar (lambda (label)
+                                         ;; dot labels break lines with \n
+                                         (string-trim (replace-regexp-in-string
+                                                       "\\(?:\\\\n\\|[ \t\n]\\)+" " " label)))
+                                       labels))
+              :edges edges
+              :successors successors
+              :predecessors predecessors
+              :rows rows
+              :places places
+              :back back
+              :roots (nreverse roots))))))
 
 (defun codeql--graph-text-label (id &optional width)
   "Return the label of the node with dot node ID, truncated to WIDTH."
@@ -6009,7 +6128,8 @@ numbered from 0, see `codeql--dot-node-labels'."
             "\n"
             (propertize (substitute-command-keys
                          (concat "  \\<codeql-graph-mode-map>\\[codeql-graph-next]/\\[codeql-graph-previous] successor/predecessor"
-                                 "   \\[codeql-graph-forward]/\\[codeql-graph-backward] other branch"
+                                 "   \\[codeql-graph-forward]/\\[codeql-graph-backward] beside"
+                                 "   \\[codeql-graph-next-root]/\\[codeql-graph-previous-root] root"
                                  "   \\[codeql-graph-visit-node] visit"
                                  "   \\[codeql-graph-cycle-format] format"
                                  "   \\[quit-window] quit"))
@@ -6019,36 +6139,58 @@ numbered from 0, see `codeql--dot-node-labels'."
 (defun codeql--graph-insert-text ()
   "Insert the text diagram of the graph of the current buffer.
 
-Point is left on the selected node, see `codeql--graph-selected'."
+Point is left on the selected node, see `codeql--graph-selected'.  The
+labels of the nodes of a row follow the diagram from left to right."
   (let* ((rows (plist-get codeql--graph-text :rows))
          (width (apply #'max 0 (mapcar (lambda (row) (length (nth 1 row))) rows)))
          target)
     (unless codeql--graph-selected
-      (setq codeql--graph-selected (car (car rows))))
-    (pcase-dolist (`(,id ,node-line ,link-line ,back) rows)
-      (let* ((selected (eql id codeql--graph-selected))
-             (column (string-match-p "o" node-line))
-             (location (codeql--graph-text-location id))
-             (start (point)))
-        (when selected
-          (setq node-line (copy-sequence node-line))
-          (aset node-line column ?x)
-          (put-text-property column (1+ column) 'face '(:inverse-video t) node-line))
-        (insert "  " node-line (make-string (- width (length node-line)) ?\s) "  "
-                (propertize (codeql--graph-text-label id 60)
-                            'face (and selected 'bold)
-                            'mouse-face 'highlight)
-                (if location (propertize (concat "  " location) 'face 'shadow) "")
-                (mapconcat (lambda (other)
-                             (propertize (format "  ^ %s" (codeql--graph-text-label other 30))
-                                         'face 'shadow))
-                           back ""))
-        (put-text-property start (point) 'codeql-graph-node id)
-        (put-text-property start (point) 'help-echo
-                           (format "%s\n%s" (codeql--graph-text-label id)
-                                   (or location "No location")))
-        (when selected
-          (setq target (+ start 2 column)))
+      (setq codeql--graph-selected (car (car (car (car rows))))))
+    (pcase-dolist (`(,nodes ,node-line ,link-line) rows)
+      (let ((start (point))
+            (label-width (if (cdr nodes) (max 20 (/ 60 (length nodes))) 60)))
+        (setq node-line (copy-sequence node-line))
+        (insert "  " node-line (make-string (- width (length node-line)) ?\s))
+        ;; the diagram belongs to the node of the nearest lane
+        (cl-loop for pos from start below (point)
+                 for column = (/ (- pos start 2) 2.0)
+                 do (put-text-property
+                     pos (1+ pos) 'codeql-graph-node
+                     (car (cl-reduce (lambda (a b)
+                                       (if (<= (abs (- (nth 1 a) column))
+                                               (abs (- (nth 1 b) column)))
+                                           a b))
+                                     nodes))))
+        (insert "  ")
+        (cl-loop for (id lane back) in nodes
+                 for first = t then nil
+                 for selected = (eql id codeql--graph-selected)
+                 for location = (codeql--graph-text-location id)
+                 for help = (format "%s\n%s" (codeql--graph-text-label id)
+                                    (or location "No location"))
+                 do
+                 (unless first
+                   (insert (propertize " │ " 'face 'shadow)))
+                 (let ((label-start (point)))
+                   (insert (propertize (codeql--graph-text-label id label-width)
+                                       'face (and selected 'bold)
+                                       'mouse-face 'highlight)
+                           (if location (propertize (concat "  " location) 'face 'shadow) "")
+                           (mapconcat (lambda (other)
+                                        (propertize (format "  ^ %s"
+                                                            (codeql--graph-text-label other 30))
+                                                    'face 'shadow))
+                                      back ""))
+                   (put-text-property label-start (point) 'codeql-graph-node id))
+                 (let ((mark (+ start 2 (* 2 lane))))
+                   (put-text-property mark (1+ mark) 'help-echo help)
+                   (when selected
+                     (setq target mark)
+                     (save-excursion
+                       (goto-char mark)
+                       (delete-char 1)
+                       (insert (propertize "x" 'face '(:inverse-video t)
+                                           'codeql-graph-node id 'help-echo help))))))
         (insert "\n")
         (when link-line
           (insert "  " link-line "\n"))))
@@ -6098,7 +6240,7 @@ first predecessor of the selected node."
   "Select a successor of the selected node, the one below it if any."
   (let* ((id codeql--graph-selected)
          (successors (aref (plist-get codeql--graph-text :successors) id))
-         (back (nth 3 (assq id (plist-get codeql--graph-text :rows))))
+         (back (aref (plist-get codeql--graph-text :back) id))
          (next (or (cl-find-if-not (lambda (successor) (memq successor back)) successors)
                    (car successors))))
     (unless next
@@ -6114,18 +6256,43 @@ first predecessor of the selected node."
                                       (cdr codeql--graph-trail)))))
 
 (defun codeql--graph-text-switch (delta)
-  "Select the branch DELTA branches away from the selected node.
+  "Select the node DELTA nodes away on the row of the selected node.
 
-The branches are the successors of the node it was reached from."
-  (let* ((parent (or (codeql--graph-parent)
-                     (user-error "This node has no other branches")))
-         (siblings (aref (plist-get codeql--graph-text :successors) parent))
-         (next (nth (+ (cl-position codeql--graph-selected siblings) delta) siblings)))
-    (unless (and next (>= (+ (cl-position codeql--graph-selected siblings) delta) 0))
-      (user-error "No other branch in that direction"))
-    (codeql--graph-select next (if (eq parent (car codeql--graph-trail))
-                                   codeql--graph-trail
-                                 (list parent)))))
+Branches run side by side, so these are the nodes of the other branches
+at the same depth."
+  (let* ((place (aref (plist-get codeql--graph-text :places) codeql--graph-selected))
+         (nodes (car (nth (car place) (plist-get codeql--graph-text :rows))))
+         (index (+ (cl-position codeql--graph-selected nodes :key #'car) delta))
+         (next (and (>= index 0) (car (nth index nodes)))))
+    (unless next
+      (user-error "No other node in that direction"))
+    ;; going back still leads to a branch node they share
+    (codeql--graph-select next (and (memq (car codeql--graph-trail)
+                                          (aref (plist-get codeql--graph-text :predecessors) next))
+                                    codeql--graph-trail))))
+
+(defun codeql--graph-text-root (delta)
+  "Select the root DELTA roots away from the selected node.
+
+The roots are the nodes no edge leads down the diagram to, see
+`codeql--graph-text'.  Going back from a node that isn't one selects
+the root above it."
+  (let* ((places (plist-get codeql--graph-text :places))
+         (here (aref places codeql--graph-selected))
+         (before (lambda (a b) (or (< (car a) (car b))
+                                   (and (= (car a) (car b)) (< (cdr a) (cdr b))))))
+         (roots (plist-get codeql--graph-text :roots))
+         (next (if (> delta 0)
+                   (nth (1- delta)
+                        (cl-remove-if-not (lambda (root) (funcall before here (aref places root)))
+                                          roots))
+                 (nth (1- (- delta))
+                      (reverse (cl-remove-if-not
+                                (lambda (root) (funcall before (aref places root) here))
+                                roots))))))
+    (unless next
+      (user-error "No other root in that direction"))
+    (codeql--graph-select next)))
 
 (defun codeql-graph-next ()
   "Move to a successor of the selected node of a text graph diagram.
@@ -6167,6 +6334,25 @@ file."
   (cond ((codeql--graph-text-p) (codeql--graph-text-switch -1))
         ((codeql--graph-image-p) (image-backward-hscroll 1))
         ((not codeql--graph-format) (backward-char 1))))
+
+(defun codeql-graph-next-root ()
+  "Select the next root node of a text graph diagram.
+
+Roots are the nodes no edge leads down the diagram to, like the entry
+points of the graph and its separate parts."
+  (interactive)
+  (if (codeql--graph-text-p)
+      (codeql--graph-text-root 1)
+    (user-error "Roots are only selected in text diagrams")))
+
+(defun codeql-graph-previous-root ()
+  "Select the previous root node of a text graph diagram.
+
+From a node that isn't a root, this selects the root above it."
+  (interactive)
+  (if (codeql--graph-text-p)
+      (codeql--graph-text-root -1)
+    (user-error "Roots are only selected in text diagrams")))
 
 (defun codeql--graph-image-p ()
   "Return non-nil when the current graph buffer shows a rendered image."
@@ -6359,6 +6545,12 @@ Image formats are skipped when they can't be rendered or shown."
     (define-key map (kbd "f") #'codeql-graph-cycle-format)
     (define-key map (kbd "n") #'codeql-graph-next)
     (define-key map (kbd "p") #'codeql-graph-previous)
+    (define-key map (kbd "C-f") #'codeql-graph-forward)
+    (define-key map (kbd "C-b") #'codeql-graph-backward)
+    (define-key map (kbd "N") #'codeql-graph-next-root)
+    (define-key map (kbd "P") #'codeql-graph-previous-root)
+    (define-key map (kbd "M-n") #'codeql-graph-next-root)
+    (define-key map (kbd "M-p") #'codeql-graph-previous-root)
     (define-key map [remap next-line] #'codeql-graph-next)
     (define-key map [remap previous-line] #'codeql-graph-previous)
     (define-key map [remap forward-char] #'codeql-graph-forward)
@@ -6376,6 +6568,8 @@ Image formats are skipped when they can't be rendered or shown."
                     "k" #'codeql-graph-previous
                     "l" #'codeql-graph-forward
                     "h" #'codeql-graph-backward
+                    "J" #'codeql-graph-next-root
+                    "K" #'codeql-graph-previous-root
                     "f" #'codeql-graph-cycle-format
                     (kbd "RET") #'codeql-graph-visit-node
                     "gr" #'revert-buffer
@@ -6389,8 +6583,9 @@ Click a node to visit its location, or choose one by its label with
 `codeql-graph-format', \\[revert-buffer] renders the graph again.
 
 In a text diagram, \\[codeql-graph-next] and \\[codeql-graph-previous] move to a successor and back to a
-predecessor of the selected node, \\[codeql-graph-forward] and \\[codeql-graph-backward] switch between the
-branches it is on, and \\[codeql-graph-visit-node] visits it, like in `undo-tree-visualize'.
+predecessor of the selected node, \\[codeql-graph-forward] and \\[codeql-graph-backward] move to the
+nodes beside it, on the other branches, \\[codeql-graph-next-root] and \\[codeql-graph-previous-root] jump between the
+roots of the graph, and \\[codeql-graph-visit-node] visits it, like in `undo-tree-visualize'.
 
 \\{codeql-graph-mode-map}"
   (require 'image-mode)
