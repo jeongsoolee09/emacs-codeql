@@ -1163,6 +1163,18 @@ OUTPUT is called with the arguments when it is a function."
         (kill-buffer archive-file)
         (kill-buffer other-file)))))
 
+(ert-deftest codeql-ported-test-database-open-file ()
+  "Source archive files opened from a query buffer are associated with it."
+  (codeql-ported-test--with-source-archive root
+    (cl-letf (((symbol-function 'codeql-xref-backend) #'ignore))
+      (codeql--database-open-file (concat root "src/app.js"))
+      (let ((archive-file (get-file-buffer (concat root "src/app.js"))))
+        (unwind-protect
+            (with-current-buffer archive-file
+              (should (eq codeql--org-query-buffer query-buffer))
+              (should buffer-read-only))
+          (kill-buffer archive-file))))))
+
 ;;; Doctor
 
 (ert-deftest codeql-ported-test-doctor-line ()
