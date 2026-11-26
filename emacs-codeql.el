@@ -5477,7 +5477,7 @@ See `codeql-copy-permalink'."
 
 Signal an error with its output when it fails."
   (let ((gh (or (executable-find "gh")
-                (user-error "gh not found, see https://cli.github.com"))))
+                (user-error "The gh CLI was not found, see https://cli.github.com"))))
     (with-temp-buffer
       (let* ((stderr (make-temp-file "codeql-gh-stderr"))
              (code (unwind-protect
@@ -5488,7 +5488,7 @@ Signal an error with its output when it fails."
                                            (string-trim (buffer-string)))
                                     (delete-file stderr))))))
         (unless (eql code 0)
-          (error "gh %s failed: %s" (string-join args " ")
+          (error "Running gh %s failed: %s" (string-join args " ")
                  (if (string-empty-p stderr) (string-trim (buffer-string)) stderr)))
         (buffer-string)))))
 
@@ -5690,7 +5690,7 @@ was analyzed.  Raw BQRS results are shown decoded."
                                  directory))
          (query-buffer codeql--mrva-query-buffer)
          (gh (or (executable-find "gh")
-                 (user-error "gh not found, see https://cli.github.com"))))
+                 (user-error "The gh CLI was not found, see https://cli.github.com"))))
     (if (or (file-exists-p (concat base ".sarif")) (file-exists-p (concat base ".bqrs")))
         (codeql--mrva-show-results repo directory query-buffer)
       (make-directory directory t)
