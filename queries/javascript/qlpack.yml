@@ -1,0 +1,6 @@
+name: emacs-codeql/javascript-queries
+version: 0.0.0
+library: false
+# resolved from the search paths of the query buffer, see `codeql--bundled-queries-directory'
+dependencies:
+  codeql/javascript-all: "*"

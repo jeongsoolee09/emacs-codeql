@@ -366,12 +366,14 @@ page holding at most this many tuples.  See `codeql-results-pagination-mode'."
   "The image format that graph results are rendered to with graphviz.
 
 Results of queries with `@kind graph', e.g. those of
-`codeql-view-cfg', are rendered by graphviz `dot' and shown in
-`image-mode'.  When this is nil, or `dot' can't be found, the dot file
-itself is opened instead."
+`codeql-view-cfg', are rendered by graphviz `dot' and shown in a
+`codeql-graph-mode' buffer, where clicking a node visits its location.
+When this is nil, or `dot' can't be found, the dot file itself is shown
+instead.  \<codeql-graph-mode-map>\[codeql-graph-cycle-format] in the graph buffer
+switches between these formats."
   :type '(choice (const :tag "SVG" "svg")
                  (const :tag "PNG" "png")
-                 (const :tag "Open the dot file" nil))
+                 (const :tag "Show the dot file" nil))
   :group 'emacs-codeql)
 
 (defcustom codeql-max-sarif-results 100
@@ -3205,6 +3207,53 @@ the locations that library packs of other languages or versions use."
                    (format "%s.ql" query-name)
                    (format "ide-contextual-queries/%s.ql" query-name)))))
 
+(defconst codeql--bundled-queries-directory
+  (expand-file-name "queries" (file-name-directory (or load-file-name buffer-file-name)))
+  "The directory of the templated queries that come with emacs-codeql.
+
+These are for languages whose library packs lack them, e.g. the printCfg
+query of `codeql-view-cfg' for JavaScript.  They are in a pack per
+language, whose dependencies are resolved from the search paths and
+library path of the query buffer.")
+
+(defun codeql--bundled-templated-query (language query-name)
+  "Return the path of the bundled templated QUERY-NAME of LANGUAGE, or nil.
+
+See `codeql--bundled-queries-directory'.  For remote databases the query
+is copied to `codeql-tmp-dir' first."
+  (let ((path (expand-file-name (format "%s/%s.ql" (substring (symbol-name language) 1)
+                                        query-name)
+                                codeql--bundled-queries-directory)))
+    (when (file-exists-p path)
+      (if (not (file-remote-p default-directory))
+          path
+        ;; along with the pack of the query
+        (let ((remote-dir (expand-file-name
+                           (format "emacs-codeql-queries/%s"
+                                   (file-relative-name (file-name-directory path)
+                                                       codeql--bundled-queries-directory))
+                           (codeql--tramp-wrap codeql-tmp-dir))))
+          (make-directory (file-name-directory (directory-file-name remote-dir)) t)
+          (copy-directory (file-name-directory path) remote-dir nil t t)
+          (codeql--tramp-unwrap (expand-file-name (file-name-nondirectory path) remote-dir)))))))
+
+(defun codeql--bundled-templated-query-p (query-path)
+  "Return non-nil if QUERY-PATH is of `codeql--bundled-templated-query'."
+  (or (file-in-directory-p query-path codeql--bundled-queries-directory)
+      (string-match-p "/emacs-codeql-queries/" query-path)))
+
+(defun codeql--find-templated-query (language query-name)
+  "Return the path of the templated QUERY-NAME of LANGUAGE, or nil.
+
+The queries of the library packs in the search paths take precedence
+over those that come with emacs-codeql, see
+`codeql--bundled-templated-query'."
+  (or (cl-loop for query-path in (codeql--templated-query-paths language query-name)
+               thereis (cl-loop for search-path in codeql--search-paths-buffer-local
+                                for full-path = (format "%s/%s" search-path query-path)
+                                when (codeql--file-exists-p full-path) return full-path))
+      (codeql--bundled-templated-query language query-name)))
+
 (defun codeql--archive-path-from-org-filename (filename)
   ;; do a dance to normalize back to the archive root relative path for this filename
   (format "/%s" (cadr
@@ -3213,7 +3262,7 @@ the locations that library packs of other languages or versions use."
                   (format "%s/*" codeql--database-source-archive-root)))))
 
 (cl-defun codeql--run-templated-query (language query-name src-filename src-buffer
-                                                 &optional position)
+                                                &optional position)
   "Run the templated QUERY-NAME of LANGUAGE for SRC-FILENAME of SRC-BUFFER.
 
 POSITION is nil, or a (LINE . COLUMN) cons of 1-based positions in
@@ -3223,41 +3272,38 @@ printCfg query of `codeql-view-cfg'."
   (cl-assert codeql--active-database t)
 
   (codeql--await-search-paths)
-  (cl-loop for query-path in (codeql--templated-query-paths language query-name)
-           do
-           (cl-loop for search-path in codeql--search-paths-buffer-local
-                    for full-path = (format "%s/%s" search-path query-path)
-                    when (codeql--file-exists-p full-path) do
-                    (message "Resolved templated query %s to %s" query-name full-path)
-                    (let* ((archive-path (codeql--archive-path-from-org-filename
-                                          (codeql--tramp-unwrap src-filename)))
-                           (template-values
-                            (cond ((string= codeql-query-server "query-server")
-                                   `(:selectedSourceFile
-                                     (:values (:tuples [(:stringValue ,archive-path)]))
-                                     ,@(when position
-                                         `(:selectedSourceLine
-                                           (:values (:tuples [(:intValue ,(car position))]))
-                                           :selectedSourceColumn
-                                           (:values (:tuples [(:intValue ,(cdr position))]))))))
-                                  ((string= codeql-query-server "query-server2")
-                                   `(:selectedSourceFile
-                                     ,archive-path
-                                     ,@(when position
-                                         `(:selectedSourceLine
-                                           ,(number-to-string (car position))
-                                           :selectedSourceColumn
-                                           ,(number-to-string (cdr position)))))))))
-                      (codeql--query-server-run-query-from-path
-                       full-path
-                       nil
-                       template-values
-                       src-filename
-                       src-buffer))
-                    ;; respect search precedence and only run the first find
-                    (cl-return-from codeql--run-templated-query)))
-  ;; if we did not return, that means we weren't able to find the thing.
-  (error "Did not find templated query %s in search paths" query-name))
+  (let ((full-path (codeql--find-templated-query language query-name)))
+    (unless full-path
+      (error "Did not find templated query %s in search paths" query-name))
+    (message "Resolved templated query %s to %s" query-name full-path)
+    ;; rather than caching the library path of a bundled query for the query buffer
+    (when (codeql--bundled-templated-query-p full-path)
+      (codeql--resolve-query-paths (buffer-file-name)))
+    (let* ((archive-path (codeql--archive-path-from-org-filename
+                          (codeql--tramp-unwrap src-filename)))
+           (template-values
+            (cond ((string= codeql-query-server "query-server")
+                   `(:selectedSourceFile
+                     (:values (:tuples [(:stringValue ,archive-path)]))
+                     ,@(when position
+                         `(:selectedSourceLine
+                           (:values (:tuples [(:intValue ,(car position))]))
+                           :selectedSourceColumn
+                           (:values (:tuples [(:intValue ,(cdr position))]))))))
+                  ((string= codeql-query-server "query-server2")
+                   `(:selectedSourceFile
+                     ,archive-path
+                     ,@(when position
+                         `(:selectedSourceLine
+                           ,(number-to-string (car position))
+                           :selectedSourceColumn
+                           ,(number-to-string (cdr position)))))))))
+      (codeql--query-server-run-query-from-path
+       full-path
+       nil
+       template-values
+       src-filename
+       src-buffer))))
 
 (defun codeql--database-src-path-p (path)
   (let ((prefix (format "^%s/*" (regexp-quote codeql--database-source-archive-root))))
@@ -4946,8 +4992,9 @@ commands can be repeated without the prefix key.")
   "Display the control flow graph of the function at point.
 
 This works in database source archive files, like `codeql-view-ast',
-for languages whose library packs come with a printCfg query.  The graph
-is shown as described for `codeql-graph-format'."
+for languages whose library packs come with a printCfg query, and for
+JavaScript, see `codeql--bundled-queries-directory'.  The graph is shown
+as described for `codeql-graph-format'."
   (interactive)
   (if (buffer-live-p codeql--org-query-buffer)
       (let ((src-filename (buffer-file-name))
@@ -4959,37 +5006,353 @@ is shown as described for `codeql-graph-format'."
             (codeql--run-templated-query language "printCfg" src-filename src-buffer position))))
     (message "Did not recognize this file as being part of an active codeql database.")))
 
-(defun codeql--show-graph (dot-path)
-  "Show the graph of the dot file at DOT-PATH, see `codeql-graph-format'."
-  (let ((dot (and codeql-graph-format
-                  (executable-find "dot" (file-remote-p dot-path))))
-        (image-path (concat (file-name-sans-extension dot-path) "." codeql-graph-format)))
-    (if (not dot)
-        (progn
-          (when codeql-graph-format
-            (message "Install graphviz to render graphs, showing the dot file instead."))
-          (switch-to-buffer-other-window (find-file-noselect dot-path)))
-      (message "Rendering graph with %s ..." dot)
+;;; Graph viewer
+
+(defvar-local codeql--graph-dot-path nil
+  "The dot file of the graph shown in a `codeql-graph-mode' buffer.")
+
+(defvar-local codeql--graph-format nil
+  "The format the graph of a `codeql-graph-mode' buffer is shown in.
+
+This takes the values of `codeql-graph-format', it starts out as that
+and is changed with `codeql-graph-cycle-format'.")
+
+(defvar-local codeql--graph-nodes nil
+  "The nodes of the graph of a `codeql-graph-mode' buffer, by dot node id.
+
+This is a vector of (LABEL . LINK) conses, where LINK is the codeql:
+link path of the location of the node, or nil when it has none.  It is
+nil when the nodes of the dot file are not known, see
+`codeql--graph-match-nodes'.")
+
+(defvar-local codeql--graph-render-process nil
+  "The graphviz process rendering the graph of a `codeql-graph-mode' buffer.")
+
+(defun codeql--location-link-path (url)
+  "Return the codeql: link path of the location URL, see `codeql--location-url'.
+
+This must be called from the query buffer, as for
+`codeql--source-link-prefix'."
+  (let ((end-line (alist-get 'endLine url))
+        (end-column (alist-get 'endColumn url)))
+    (format "%s%s::%s:%s%s"
+            (codeql--source-link-prefix)
+            (codeql--encode-link-path (codeql--uri-to-filename (alist-get 'uri url)))
+            (alist-get 'startLine url)
+            (alist-get 'startColumn url)
+            (if (and (natnump end-line) (natnump end-column))
+                (format ":%s:%s" end-line end-column)
+              ""))))
+
+(defun codeql--bqrs-graph-nodes (bqrs-path)
+  "Return the nodes of the graph results at BQRS-PATH, or nil on failure.
+
+This is a list of (LABEL . LINK) conses as for `codeql--graph-nodes', in
+order of first appearance in the nodes result set.  LABEL is the
+`semmle.label' property of the node, or the label of its entity.  This
+must be called from the query buffer, see `codeql--location-link-path'."
+  (when-let* ((json (codeql--bqrs-to-json bqrs-path "id,url,string" "nodes"))
+              (tuples (json-pointer-get
+                       (json-parse-string json :object-type 'alist) "/tuples")))
+    (let ((seen (make-hash-table :test #'equal))
+          (link-prefix (ignore-errors (codeql--source-link-prefix)))
+          nodes)
+      (cl-loop for tuple across tuples
+               for entity = (aref tuple 0)
+               for key = (or (json-pointer-get entity "/id") entity)
+               for node = (gethash key seen)
+               unless node do
+               (let ((url (and link-prefix (listp entity)
+                               (codeql--location-url (json-pointer-get entity "/url")))))
+                 (setq node (cons (if (listp entity)
+                                      (json-pointer-get entity "/label")
+                                    (format "%s" entity))
+                                  (and url (codeql--location-link-path url))))
+                 (puthash key node seen)
+                 (push node nodes))
+               when (and (= (length tuple) 3) (equal (aref tuple 1) "semmle.label"))
+               do (setcar node (aref tuple 2)))
+      (nreverse nodes))))
+
+(defun codeql--dot-node-labels (dot-path)
+  "Return the labels of the nodes of the dot file at DOT-PATH, by node id.
+
+Dot files of `codeql bqrs interpret' number their nodes from 0, return
+nil when the nodes of DOT-PATH aren't numbered like that."
+  (with-temp-buffer
+    (insert-file-contents dot-path)
+    (let (labels)
+      (while (re-search-forward
+              "^ *\\([0-9]+\\)\\[\"label\"=\"\\(\\(?:[^\"\\\\]\\|\\\\.\\)*\\)\"" nil t)
+        (push (cons (string-to-number (match-string 1))
+                    (replace-regexp-in-string "\\\\\\(.\\)" "\\1" (match-string 2) t))
+              labels))
+      (setq labels (nreverse labels))
+      (when (equal (mapcar #'car labels) (number-sequence 0 (1- (length labels))))
+        (mapcar #'cdr labels)))))
+
+(defun codeql--graph-match-nodes (dot-path nodes)
+  "Return the vector of NODES of the dot file at DOT-PATH, by node id.
+
+NODES are as returned by `codeql--bqrs-graph-nodes'.  Return nil unless
+they are the nodes of DOT-PATH in the same order, as told by their
+labels, since dot files don't carry the locations of their nodes."
+  (let ((labels (codeql--dot-node-labels dot-path))
+        (normalize (lambda (label)
+                     (string-trim (replace-regexp-in-string "[ \t\n]+" " " (or label ""))))))
+    (when (and labels (= (length labels) (length nodes))
+               (cl-every (lambda (label node)
+                           (string= (funcall normalize label) (funcall normalize (car node))))
+                         labels nodes))
+      (vconcat nodes))))
+
+(defun codeql--parse-image-map (cmapx nodes)
+  "Return the image map for the graphviz CMAPX image map text.
+
+The areas of CMAPX are those of the nodes of the dot file, their href
+is their node id.  NODES are as for `codeql--graph-nodes' and give the
+tooltips of the areas, see the :map image property."
+  (with-temp-buffer
+    (insert cmapx)
+    (let ((dom (libxml-parse-xml-region (point-min) (point-max))))
+      ;; the children of the map element are its area elements
+      (delq nil
+            (mapcar
+             (lambda (area)
+               (when (eq (car-safe area) 'area)
+                 (let* ((attributes (nth 1 area))
+                        (id (alist-get 'href attributes))
+                        (node (and nodes id (string-match-p "\\`[0-9]+\\'" id)
+                                   (< (string-to-number id) (length nodes))
+                                   (aref nodes (string-to-number id))))
+                        (coords (mapcar #'string-to-number
+                                        (split-string (or (alist-get 'coords attributes) "")
+                                                      "," t)))
+                        (shape (pcase (alist-get 'shape attributes)
+                                 ("rect" (pcase-let ((`(,x0 ,y0 ,x1 ,y1) coords))
+                                           (and x1 `(rect (,x0 . ,y0) . (,x1 . ,y1)))))
+                                 ("circle" (pcase-let ((`(,x ,y ,r) coords))
+                                             (and r `(circle (,x . ,y) . ,r))))
+                                 ("poly" (and coords (cons 'poly (vconcat coords)))))))
+                   (when (and id shape)
+                     (list shape id
+                           (list 'help-echo
+                                 (if node
+                                     (format "%s\n%s" (car node)
+                                             (if (cdr node)
+                                                 (car (codeql--parse-link-location (cdr node)))
+                                               "No location"))
+                                   (alist-get 'title attributes))))))))
+             (cddr dom))))))
+
+(defun codeql--svg-size-to-pixels (svg)
+  "Return SVG with its point width and height turned into pixels.
+
+Graphviz gives SVG sizes in points, which may be rendered at another
+resolution than the 96 dpi pixels of its image maps."
+  (replace-regexp-in-string
+   "<svg width=\"\\([0-9.]+\\)pt\" height=\"\\([0-9.]+\\)pt\""
+   (lambda (match)
+     (format "<svg width=\"%d\" height=\"%d\""
+             (round (* (string-to-number (match-string 1 match)) (/ 96.0 72)))
+             (round (* (string-to-number (match-string 2 match)) (/ 96.0 72)))))
+   svg t t))
+
+(defun codeql--graph-insert-dot (dot-path &optional note)
+  "Insert the dot file at DOT-PATH, after NOTE when it is non-nil."
+  (when note
+    (insert (propertize (concat note "\n\n") 'face 'shadow)))
+  (insert-file-contents dot-path)
+  (goto-char (point-min)))
+
+(defun codeql--graph-insert-image (image-path map-path)
+  "Insert the image at IMAGE-PATH with the image map at MAP-PATH."
+  (let* ((type (if (string-suffix-p ".svg" image-path) 'svg 'png))
+         (data (with-temp-buffer
+                 (set-buffer-multibyte nil)
+                 (insert-file-contents-literally image-path)
+                 (buffer-string)))
+         (map (codeql--parse-image-map
+               (with-temp-buffer
+                 (insert-file-contents map-path)
+                 (buffer-string))
+               codeql--graph-nodes)))
+    (when (eq type 'svg)
+      (setq data (codeql--svg-size-to-pixels data)))
+    (insert-image (create-image data type t :map map) "graph")
+    (goto-char (point-min))))
+
+(defun codeql--graph-render ()
+  "Render the graph of the current `codeql-graph-mode' buffer.
+
+The image is rendered asynchronously by graphviz in `codeql--graph-format',
+with an image map of its nodes, or the dot file is shown when that is
+nil."
+  (let* ((buffer (current-buffer))
+         (dot-path codeql--graph-dot-path)
+         (format codeql--graph-format)
+         (dot (and format (executable-find "dot" (file-remote-p dot-path))))
+         (base (file-name-sans-extension dot-path))
+         (image-path (concat base "." format))
+         (map-path (concat base ".cmapx"))
+         (inhibit-read-only t))
+    (when (process-live-p codeql--graph-render-process)
+      (delete-process codeql--graph-render-process))
+    (erase-buffer)
+    (cond
+     ((not format)
+      (codeql--graph-insert-dot dot-path))
+     ((not dot)
+      (setq codeql--graph-format nil)
+      (codeql--graph-insert-dot
+       dot-path "Install graphviz to render graphs, showing the dot file instead."))
+     (t
+      (insert (propertize "Rendering graph ..." 'face 'shadow))
       (let ((default-directory (file-name-directory dot-path)))
-        (make-process
-         :name "codeql-dot"
-         :buffer (generate-new-buffer " *codeql-dot*")
-         :command (list dot (format "-T%s" codeql-graph-format)
-                        "-o" (file-local-name image-path)
-                        (file-local-name dot-path))
-         :file-handler t
-         :sentinel
-         (lambda (process _event)
-           (unless (process-live-p process)
-             (let ((output (with-current-buffer (process-buffer process)
-                             (buffer-string))))
-               (kill-buffer (process-buffer process))
-               (if (and (zerop (process-exit-status process))
-                        (file-exists-p image-path))
-                   (switch-to-buffer-other-window (find-file-noselect image-path))
-                 (message "Failed to render graph, showing the dot file instead: %s"
-                          (string-trim output))
-                 (switch-to-buffer-other-window (find-file-noselect dot-path)))))))))))
+        (setq codeql--graph-render-process
+              (make-process
+               :name "codeql-dot"
+               :buffer (generate-new-buffer " *codeql-dot*")
+               ;; image map areas link to their dot node ids
+               :command (list dot "-NURL=\\N"
+                              (format "-T%s" format) "-o" (file-local-name image-path)
+                              "-Tcmapx" "-o" (file-local-name map-path)
+                              (file-local-name dot-path))
+               :file-handler t
+               :sentinel
+               (lambda (process _event)
+                 (unless (process-live-p process)
+                   (let ((output (with-current-buffer (process-buffer process)
+                                   (string-trim (buffer-string)))))
+                     (kill-buffer (process-buffer process))
+                     (when (and (buffer-live-p buffer)
+                                (eq process (buffer-local-value
+                                             'codeql--graph-render-process buffer)))
+                       (with-current-buffer buffer
+                         (let ((inhibit-read-only t))
+                           (erase-buffer)
+                           (if (and (zerop (process-exit-status process))
+                                    (file-exists-p image-path)
+                                    (file-exists-p map-path))
+                               (codeql--graph-insert-image image-path map-path)
+                             (setq codeql--graph-format nil)
+                             (codeql--graph-insert-dot
+                              dot-path (format "Failed to render graph, showing the dot file instead: %s"
+                                               output)))
+                           (set-buffer-modified-p nil))))))))))))
+    (set-buffer-modified-p nil)))
+
+(defun codeql--graph-revert (&rest _)
+  "Render the graph of the current `codeql-graph-mode' buffer again."
+  (codeql--graph-render))
+
+(defun codeql--graph-visit (id)
+  "Visit the location of the node with dot node ID of the current graph."
+  (let ((node (and codeql--graph-nodes (< id (length codeql--graph-nodes))
+                   (aref codeql--graph-nodes id))))
+    (cond ((not codeql--graph-nodes)
+           (user-error "The node locations of this graph are unknown"))
+          ((not (cdr node))
+           (user-error "Node %s has no location" (car node)))
+          (t (codeql--org-open-file-link (cdr node))))))
+
+(defun codeql-graph-visit-node-at-mouse (event)
+  "Visit the location of the graph node clicked with EVENT."
+  (interactive "e")
+  (let ((area (nth 1 (event-start event))))
+    (if (and (stringp area) (string-match-p "\\`[0-9]+\\'" area))
+        (with-current-buffer (window-buffer (posn-window (event-start event)))
+          (codeql--graph-visit (string-to-number area)))
+      (message "Click a node to visit its location."))))
+
+(defun codeql-graph-visit-node ()
+  "Visit the location of a graph node chosen by its label."
+  (interactive)
+  (unless codeql--graph-nodes
+    (user-error "The node locations of this graph are unknown"))
+  (let* ((candidates
+          (cl-loop for (label . link) across codeql--graph-nodes
+                   for id from 0
+                   when link collect
+                   (cons (format "%s  %s" (string-trim (replace-regexp-in-string
+                                                        "[ \t\n]+" " " label))
+                                 (propertize
+                                  (format "%s%s"
+                                          (file-name-nondirectory
+                                           (car (codeql--parse-link-location link)))
+                                          (if-let ((line (nth 1 (codeql--parse-link-location link))))
+                                              (format ":%s" line)
+                                            ""))
+                                  'face 'shadow))
+                         id)))
+         (choice (completing-read "Visit node: " candidates nil t)))
+    (codeql--graph-visit (cdr (assoc choice candidates)))))
+
+(defun codeql-graph-cycle-format ()
+  "Show the graph in the next of the formats of `codeql-graph-format'."
+  (interactive)
+  (let* ((formats '("svg" "png" nil))
+         (next (cadr (member codeql--graph-format formats))))
+    (when (and (null codeql--graph-format) (executable-find "dot"))
+      (setq next (car formats)))
+    (setq codeql--graph-format next)
+    (codeql--graph-render)
+    (message "Showing the graph as %s." (or next "dot"))))
+
+(declare-function image-next-line "image-mode")
+(declare-function image-previous-line "image-mode")
+(declare-function image-forward-hscroll "image-mode")
+(declare-function image-backward-hscroll "image-mode")
+(declare-function image-scroll-up "image-mode")
+(declare-function image-scroll-down "image-mode")
+(declare-function image-bob "image-mode")
+(declare-function image-eob "image-mode")
+
+(defvar codeql-graph-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-1] #'codeql-graph-visit-node-at-mouse)
+    (define-key map (kbd "RET") #'codeql-graph-visit-node)
+    (define-key map (kbd "f") #'codeql-graph-cycle-format)
+    ;; scroll large graphs like `image-mode' does
+    (define-key map [remap next-line] #'image-next-line)
+    (define-key map [remap previous-line] #'image-previous-line)
+    (define-key map [remap forward-char] #'image-forward-hscroll)
+    (define-key map [remap backward-char] #'image-backward-hscroll)
+    (define-key map [remap scroll-up-command] #'image-scroll-up)
+    (define-key map [remap scroll-down-command] #'image-scroll-down)
+    (define-key map [remap beginning-of-buffer] #'image-bob)
+    (define-key map [remap end-of-buffer] #'image-eob)
+    map)
+  "Keymap for `codeql-graph-mode'.")
+
+(define-derived-mode codeql-graph-mode special-mode "CodeQL-Graph"
+  "Major mode for the graphs of `@kind graph' query results.
+
+Click a node to visit its location, or choose one by its label with
+\\<codeql-graph-mode-map>\\[codeql-graph-visit-node].  \\[codeql-graph-cycle-format] switches between the formats of
+`codeql-graph-format', \\[revert-buffer] renders the graph again.
+
+\\{codeql-graph-mode-map}"
+  (require 'image-mode)
+  (setq truncate-lines t)
+  (setq-local revert-buffer-function #'codeql--graph-revert))
+
+(defun codeql--show-graph (dot-path &optional nodes query-buffer)
+  "Show the graph of the dot file at DOT-PATH in a `codeql-graph-mode' buffer.
+
+NODES are the nodes of the graph as returned by `codeql--bqrs-graph-nodes',
+their locations are visited with the database of QUERY-BUFFER.  The
+graph is shown as set by `codeql-graph-format'."
+  (let ((nodes (and nodes (codeql--graph-match-nodes dot-path nodes))))
+    (with-current-buffer (get-buffer-create
+                          (format "*codeql-graph: %s*" (file-name-base dot-path)))
+      (codeql-graph-mode)
+      (setq codeql--graph-dot-path dot-path
+            codeql--graph-format codeql-graph-format
+            codeql--graph-nodes nodes
+            codeql--org-query-buffer query-buffer)
+      (codeql--graph-render)
+      (switch-to-buffer-other-window (current-buffer)))))
 
 (defun codeql--process-ast (json src-filename src-root src-buffer)
   ;; only allow this to be called as part of a templated flow
@@ -5159,7 +5522,11 @@ org data when everything fits on a single page, nil otherwise."
              (string= query-kind "graph")
              query-id)
         (if-let ((dot-path (codeql--bqrs-to-dot bqrs-path query-id query-kind)))
-            (codeql--show-graph dot-path)
+            (codeql--show-graph dot-path
+                                (when (buffer-live-p query-buffer)
+                                  (with-current-buffer query-buffer
+                                    (codeql--bqrs-graph-nodes bqrs-path)))
+                                query-buffer)
           (message "Failed to interpret graph results in %s." bqrs-path)))
        ;; fall through to raw results parsing
        (t
