@@ -2411,7 +2411,8 @@ all result sets as reported by `codeql bqrs info', :result-set the name of
 the shown one, and :offsets the vector of page byte offsets as computed by
 `codeql bqrs info --paginate-rows', or nil for a single page.
 
-SARIF results have :results, the vector of all parsed SARIF results.")
+SARIF results have :results, the vector of all parsed SARIF results,
+and :link-prefix, see `codeql--sarif-results-to-org'.")
 
 (defvar-local codeql--raw-results-page-cache nil
   "Rendered org data of recently visited pages, as (PAGE . ORG-DATA) entries.
@@ -2484,9 +2485,13 @@ Prefers #select, otherwise the first result set that holds any rows."
   "Return non-nil if PAGINATION describes problem or path-problem results."
   (eq (plist-get pagination :kind) 'sarif))
 
-(defun codeql--sarif-results-to-org (results start end)
-  "Return org data for the SARIF RESULTS vector from index START below END."
-  (let ((codeql--source-link-prefix-box (list nil))
+(defun codeql--sarif-results-to-org (results start end &optional link-prefix)
+  "Return org data for the SARIF RESULTS vector from index START below END.
+
+Result links point into the source archive of the active database,
+unless LINK-PREFIX is non-nil, in which case it is used instead, e.g.
+the empty string for results whose locations are files on disk."
+  (let ((codeql--source-link-prefix-box (list link-prefix))
         (n (length results)))
     (mapconcat
      #'identity
@@ -2747,7 +2752,8 @@ and the org data of its first page, or nil when there is nothing to show."
                        (let ((page-size (plist-get pagination :page-size)))
                          (codeql--sarif-results-to-org
                           (plist-get pagination :results)
-                          (* page page-size) (* (1+ page) page-size)))
+                          (* page page-size) (* (1+ page) page-size)
+                          (plist-get pagination :link-prefix)))
                      (codeql--raw-results-page-to-org
                       (plist-get pagination :bqrs-path)
                       (plist-get pagination :result-set)
@@ -3620,7 +3626,13 @@ See `codeql-highlight-visited-location'."
       (user-error "Source file not found: %s" filename))
 
     (codeql--alerts-note-visit link)
-    (let ((query-buffer codeql--org-query-buffer))
+    (let* ((query-buffer codeql--org-query-buffer)
+           ;; results loaded from a SARIF file may point at a source
+           ;; checkout instead, see `codeql-load-sarif'
+           (database-file-p (or (not (buffer-live-p query-buffer))
+                                (with-current-buffer query-buffer
+                                  (and codeql--database-source-archive-root
+                                       (codeql--database-src-path-p filename))))))
       (when-let ((src-buffer (codeql--find-file-other-window filename)))
         (with-current-buffer src-buffer
           ;; this will be nil for org history, which means we lose any
@@ -3630,7 +3642,8 @@ See `codeql-highlight-visited-location'."
           ;; is still related to the query history I suppose?
           (unless query-buffer
             (message "No active query buffer for these results, opened from history?"))
-          (setq codeql--org-query-buffer query-buffer)
+          (when database-file-p
+            (setq codeql--org-query-buffer query-buffer))
           (widen)
           ;; codeql is 1 based, eglot calcs are 0 based, adjust accordingly,
           ;; line 0 is a location spanning the whole file
@@ -3647,7 +3660,8 @@ See `codeql-highlight-visited-location'."
                (codeql--eglot--lsp-position-to-point
                 `(:line ,(1- end-line) :character ,end-column)))))
           ;; enable our xref backend, this kicks in templated queries for refs and defs
-          (codeql-xref-backend))))))
+          (when database-file-p
+            (codeql-xref-backend)))))))
 
 (with-eval-after-load 'ol
   (org-link-set-parameters "codeql" :follow #'codeql--org-open-file-link))
@@ -4831,6 +4845,29 @@ commands can be repeated without the prefix key.")
           (when codeql--results-marker-suffix
             (format " (%s)" codeql--results-marker-suffix))))
 
+(defun codeql--render-sarif-results (results query-buffer footer marker &optional link-prefix)
+  "Render the vector of SARIF RESULTS of QUERY-BUFFER in a results buffer.
+
+FOOTER and MARKER are as for `codeql--org-render-sarif-results', and
+LINK-PREFIX is as for `codeql--sarif-results-to-org'.  Results are shown
+one page of `codeql-max-sarif-results' at a time.  Return the rendered
+org data when everything fits on a single page, nil otherwise."
+  (let* ((total (length results))
+         (page-size (max 1 codeql-max-sarif-results))
+         (org-data (codeql--sarif-results-to-org results 0 page-size link-prefix)))
+    (if (<= total page-size)
+        (codeql--org-render-sarif-results org-data query-buffer footer marker)
+      (codeql--org-render-raw-query-results
+       org-data query-buffer footer marker
+       (list :kind 'sarif
+             :results results
+             :link-prefix link-prefix
+             :page 0
+             :page-size page-size
+             :total-rows total
+             :footer footer))
+      nil)))
+
 (defun codeql-load-bqrs (bqrs-path
                          query-path
                          db-path
@@ -4938,32 +4975,16 @@ commands can be repeated without the prefix key.")
                          (cl-loop for run across runs
                                   for run-id below (length runs)
                                   do (message "Rendering results for run %s" run-id)
-                                  ;; check if we have any artifact contents, TODO: do something with 'm?
-                                  (cl-loop for artifact across (json-pointer-get run "/artifacts")
-                                           when (json-pointer-get artifact "/contents")
-                                           do (message "Found artifact contents.")
-                                           (cl-return t))
-                                  collect (or (json-pointer-get run "/results") []))))
-                 (total (length results))
-                 (page-size (max 1 codeql-max-sarif-results)))
-            (if (zerop total)
+                                  collect (or (json-pointer-get run "/results") [])))))
+            (if (zerop (length results))
                 (message "No results found.")
-              (let* ((org-data (codeql--sarif-results-to-org results 0 page-size))
-                     (marker (codeql--results-marker query-path)))
-                (if (<= total page-size)
-                    (let ((rendered (codeql--org-render-sarif-results
-                                     org-data query-buffer footer marker)))
-                      ;; save off the fully rendered version for speedy re-loads
-                      (with-temp-file (format "%s.org" bqrs-path)
-                        (insert rendered)))
-                  (codeql--org-render-raw-query-results
-                   org-data query-buffer footer marker
-                   (list :kind 'sarif
-                         :results results
-                         :page 0
-                         :page-size page-size
-                         :total-rows total
-                         :footer footer))
+              (let ((rendered (codeql--render-sarif-results
+                               results query-buffer footer
+                               (codeql--results-marker query-path))))
+                (if rendered
+                    ;; save off the fully rendered version for speedy re-loads
+                    (with-temp-file (format "%s.org" bqrs-path)
+                      (insert rendered))
                   ;; paginated results are re-rendered from the bqrs on reload
                   (when (file-exists-p (format "%s.org" bqrs-path))
                     (delete-file (format "%s.org" bqrs-path)))))))))
@@ -4992,6 +5013,171 @@ commands can be repeated without the prefix key.")
                     (delete-file (format "%s.org" bqrs-path)))
                 (with-temp-file (format "%s.org" bqrs-path)
                   (insert rendered)))))))))))
+
+;; loading SARIF files, e.g. the output of codeql database analyze
+
+(defun codeql--sarif-file-uri-path (uri)
+  "Return the local path of the absolute file URI, or nil if it isn't one."
+  (let ((url (url-generic-parse-url (url-unhex-string uri))))
+    (when (and (equal (url-type url) "file")
+               (file-name-absolute-p (url-filename url)))
+      (url-filename url))))
+
+(defun codeql--sarif-artifact-location (artifact-location run)
+  "Return ARTIFACT-LOCATION of RUN with any uri it inherits from its artifact.
+
+SARIF locations may reference an entry of the run's artifacts by index
+rather than spell out their uri."
+  (let ((index (json-pointer-get artifact-location "/index")))
+    (if (or (json-pointer-get artifact-location "/uri") (not (natnump index)))
+        artifact-location
+      (let ((artifact (ignore-errors (aref (json-pointer-get run "/artifacts") index))))
+        (append (json-pointer-get artifact "/location") artifact-location)))))
+
+(defun codeql--sarif-artifact-contents (artifact-location run)
+  "Return the embedded text contents of the artifact at ARTIFACT-LOCATION in RUN."
+  (let ((index (json-pointer-get artifact-location "/index"))
+        (uri (json-pointer-get artifact-location "/uri")))
+    (cl-loop for artifact across (or (json-pointer-get run "/artifacts") [])
+             for i from 0
+             when (or (eql i index)
+                      (and uri (equal uri (json-pointer-get artifact "/location/uri"))))
+             return (json-pointer-get artifact "/contents/text"))))
+
+(defun codeql--sarif-resolve-location (artifact-location run base-dir artifacts-dir)
+  "Return the absolute path that ARTIFACT-LOCATION of RUN refers to, or nil.
+
+Relative uris are resolved against the run's `originalUriBaseIds' for
+their `uriBaseId' when those name an absolute file uri, and otherwise
+against the directory returned by calling BASE-DIR.  When ARTIFACTS-DIR
+is non-nil and the resolved file doesn't exist, but the artifact has
+embedded contents, those are written below ARTIFACTS-DIR instead."
+  (let* ((location (codeql--sarif-artifact-location artifact-location run))
+         (uri (json-pointer-get location "/uri"))
+         (base-id (json-pointer-get location "/uriBaseId")))
+    (when (and (stringp uri) (not (codeql--empty-location-uri-p uri)))
+      (let* ((relative (and (not (url-type (url-generic-parse-url uri)))
+                            (not (file-name-absolute-p uri))
+                            (url-unhex-string uri)))
+             (path
+              (cond
+               ((not relative)
+                (or (codeql--sarif-file-uri-path uri)
+                    (and (file-name-absolute-p uri) uri)))
+               ((when-let* ((base-id)
+                            (base-uri (json-pointer-get
+                                       run (format "/originalUriBaseIds/%s/uri" base-id)))
+                            (base-path (codeql--sarif-file-uri-path base-uri)))
+                  (expand-file-name relative base-path)))
+               (t
+                (expand-file-name relative (funcall base-dir))))))
+        (if-let ((artifacts-dir)
+                 ((and path (not (codeql--file-exists-p path))))
+                 (contents (codeql--sarif-artifact-contents location run)))
+            (let ((copy (expand-file-name (or relative (file-name-nondirectory path))
+                                          artifacts-dir)))
+              (make-directory (file-name-directory copy) t)
+              (with-temp-file copy
+                (insert contents))
+              copy)
+          path)))))
+
+(defun codeql--sarif-normalize-locations (node run base-dir artifacts-dir)
+  "Rewrite all artifact locations below the parsed SARIF NODE of RUN in place.
+
+Their uris become absolute file uris, or empty ones when they can't be
+resolved, see `codeql--sarif-resolve-location' for BASE-DIR and
+ARTIFACTS-DIR."
+  (cond
+   ((vectorp node)
+    (cl-loop for child across node
+             do (codeql--sarif-normalize-locations child run base-dir artifacts-dir)))
+   ((and (consp node) (consp (car node)))
+    (dolist (entry node)
+      (if (eq (car-safe entry) 'artifactLocation)
+          (let ((path (codeql--sarif-resolve-location (cdr entry) run base-dir artifacts-dir)))
+            (setcdr entry `((uri . ,(if path (concat "file://" path) "")))))
+        (codeql--sarif-normalize-locations (cdr-safe entry) run base-dir artifacts-dir))))))
+
+(defun codeql--sarif-normalize-rule-id (result run)
+  "Give RESULT of RUN a ruleId, looking it up in the run's rules if needed."
+  (unless (json-pointer-get result "/ruleId")
+    (let* ((index (or (json-pointer-get result "/ruleIndex")
+                      (json-pointer-get result "/rule/index")))
+           (rule-id (or (json-pointer-get result "/rule/id")
+                        (and (natnump index)
+                             (ignore-errors
+                               (json-pointer-get
+                                (aref (json-pointer-get run "/tool/driver/rules") index)
+                                "/id")))
+                        "unknown-rule")))
+      (nconc result (list (cons 'ruleId rule-id))))))
+
+(defun codeql-load-sarif (sarif-path &optional checkout-dir)
+  "Render the results of the SARIF file at SARIF-PATH.
+
+This shows SARIF produced outside of this query buffer, e.g. by
+`codeql database analyze' or a code scanning run, like the results of a
+problem or path-problem query.
+
+When the query buffer has an active database, result locations are
+taken to be files of its source archive, so that they can be browsed
+with xrefs like regular query results.  With a prefix argument, or
+without an active database, they are taken to be files of the source
+checkout at CHECKOUT-DIR instead, which is prompted for when the SARIF
+contains relative locations its `originalUriBaseIds' don't resolve.
+Locations that are missing from the checkout, but whose contents are
+embedded in the SARIF, are shown from a copy of those contents."
+  (interactive
+   (list (read-file-name "SARIF file: " nil nil t nil
+                         (lambda (f) (or (file-directory-p f)
+                                         (string-match-p "\\.sarif\\(?:\\.json\\)?\\'" f))))
+         (when current-prefix-arg
+           (read-directory-name "Source checkout: " nil nil t))))
+  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (let* ((sarif-path (expand-file-name sarif-path))
+         (database-p (and codeql--active-database
+                          codeql--database-source-archive-zip
+                          (not checkout-dir)))
+         (json (with-temp-buffer
+                 (insert-file-contents sarif-path)
+                 (json-parse-buffer :object-type 'alist)))
+         (base-dir
+          (if database-p
+              (lambda () (or codeql--database-source-location-prefix "/"))
+            (lambda ()
+              (or checkout-dir
+                  (setq checkout-dir
+                        (read-directory-name "Source checkout for relative locations: "
+                                             nil nil t))))))
+         (artifacts-dir (unless database-p
+                          (expand-file-name
+                           (format "codeql-sarif-artifacts/%s" (md5 sarif-path))
+                           temporary-file-directory)))
+         (results
+          (apply #'vconcat
+                 (cl-loop for run across (or (json-pointer-get json "/runs") [])
+                          for results = (or (json-pointer-get run "/results") [])
+                          do (cl-loop for result across results
+                                      do (codeql--sarif-normalize-rule-id result run)
+                                      (codeql--sarif-normalize-locations
+                                       result run base-dir artifacts-dir))
+                          collect results))))
+    (if (zerop (length results))
+        (message "No results found in %s." sarif-path)
+      (codeql--render-sarif-results
+       results (current-buffer)
+       (format (mapconcat #'identity
+                          '("#+QUERY_TIME: %s"
+                            "#+SARIF_PATH: %s"
+                            "#+SOURCE_ROOT: %s" "") "\n")
+               (current-time-string)
+               sarif-path
+               (if database-p
+                   (directory-file-name codeql--active-database)
+                 (or checkout-dir "-")))
+       (file-name-nondirectory sarif-path)
+       (unless database-p "")))))
 
 ;; request cancellation control
 
@@ -6636,6 +6822,7 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
            ("n" "quick eval count" codeql-query-server-quick-eval-count)
            ("h" "history" codeql-query-history)
            ("C" "compare" codeql-query-history-compare)
+           ("l" "load sarif" codeql-load-sarif)
            ("t" "performance" codeql-query-performance)
            ("T" "compare performance" codeql-query-performance-compare)
            ("c" "cancel" codeql-query-server-cancel-query)]

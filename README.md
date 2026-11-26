@@ -11,6 +11,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Quick query evaluation of regions or of the predicate at point, and quick evaluation counts
 - Query history for the local session
 - Comparing the results of two query runs
+- Loading SARIF files, e.g. from `codeql database analyze` or code scanning, as browsable results
 - Query performance summaries from evaluator logs
 - Persistent per-project database history, with optional consult narrowing and embark actions
 - Registration of zipped database archives
@@ -253,6 +254,12 @@ Locations that span a whole file open that file at the top, and locations withou
 `codeql-query-history-compare` (`C` in the query server transient) compares the results of two runs from the query history, e.g. of two versions of the same query. It prompts for the two runs, which must be on the active database and have result sets with the same names and number of columns. Problem and path-problem results can only be compared with each other.
 
 The rows only found in the first run and those only found in the second run are computed by `codeql bqrs diff` and shown side by side in two results buffers, named after the runs they came from. These work like any other results buffer, so problem results are rendered as org trees and raw results as tables that can be sorted and paged. The echo area summarizes how many rows each side has to itself.
+
+#### Loading SARIF files
+
+`codeql-load-sarif` (`l` in the query server transient) renders an existing SARIF file, e.g. the output of `codeql database analyze` or a code scanning run, like the results of a problem or path-problem query, with pagination, alert navigation and diagnostics.
+
+When the query buffer has an active database, result locations are taken to be files of its source archive, so that they work with the database source archive xref backend like regular results. With a prefix argument, or without an active database, they are taken to be files of a source checkout instead, which is prompted for when the SARIF has relative locations that its `originalUriBaseIds` don't resolve. Locations missing from the checkout whose contents are embedded in the SARIF (`codeql database analyze --sarif-add-file-contents`) are shown from a read-only copy of those contents.
 
 #### Query performance
 
