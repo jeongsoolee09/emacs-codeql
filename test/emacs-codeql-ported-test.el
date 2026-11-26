@@ -1271,6 +1271,25 @@ an alist from argument lists to results."
 
 ;;; Language server
 
+;;; Transient
+
+(defun codeql-ported-test--transient-keys (prefix)
+  "Return the keys of the suffixes of the transient PREFIX."
+  (let (keys)
+    (named-let walk ((layout (get prefix 'transient--layout)))
+      (cond ((and (proper-list-p layout) (plist-get layout :command))
+             (push (plist-get layout :key) keys))
+            ((or (vectorp layout) (proper-list-p layout))
+             (mapc #'walk layout))))
+    (nreverse keys)))
+
+(ert-deftest codeql-ported-test-transient-keys ()
+  "Each command of the query server menu has a key of its own."
+  (let ((keys (codeql-ported-test--transient-keys
+               'codeql-transient-query-server-interact)))
+    (should (member "p" keys))
+    (should (equal (seq-uniq keys) keys))))
+
 (ert-deftest codeql-ported-test-lsp-single-server ()
   (require 'eglot)
   (let* ((project '(transient . "/tmp/"))

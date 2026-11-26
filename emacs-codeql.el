@@ -9652,7 +9652,7 @@ the FILES wildcard to search, which defaults to all files."
           ["Query"
            ("r" "run" codeql-query-server-run-query)
            ("e" "quick eval" codeql-query-server-quick-eval)
-           ("E" "quick eval predicate" codeql-query-server-quick-eval-predicate)
+           ("p" "quick eval predicate" codeql-query-server-quick-eval-predicate)
            ("n" "quick eval count" codeql-query-server-quick-eval-count)
            ("h" "history" codeql-query-history)
            ("C" "compare" codeql-query-history-compare)
@@ -9664,7 +9664,7 @@ the FILES wildcard to search, which defaults to all files."
            ("R" "REPL" codeql-repl)
            ("E" "eval in REPL" codeql-repl-send-region)]
           ["Config"
-           ("p" codeql-set-max-paths
+           ("P" codeql-set-max-paths
             :description
             (lambda ()
               (format "--max-paths=%s"
