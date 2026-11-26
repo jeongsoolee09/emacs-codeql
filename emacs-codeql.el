@@ -2057,6 +2057,11 @@ A location with all positions 0 spans its whole file."
 
 ;;; Org-mode based result rendering, so we can turn results into audit notes \o/
 
+(defvar-local codeql--permalink-info nil
+  "Permalink information of the results this source file was visited from.
+
+See `codeql--results-permalink-info'.")
+
 (defvar-local codeql--org-query-buffer nil
   "Share a buffer local copy of the query buffer in results buffers.")
 
@@ -3680,6 +3685,7 @@ See `codeql-highlight-visited-location'."
 
     (codeql--alerts-note-visit link)
     (let* ((query-buffer codeql--org-query-buffer)
+           (permalink-info (codeql--results-permalink-info))
            ;; results loaded from a SARIF file may point at a source
            ;; checkout instead, see `codeql-load-sarif'
            (database-file-p (or (not (buffer-live-p query-buffer))
@@ -3697,6 +3703,8 @@ See `codeql-highlight-visited-location'."
             (message "No active query buffer for these results, opened from history?"))
           (when database-file-p
             (setq codeql--org-query-buffer query-buffer))
+          (when permalink-info
+            (setq codeql--permalink-info permalink-info))
           (widen)
           ;; codeql is 1 based, eglot calcs are 0 based, adjust accordingly,
           ;; line 0 is a location spanning the whole file
@@ -5276,17 +5284,165 @@ embedded in the SARIF, are shown from a copy of those contents."
         (message "No results found in %s." sarif-path)
       (codeql--render-sarif-results
        results (current-buffer)
-       (format (mapconcat #'identity
-                          '("#+QUERY_TIME: %s"
-                            "#+SARIF_PATH: %s"
-                            "#+SOURCE_ROOT: %s" "") "\n")
-               (current-time-string)
-               sarif-path
-               (if database-p
-                   (directory-file-name codeql--active-database)
-                 (or checkout-dir "-")))
+       (concat
+        (format (mapconcat #'identity
+                           '("#+QUERY_TIME: %s"
+                             "#+SARIF_PATH: %s"
+                             "#+SOURCE_ROOT: %s" "") "\n")
+                (current-time-string)
+                sarif-path
+                (if database-p
+                    (directory-file-name codeql--active-database)
+                  (or checkout-dir "-")))
+        (when-let ((provenance (codeql--sarif-provenance json)))
+          (mapconcat
+           (lambda (line) (concat line "\n"))
+           `(,(format "#+REPOSITORY_URI: %s" (car provenance))
+             ,(format "#+REVISION_ID: %s" (cdr provenance))
+             ,@(mapcar (lambda (root) (format "#+REPOSITORY_ROOT: %s" root))
+                       (if database-p
+                           (list (concat (directory-file-name
+                                          (codeql--tramp-wrap
+                                           codeql--database-source-archive-root))
+                                         (directory-file-name
+                                          (or codeql--database-source-location-prefix "/"))))
+                         (delete-dups
+                          (delq nil
+                                `(,checkout-dir
+                                  ,@(cl-loop for run across (or (json-pointer-get json "/runs") [])
+                                             append (mapcar (lambda (base)
+                                                              (codeql--sarif-file-uri-path
+                                                               (or (json-pointer-get (cdr base) "/uri") "")))
+                                                            (json-pointer-get run "/originalUriBaseIds")))
+                                  ,artifacts-dir))))))
+           "")))
        (file-name-nondirectory sarif-path)
        (unless database-p "")))))
+
+;; permalinks to the results of SARIF files with version control provenance
+
+(defun codeql--sarif-provenance (json)
+  "Return the (REPOSITORY-URI . REVISION-ID) of the parsed SARIF JSON, or nil.
+
+This is the first `versionControlProvenance' of its runs that has both."
+  (cl-loop for run across (or (json-pointer-get json "/runs") [])
+           thereis (cl-loop for provenance across (or (json-pointer-get
+                                                       run "/versionControlProvenance")
+                                                      [])
+                            for repository = (json-pointer-get provenance "/repositoryUri")
+                            for revision = (json-pointer-get provenance "/revisionId")
+                            when (and (stringp repository) (stringp revision))
+                            return (cons repository revision))))
+
+(defun codeql--results-keyword-values (keyword)
+  "Return the values of the org KEYWORD lines of the current buffer."
+  (save-excursion
+    (save-restriction
+      (widen)
+      (goto-char (point-min))
+      (let ((re (format "^#\\+%s:[ \t]*\\(.*?\\)[ \t]*$" (regexp-quote keyword)))
+            values)
+        (while (re-search-forward re nil t)
+          (push (match-string-no-properties 1) values))
+        (nreverse values)))))
+
+(defun codeql--results-permalink-info ()
+  "Return the permalink information of the current results buffer, or nil.
+
+This is a plist of the :repository uri and :revision that the results
+were produced for, and the local :roots that their locations are
+relative to, as recorded by `codeql-load-sarif'."
+  (when (derived-mode-p 'codeql-results-mode)
+    (let ((repository (car (codeql--results-keyword-values "REPOSITORY_URI")))
+          (revision (car (codeql--results-keyword-values "REVISION_ID"))))
+      (when (and repository revision)
+        (list :repository repository
+              :revision revision
+              :roots (codeql--results-keyword-values "REPOSITORY_ROOT"))))))
+
+(defun codeql--permalink-relative-path (file roots)
+  "Return the path of FILE relative to the longest of ROOTS it is in, or nil."
+  (let ((file (expand-file-name file)))
+    (cl-loop for root in (sort (mapcar (lambda (root)
+                                         (file-name-as-directory (expand-file-name root)))
+                                       roots)
+                               (lambda (a b) (> (length a) (length b))))
+             when (string-prefix-p root file)
+             return (substring file (length root)))))
+
+(defun codeql--permalink (info path line &optional end-line)
+  "Return the permalink to LINE through END-LINE of PATH for INFO.
+
+INFO is as returned by `codeql--results-permalink-info' and PATH is
+relative to the repository root.  This assumes a GitHub style
+repository URI."
+  (let ((repository (replace-regexp-in-string
+                     "\\(?:\\.git\\)?/*\\'" ""
+                     (replace-regexp-in-string
+                      ;; scp-like git@host:owner/name
+                      "\\`[^@/:]+@\\([^:/]+\\):" "https://\\1/"
+                      (plist-get info :repository)))))
+    (concat (format "%s/blob/%s/%s" repository (plist-get info :revision)
+                    (mapconcat #'url-hexify-string (split-string path "/") "/"))
+            (when line
+              (if (and end-line (> end-line line))
+                  (format "#L%d-L%d" line end-line)
+                (format "#L%d" line))))))
+
+(defun codeql--permalink-at-point ()
+  "Return the permalink to the result location at point.
+
+In a results buffer this is the location of the codeql: link at or
+before point on the current line.  In a source file visited from those
+results it is the current line, or the lines of the active region."
+  (cl-destructuring-bind (info file line end-line)
+      (cond
+       ((derived-mode-p 'codeql-results-mode)
+        (let ((links (or (codeql--line-links)
+                         (user-error "No result location on this line"))))
+          (pcase-let ((`(,file ,line ,_ ,end-line)
+                       (codeql--parse-link-location
+                        (car (or (cl-find-if (lambda (link) (<= (nth 2 link) (point)))
+                                             links :from-end t)
+                                 (car links))))))
+            (list (or (codeql--results-permalink-info)
+                      (user-error "These results have no version control provenance"))
+                  file line end-line))))
+       ((and buffer-file-name codeql--permalink-info)
+        (if (use-region-p)
+            (list codeql--permalink-info buffer-file-name
+                  (line-number-at-pos (region-beginning))
+                  (line-number-at-pos (if (and (> (region-end) (region-beginning))
+                                               (save-excursion
+                                                 (goto-char (region-end))
+                                                 (bolp)))
+                                          (1- (region-end))
+                                        (region-end))))
+          (list codeql--permalink-info buffer-file-name (line-number-at-pos) nil)))
+       (t (user-error "Not a result location with version control provenance")))
+    (codeql--permalink
+     info
+     (or (codeql--permalink-relative-path file (plist-get info :roots))
+         (user-error "%s is not in the repository of these results" file))
+     line end-line)))
+
+(defun codeql-copy-permalink ()
+  "Copy the permalink to the result location at point to the kill ring.
+
+This works for the results of SARIF files that record the repository
+and revision they were produced for, like those of code scanning, see
+`codeql-load-sarif', and for source files visited from their links."
+  (interactive)
+  (let ((permalink (codeql--permalink-at-point)))
+    (kill-new permalink)
+    (message "Copied %s" permalink)))
+
+(defun codeql-browse-permalink ()
+  "Browse the permalink to the result location at point.
+
+See `codeql-copy-permalink'."
+  (interactive)
+  (browse-url (codeql--permalink-at-point)))
 
 ;; request cancellation control
 
