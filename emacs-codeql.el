@@ -362,6 +362,18 @@ page holding at most this many tuples.  See `codeql-results-pagination-mode'."
   :type 'integer
   :group 'emacs-codeql)
 
+(defcustom codeql-graph-format "svg"
+  "The image format that graph results are rendered to with graphviz.
+
+Results of queries with `@kind graph', e.g. those of
+`codeql-view-cfg', are rendered by graphviz `dot' and shown in
+`image-mode'.  When this is nil, or `dot' can't be found, the dot file
+itself is opened instead."
+  :type '(choice (const :tag "SVG" "svg")
+                 (const :tag "PNG" "png")
+                 (const :tag "Open the dot file" nil))
+  :group 'emacs-codeql)
+
 (defcustom codeql-max-sarif-results 100
   "The max amount of problem or path-problem results to render at once.
 
@@ -1700,6 +1712,24 @@ as obtained from `codeql--bqrs-info' pagination offsets."
                      "--" (codeql--tramp-unwrap bqrs-path))))
     (when (codeql--cli-command-to-string args)
       (with-temp-buffer (insert-file-contents sarif-file) (buffer-string)))))
+
+(defun codeql--bqrs-to-dot (bqrs-path id kind)
+  "Interpret the graph results at BQRS-PATH of query ID and KIND as dot.
+
+Return the path of the dot file, or nil on failure."
+  (cl-assert (and id kind) t)
+  (let ((output-dir (concat bqrs-path ".dot.d")))
+    (when (codeql--cli-command-to-string
+           (list "bqrs" "interpret" "-v" "--log-to-stderr"
+                 (format "-t=id=%s" id) (format "-t=kind=%s" kind)
+                 (format "--output=%s" (codeql--tramp-unwrap output-dir))
+                 "--format=dot"
+                 "--no-group-results"
+                 "--" (codeql--tramp-unwrap bqrs-path)))
+      ;; one file per query id, ids like rb/print-cfg become subdirectories
+      (let ((dot-path (expand-file-name (concat id ".dot") output-dir)))
+        (when (codeql--file-exists-p dot-path)
+          dot-path)))))
 
 (defun codeql--database-archive-zipinfo ()
   "Return extraction-relative file listing for source archive zip."
@@ -3107,6 +3137,16 @@ unescaped [ can start a link."
   (when-let (fmt(plist-get codeql--templated-query-formats language))
     (format fmt query-name)))
 
+(defun codeql--templated-query-paths (language query-name)
+  "Return the relative paths where QUERY-NAME of LANGUAGE may be found.
+
+The path of `codeql--templated-query-formats' comes first, followed by
+the locations that library packs of other languages or versions use."
+  (delete-dups
+   (delq nil (list (codeql--templated-query-path language query-name)
+                   (format "%s.ql" query-name)
+                   (format "ide-contextual-queries/%s.ql" query-name)))))
+
 (defun codeql--archive-path-from-org-filename (filename)
   ;; do a dance to normalize back to the archive root relative path for this filename
   (format "/%s" (cadr
@@ -3114,39 +3154,52 @@ unescaped [ can start a link."
                   filename
                   (format "%s/*" codeql--database-source-archive-root)))))
 
-(defun codeql--run-templated-query (language query-name src-filename src-buffer)
+(cl-defun codeql--run-templated-query (language query-name src-filename src-buffer
+                                                 &optional position)
+  "Run the templated QUERY-NAME of LANGUAGE for SRC-FILENAME of SRC-BUFFER.
+
+POSITION is nil, or a (LINE . COLUMN) cons of 1-based positions in
+SRC-FILENAME for queries that work on what is found there, like the
+printCfg query of `codeql-view-cfg'."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (cl-assert codeql--active-database t)
 
   (codeql--await-search-paths)
-  (when-let ((query-path (codeql--templated-query-path language query-name)))
-    (cl-loop for search-path in codeql--search-paths-buffer-local
-             for full-path = (format "%s/%s" search-path query-path)
-             when (codeql--file-exists-p full-path) do
-             (message "Resolved templated query %s to %s" query-name full-path)
-             (let ((template-values
-                    (cond ((string= codeql-query-server "query-server")
-                           `(:selectedSourceFile
-                             (:values
-                              (:tuples
-                               [(:stringValue
-                                 ,(codeql--archive-path-from-org-filename
-                                   (codeql--tramp-unwrap src-filename)))]))))
-                          ((string= codeql-query-server "query-server2")
-                           `(:selectedSourceFile
-                             ,(codeql--archive-path-from-org-filename
-                               (codeql--tramp-unwrap src-filename)))))))
-               (codeql--query-server-run-query-from-path
-                full-path
-                nil
-                template-values
-                src-filename
-                src-buffer))
-             ;; respect search precedence and only return from first find
-             (cl-return)
-             ;; if we did not return, that means we weren't able to find the thing.
-             finally
-             (error "Did not find templated queries in search paths."))))
+  (cl-loop for query-path in (codeql--templated-query-paths language query-name)
+           do
+           (cl-loop for search-path in codeql--search-paths-buffer-local
+                    for full-path = (format "%s/%s" search-path query-path)
+                    when (codeql--file-exists-p full-path) do
+                    (message "Resolved templated query %s to %s" query-name full-path)
+                    (let* ((archive-path (codeql--archive-path-from-org-filename
+                                          (codeql--tramp-unwrap src-filename)))
+                           (template-values
+                            (cond ((string= codeql-query-server "query-server")
+                                   `(:selectedSourceFile
+                                     (:values (:tuples [(:stringValue ,archive-path)]))
+                                     ,@(when position
+                                         `(:selectedSourceLine
+                                           (:values (:tuples [(:intValue ,(car position))]))
+                                           :selectedSourceColumn
+                                           (:values (:tuples [(:intValue ,(cdr position))]))))))
+                                  ((string= codeql-query-server "query-server2")
+                                   `(:selectedSourceFile
+                                     ,archive-path
+                                     ,@(when position
+                                         `(:selectedSourceLine
+                                           ,(number-to-string (car position))
+                                           :selectedSourceColumn
+                                           ,(number-to-string (cdr position)))))))))
+                      (codeql--query-server-run-query-from-path
+                       full-path
+                       nil
+                       template-values
+                       src-filename
+                       src-buffer))
+                    ;; respect search precedence and only run the first find
+                    (cl-return-from codeql--run-templated-query)))
+  ;; if we did not return, that means we weren't able to find the thing.
+  (error "Did not find templated query %s in search paths" query-name))
 
 (defun codeql--database-src-path-p (path)
   (let ((prefix (format "^%s/*" (regexp-quote codeql--database-source-archive-root))))
@@ -4825,6 +4878,55 @@ commands can be repeated without the prefix key.")
                 (codeql--run-templated-query language "printAst" src-filename src-buffer))))
         (message "Did not recognize this file as being part of an active codeql database.")))))
 
+(defun codeql-view-cfg ()
+  "Display the control flow graph of the function at point.
+
+This works in database source archive files, like `codeql-view-ast',
+for languages whose library packs come with a printCfg query.  The graph
+is shown as described for `codeql-graph-format'."
+  (interactive)
+  (if (buffer-live-p codeql--org-query-buffer)
+      (let ((src-filename (buffer-file-name))
+            (src-buffer (current-buffer))
+            (position (cons (line-number-at-pos) (codeql--lsp-abiding-column))))
+        (with-current-buffer codeql--org-query-buffer
+          (message "Cooking up CFG for %s, please hold." (file-name-nondirectory src-filename))
+          (let ((language (intern (format ":%s" codeql--active-database-language))))
+            (codeql--run-templated-query language "printCfg" src-filename src-buffer position))))
+    (message "Did not recognize this file as being part of an active codeql database.")))
+
+(defun codeql--show-graph (dot-path)
+  "Show the graph of the dot file at DOT-PATH, see `codeql-graph-format'."
+  (let ((dot (and codeql-graph-format
+                  (executable-find "dot" (file-remote-p dot-path))))
+        (image-path (concat (file-name-sans-extension dot-path) "." codeql-graph-format)))
+    (if (not dot)
+        (progn
+          (when codeql-graph-format
+            (message "Install graphviz to render graphs, showing the dot file instead."))
+          (switch-to-buffer-other-window (find-file-noselect dot-path)))
+      (message "Rendering graph with %s ..." dot)
+      (let ((default-directory (file-name-directory dot-path)))
+        (make-process
+         :name "codeql-dot"
+         :buffer (generate-new-buffer " *codeql-dot*")
+         :command (list dot (format "-T%s" codeql-graph-format)
+                        "-o" (file-local-name image-path)
+                        (file-local-name dot-path))
+         :file-handler t
+         :sentinel
+         (lambda (process _event)
+           (unless (process-live-p process)
+             (let ((output (with-current-buffer (process-buffer process)
+                             (buffer-string))))
+               (kill-buffer (process-buffer process))
+               (if (and (zerop (process-exit-status process))
+                        (file-exists-p image-path))
+                   (switch-to-buffer-other-window (find-file-noselect image-path))
+                 (message "Failed to render graph, showing the dot file instead: %s"
+                          (string-trim output))
+                 (switch-to-buffer-other-window (find-file-noselect dot-path)))))))))))
+
 (defun codeql--process-ast (json src-filename src-root src-buffer)
   ;; only allow this to be called as part of a templated flow
   (puthash src-filename (list json src-root) codeql--ast-cache)
@@ -4988,6 +5090,13 @@ org data when everything fits on a single page, nil otherwise."
                   ;; paginated results are re-rendered from the bqrs on reload
                   (when (file-exists-p (format "%s.org" bqrs-path))
                     (delete-file (format "%s.org" bqrs-path)))))))))
+       ;; graphs, e.g. control flow graphs of `codeql-view-cfg'
+       ((and (seq-contains-p compatible-query-kinds "Graph")
+             (string= query-kind "graph")
+             query-id)
+        (if-let ((dot-path (codeql--bqrs-to-dot bqrs-path query-id query-kind)))
+            (codeql--show-graph dot-path)
+          (message "Failed to interpret graph results in %s." bqrs-path)))
        ;; fall through to raw results parsing
        (t
         ;; raw results are decoded one page of `codeql-max-raw-results' rows at a
