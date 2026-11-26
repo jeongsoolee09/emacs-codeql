@@ -363,16 +363,19 @@ page holding at most this many tuples.  See `codeql-results-pagination-mode'."
   :group 'emacs-codeql)
 
 (defcustom codeql-graph-format "svg"
-  "The image format that graph results are rendered to with graphviz.
+  "The format that graph results are shown in.
 
 Results of queries with `@kind graph', e.g. those of
-`codeql-view-cfg', are rendered by graphviz `dot' and shown in a
-`codeql-graph-mode' buffer, where clicking a node visits its location.
-When this is nil, or `dot' can't be found, the dot file itself is shown
-instead.  \<codeql-graph-mode-map>\[codeql-graph-cycle-format] in the graph buffer
-switches between these formats."
+`codeql-view-cfg', are shown in a `codeql-graph-mode' buffer.  As
+\"svg\" or \"png\" they are rendered to an image by graphviz `dot',
+where clicking a node visits its location.  As \"text\" they are drawn
+as a text diagram in the style of `undo-tree-visualize', which is also
+used when `dot' can't be found or the frame can't show images.  When
+this is nil, the dot file itself is shown.
+\\<codeql-graph-mode-map>\\[codeql-graph-cycle-format] in the graph buffer switches between these formats."
   :type '(choice (const :tag "SVG" "svg")
                  (const :tag "PNG" "png")
+                 (const :tag "Text diagram" "text")
                  (const :tag "Show the dot file" nil))
   :group 'emacs-codeql)
 
@@ -5028,6 +5031,24 @@ nil when the nodes of the dot file are not known, see
 (defvar-local codeql--graph-render-process nil
   "The graphviz process rendering the graph of a `codeql-graph-mode' buffer.")
 
+(defvar-local codeql--graph-text nil
+  "The text diagram of the graph of a `codeql-graph-mode' buffer.
+
+This is a plist of the :labels of the nodes of the graph and their
+:successors and :predecessors, vectors by dot node id, its :edges as
+returned by `codeql--dot-edges' and the :rows of its diagram as returned
+by `codeql--graph-text-layout'.  It is nil until the graph is first
+shown as text.")
+
+(defvar-local codeql--graph-selected nil
+  "The dot node id of the selected node of a text graph diagram.")
+
+(defvar-local codeql--graph-trail nil
+  "The nodes selected before `codeql--graph-selected', most recent first.
+
+`codeql-graph-previous' goes back along it, and the branches switched
+between by `codeql-graph-forward' are the successors of its first node.")
+
 (defun codeql--location-link-path (url)
   "Return the codeql: link path of the location URL, see `codeql--location-url'.
 
@@ -5165,6 +5186,8 @@ resolution than the 96 dpi pixels of its image maps."
   (insert-file-contents dot-path)
   (goto-char (point-min)))
 
+(defvar codeql-graph-image-map)
+
 (defun codeql--graph-insert-image (image-path map-path)
   "Insert the image at IMAGE-PATH with the image map at MAP-PATH."
   (let* ((type (if (string-suffix-p ".svg" image-path) 'svg 'png))
@@ -5180,7 +5203,397 @@ resolution than the 96 dpi pixels of its image maps."
     (when (eq type 'svg)
       (setq data (codeql--svg-size-to-pixels data)))
     (insert-image (create-image data type t :map map) "graph")
+    (put-text-property (point-min) (point-max) 'keymap codeql-graph-image-map)
     (goto-char (point-min))))
+
+;; text diagrams of graphs, drawn like those of `undo-tree-visualize':
+;; one node per row, with an `o' in the lane of each node and the edges
+;; pointing down the diagram as lanes of `|' between them
+;;
+;;   o      while (i < n)
+;;   |
+;;   o-.    if (x)
+;;   | |
+;;   o |    then
+;;   | |
+;;   | o    else
+;;   | |
+;;   o-'    i++  ^ while (i < n)
+;;
+;; `.' starts the lane of another successor, `'' ends that of another
+;; predecessor, and edges pointing up the diagram are listed after the
+;; label as `^ LABEL'
+
+(defun codeql--dot-edges (dot-path)
+  "Return the edges of the dot file at DOT-PATH as (FROM TO LABEL) lists.
+
+FROM and TO are dot node ids, as for `codeql--dot-node-labels', LABEL
+is the label of the edge or nil when it has none."
+  (with-temp-buffer
+    (insert-file-contents dot-path)
+    (let (edges)
+      (while (re-search-forward
+              (concat "^ *\\([0-9]+\\) -> \\([0-9]+\\)"
+                      "\\(?:\\[\"label\"=\"\\(\\(?:[^\"\\\\]\\|\\\\.\\)*\\)\"\\)?")
+              nil t)
+        (push (list (string-to-number (match-string 1))
+                    (string-to-number (match-string 2))
+                    (and (match-string 3)
+                         (replace-regexp-in-string "\\\\\\(.\\)" "\\1" (match-string 3) t)))
+              edges))
+      (nreverse edges))))
+
+(defun codeql--graph-text-order (successors)
+  "Return the dot node ids of a graph in the order of its text diagram.
+
+SUCCESSORS is a vector of the lists of successors of the nodes, by dot
+node id.  This is the reverse postorder of a depth-first search from the
+nodes without predecessors, then from those left over by id, so that most
+edges point down the diagram.  A node is followed by its first
+successor where possible."
+  (let* ((count (length successors))
+         (visited (make-bool-vector count nil))
+         (rootp (make-bool-vector count t))
+         (search
+          (lambda (roots)
+            (let (order)
+              ;; visit the roots in reverse so the first comes first
+              (dolist (root (reverse roots))
+                (unless (aref visited root)
+                  (aset visited root t)
+                  ;; a stack of (NODE . SUCCESSORS-LEFT-TO-VISIT)
+                  (let ((stack (list (cons root (reverse (aref successors root))))))
+                    (while stack
+                      (let* ((top (car stack))
+                             (next (cl-find-if-not (lambda (id) (aref visited id)) (cdr top))))
+                        (if (not next)
+                            (push (car (pop stack)) order)
+                          (setcdr top (cdr (memq next (cdr top))))
+                          (aset visited next t)
+                          (push (cons next (reverse (aref successors next))) stack)))))))
+              order))))
+    (dotimes (id count)
+      (dolist (successor (aref successors id))
+        (unless (= successor id)
+          (aset rootp successor nil))))
+    (append (funcall search (cl-remove-if-not (lambda (id) (aref rootp id))
+                                              (number-sequence 0 (1- count))))
+            ;; nodes on cycles that can't be reached from those, by id
+            (cl-loop for id below count
+                     unless (aref visited id) append (funcall search (list id))))))
+
+(defun codeql--graph-text-layout (successors)
+  "Return the rows of the text diagram of a graph.
+
+SUCCESSORS is a vector of the lists of successors of the nodes, by dot
+node id.  Each row is a (ID NODE-LINE LINK-LINE BACK) list: the dot node
+ID drawn in it, the diagram of its NODE-LINE, the LINK-LINE drawn below
+it, which is nil for the last row, and the successors of ID that edges
+point BACK up to, which aren't drawn."
+  (let* ((order (codeql--graph-text-order successors))
+         (position (make-vector (length successors) 0))
+         ;; the target nodes of the edges drawn in each lane
+         (lanes [])
+         (diagram (lambda (slot)
+                    (string-trim-right
+                     (mapconcat (lambda (k) (string (funcall slot k)))
+                                (number-sequence 0 (1- (length lanes)))
+                                " "))))
+         rows)
+    (cl-loop for id in order for row from 0 do (aset position id row))
+    (dolist (id order)
+      (let* ((forward (cl-remove-if-not (lambda (successor)
+                                          (> (aref position successor) (aref position id)))
+                                        (aref successors id)))
+             (ends (cl-loop for k below (length lanes)
+                            when (eql (aref lanes k) id) collect k))
+             (column (or (car ends) (cl-position nil lanes) (length lanes)))
+             (through (cl-loop for k below (length lanes)
+                               when (and (aref lanes k) (not (eql (aref lanes k) id)))
+                               collect k))
+             starts)
+        (setq ends (delq column ends))
+        (when (= column (length lanes))
+          (setq lanes (vconcat lanes [nil])))
+        (aset lanes column (car forward))
+        (dolist (k ends)
+          (aset lanes k nil))
+        (dolist (successor (cdr forward))
+          (let ((k (or (cl-loop for k from (1+ column) below (length lanes)
+                                unless (or (aref lanes k) (memq k ends)) return k)
+                       (length lanes))))
+            (when (= k (length lanes))
+              (setq lanes (vconcat lanes [nil])))
+            (aset lanes k successor)
+            (push k starts)))
+        (let* ((marks (append ends starts))
+               (low (apply #'min column marks))
+               (high (apply #'max column marks))
+               (node-line
+                (let ((line (funcall diagram
+                                     (lambda (k)
+                                       (cond ((= k column) ?o)
+                                             ((memq k through) ?|)
+                                             ((memq k ends) ?')
+                                             ((memq k starts) ?.)
+                                             ((< low k high) ?-)
+                                             (t ?\s))))))
+                  ;; join the lanes to the node
+                  (dotimes (k (- high low))
+                    (aset line (+ (* 2 (+ low k)) 1) ?-))
+                  line)))
+          (while (and (> (length lanes) 0) (null (aref lanes (1- (length lanes)))))
+            (setq lanes (substring lanes 0 -1)))
+          (push (list id node-line
+                      (funcall diagram (lambda (k) (if (aref lanes k) ?| ?\s)))
+                      (cl-remove-if-not (lambda (successor)
+                                          (<= (aref position successor) (aref position id)))
+                                        (aref successors id)))
+                rows))))
+    (when rows
+      (setf (nth 2 (car rows)) nil))
+    (nreverse rows)))
+
+(defun codeql--graph-text-graph (dot-path)
+  "Return the text diagram of the dot file at DOT-PATH, or nil.
+
+See `codeql--graph-text'.  This is nil when the nodes of DOT-PATH aren't
+numbered from 0, see `codeql--dot-node-labels'."
+  (when-let ((labels (codeql--dot-node-labels dot-path)))
+    (let* ((count (length labels))
+           (edges (cl-remove-if-not (lambda (edge)
+                                      (and (< (car edge) count) (< (nth 1 edge) count)))
+                                    (codeql--dot-edges dot-path)))
+           (successors (make-vector count nil))
+           (predecessors (make-vector count nil)))
+      (dolist (edge (reverse edges))
+        (cl-pushnew (nth 1 edge) (aref successors (car edge)))
+        (cl-pushnew (car edge) (aref predecessors (nth 1 edge))))
+      (list :labels (vconcat (mapcar (lambda (label)
+                                       ;; dot labels break lines with \n
+                                       (string-trim (replace-regexp-in-string
+                                                     "\\(?:\\\\n\\|[ \t\n]\\)+" " " label)))
+                                     labels))
+            :edges edges
+            :successors successors
+            :predecessors predecessors
+            :rows (codeql--graph-text-layout successors)))))
+
+(defun codeql--graph-text-label (id &optional width)
+  "Return the label of the node with dot node ID, truncated to WIDTH."
+  (let ((label (aref (plist-get codeql--graph-text :labels) id)))
+    (if width (truncate-string-to-width label width nil nil "…") label)))
+
+(defun codeql--graph-text-location (id)
+  "Return the location of the node with dot node ID as FILE:LINE, or nil."
+  (when-let* ((node (and codeql--graph-nodes (aref codeql--graph-nodes id)))
+              (location (and (cdr node) (codeql--parse-link-location (cdr node)))))
+    (if (nth 1 location)
+        (format "%s:%s" (file-name-nondirectory (car location)) (nth 1 location))
+      (file-name-nondirectory (car location)))))
+
+(defun codeql--graph-text-button (id &optional edge-label)
+  "Return a button selecting the node with dot node ID, after EDGE-LABEL."
+  (concat (if edge-label (propertize (format "[%s] " edge-label) 'face 'shadow) "")
+          (make-text-button (codeql--graph-text-label id 40) nil
+                            'action (lambda (_) (codeql--graph-select id))
+                            'follow-link t
+                            'help-echo (codeql--graph-text-label id))))
+
+(defun codeql--graph-text-details ()
+  "Insert the description of the selected node of a text graph diagram."
+  (let* ((id codeql--graph-selected)
+         (edges (plist-get codeql--graph-text :edges))
+         (list-nodes
+          (lambda (ids label-of)
+            (if ids
+                (mapconcat (lambda (other) (codeql--graph-text-button
+                                            other (funcall label-of other)))
+                           ids ", ")
+              "none"))))
+    (insert "\n  " (propertize (codeql--graph-text-label id) 'face 'bold) "\n"
+            (format "  Location: %s\n" (or (codeql--graph-text-location id) "unknown"))
+            (format "  Predecessors: %s\n"
+                    (funcall list-nodes (aref (plist-get codeql--graph-text :predecessors) id)
+                             (lambda (other)
+                               (nth 2 (cl-find-if (lambda (edge) (and (= (car edge) other)
+                                                                      (= (nth 1 edge) id)))
+                                                  edges)))))
+            (format "  Successors: %s\n"
+                    (funcall list-nodes (aref (plist-get codeql--graph-text :successors) id)
+                             (lambda (other)
+                               (nth 2 (cl-find-if (lambda (edge) (and (= (car edge) id)
+                                                                      (= (nth 1 edge) other)))
+                                                  edges)))))
+            "\n"
+            (propertize (substitute-command-keys
+                         (concat "  \\<codeql-graph-mode-map>\\[codeql-graph-next]/\\[codeql-graph-previous] successor/predecessor"
+                                 "   \\[codeql-graph-forward]/\\[codeql-graph-backward] other branch"
+                                 "   \\[codeql-graph-visit-node] visit"
+                                 "   \\[codeql-graph-cycle-format] format"
+                                 "   \\[quit-window] quit"))
+                        'face 'shadow)
+            "\n")))
+
+(defun codeql--graph-insert-text ()
+  "Insert the text diagram of the graph of the current buffer.
+
+Point is left on the selected node, see `codeql--graph-selected'."
+  (let* ((rows (plist-get codeql--graph-text :rows))
+         (width (apply #'max 0 (mapcar (lambda (row) (length (nth 1 row))) rows)))
+         target)
+    (unless codeql--graph-selected
+      (setq codeql--graph-selected (car (car rows))))
+    (pcase-dolist (`(,id ,node-line ,link-line ,back) rows)
+      (let* ((selected (eql id codeql--graph-selected))
+             (column (string-match-p "o" node-line))
+             (location (codeql--graph-text-location id))
+             (start (point)))
+        (when selected
+          (setq node-line (copy-sequence node-line))
+          (aset node-line column ?x)
+          (put-text-property column (1+ column) 'face '(:inverse-video t) node-line))
+        (insert "  " node-line (make-string (- width (length node-line)) ?\s) "  "
+                (propertize (codeql--graph-text-label id 60)
+                            'face (and selected 'bold)
+                            'mouse-face 'highlight)
+                (if location (propertize (concat "  " location) 'face 'shadow) "")
+                (mapconcat (lambda (other)
+                             (propertize (format "  ^ %s" (codeql--graph-text-label other 30))
+                                         'face 'shadow))
+                           back ""))
+        (put-text-property start (point) 'codeql-graph-node id)
+        (put-text-property start (point) 'help-echo
+                           (format "%s\n%s" (codeql--graph-text-label id)
+                                   (or location "No location")))
+        (when selected
+          (setq target (+ start 2 column)))
+        (insert "\n")
+        (when link-line
+          (insert "  " link-line "\n"))))
+    (codeql--graph-text-details)
+    (goto-char (or target (point-min)))
+    (dolist (window (get-buffer-window-list (current-buffer) nil t))
+      (set-window-point window (point)))))
+
+(defun codeql--graph-header-line ()
+  "Return the header line of a text graph diagram, the selected node."
+  (when codeql--graph-selected
+    (concat " " (codeql--graph-text-label codeql--graph-selected)
+            (when-let ((location (codeql--graph-text-location codeql--graph-selected)))
+              (propertize (concat "  " location) 'face 'shadow)))))
+
+(defun codeql--graph-text-p ()
+  "Return non-nil when the current graph buffer shows a text diagram."
+  (equal codeql--graph-format "text"))
+
+(defun codeql--graph-select (id &optional trail)
+  "Select the node with dot node ID of the text diagram, after TRAIL.
+
+TRAIL is the new `codeql--graph-trail'."
+  (setq codeql--graph-selected id
+        codeql--graph-trail trail)
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (codeql--graph-insert-text)
+    (set-buffer-modified-p nil)))
+
+(defun codeql--graph-text-node-at (pos)
+  "Return the dot node id of the text diagram row at POS, or nil."
+  (and (codeql--graph-text-p) (get-text-property pos 'codeql-graph-node)))
+
+(defun codeql--graph-parent ()
+  "Return the node the selected node was reached from, or nil.
+
+This is the previously selected node if it is a predecessor, or else the
+first predecessor of the selected node."
+  (let ((predecessors (aref (plist-get codeql--graph-text :predecessors)
+                            codeql--graph-selected)))
+    (if (memq (car codeql--graph-trail) predecessors)
+        (car codeql--graph-trail)
+      (car predecessors))))
+
+(defun codeql--graph-text-next ()
+  "Select a successor of the selected node, the one below it if any."
+  (let* ((id codeql--graph-selected)
+         (successors (aref (plist-get codeql--graph-text :successors) id))
+         (back (nth 3 (assq id (plist-get codeql--graph-text :rows))))
+         (next (or (cl-find-if-not (lambda (successor) (memq successor back)) successors)
+                   (car successors))))
+    (unless next
+      (user-error "This node has no successors"))
+    (codeql--graph-select next (cons id codeql--graph-trail))))
+
+(defun codeql--graph-text-previous ()
+  "Select the node the selected node was reached from."
+  (let ((parent (codeql--graph-parent)))
+    (unless parent
+      (user-error "This node has no predecessors"))
+    (codeql--graph-select parent (and (eq parent (car codeql--graph-trail))
+                                      (cdr codeql--graph-trail)))))
+
+(defun codeql--graph-text-switch (delta)
+  "Select the branch DELTA branches away from the selected node.
+
+The branches are the successors of the node it was reached from."
+  (let* ((parent (or (codeql--graph-parent)
+                     (user-error "This node has no other branches")))
+         (siblings (aref (plist-get codeql--graph-text :successors) parent))
+         (next (nth (+ (cl-position codeql--graph-selected siblings) delta) siblings)))
+    (unless (and next (>= (+ (cl-position codeql--graph-selected siblings) delta) 0))
+      (user-error "No other branch in that direction"))
+    (codeql--graph-select next (if (eq parent (car codeql--graph-trail))
+                                   codeql--graph-trail
+                                 (list parent)))))
+
+(defun codeql-graph-next ()
+  "Move to a successor of the selected node of a text graph diagram.
+
+Successors pointing down the diagram are preferred.  Images are scrolled
+instead, and the dot file is moved in by line."
+  (interactive)
+  (cond ((codeql--graph-text-p) (codeql--graph-text-next))
+        ((codeql--graph-image-p) (image-next-line 1))
+        ((not codeql--graph-format) (forward-line 1))))
+
+(defun codeql-graph-previous ()
+  "Move back to the node the selected node was reached from.
+
+That is the previously selected node, or the first predecessor of the
+selected node.  Images are scrolled instead, and the dot file is moved
+in by line."
+  (interactive)
+  (cond ((codeql--graph-text-p) (codeql--graph-text-previous))
+        ((codeql--graph-image-p) (image-previous-line 1))
+        ((not codeql--graph-format) (forward-line -1))))
+
+(defun codeql-graph-forward ()
+  "Switch to the next branch of the node the selected node was reached from.
+
+Images are scrolled instead, and point moves by character in the dot
+file."
+  (interactive)
+  (cond ((codeql--graph-text-p) (codeql--graph-text-switch 1))
+        ((codeql--graph-image-p) (image-forward-hscroll 1))
+        ((not codeql--graph-format) (forward-char 1))))
+
+(defun codeql-graph-backward ()
+  "Switch to the previous branch of the node the selected node was reached from.
+
+Images are scrolled instead, and point moves by character in the dot
+file."
+  (interactive)
+  (cond ((codeql--graph-text-p) (codeql--graph-text-switch -1))
+        ((codeql--graph-image-p) (image-backward-hscroll 1))
+        ((not codeql--graph-format) (backward-char 1))))
+
+(defun codeql--graph-image-p ()
+  "Return non-nil when the current graph buffer shows a rendered image."
+  (eq (car-safe (get-text-property (point-min) 'display)) 'image))
+
+(defun codeql--graph-images-p (format)
+  "Return non-nil when the selected frame can show graph images in FORMAT."
+  (and (display-images-p) (image-type-available-p (intern format))))
 
 (defun codeql--graph-render ()
   "Render the graph of the current `codeql-graph-mode' buffer.
@@ -5195,17 +5608,32 @@ nil."
          (base (file-name-sans-extension dot-path))
          (image-path (concat base "." format))
          (map-path (concat base ".cmapx"))
-         (inhibit-read-only t))
+         (inhibit-read-only t)
+         note)
     (when (process-live-p codeql--graph-render-process)
       (delete-process codeql--graph-render-process))
     (erase-buffer)
+    (setq header-line-format nil)
+    (when (and (member format '("svg" "png"))
+               (not (and dot (codeql--graph-images-p format))))
+      (message (if dot "This frame can't show %s images, showing the graph as text."
+                 "Install graphviz to render graphs as %s images, showing the graph as text.")
+               format)
+      (setq format "text"
+            codeql--graph-format format))
+    (when (equal format "text")
+      (unless codeql--graph-text
+        (setq codeql--graph-text (codeql--graph-text-graph dot-path)))
+      (unless codeql--graph-text
+        (setq format nil
+              codeql--graph-format nil
+              note "This graph can't be drawn as text, showing the dot file instead.")))
     (cond
      ((not format)
-      (codeql--graph-insert-dot dot-path))
-     ((not dot)
-      (setq codeql--graph-format nil)
-      (codeql--graph-insert-dot
-       dot-path "Install graphviz to render graphs, showing the dot file instead."))
+      (codeql--graph-insert-dot dot-path note))
+     ((equal format "text")
+      (codeql--graph-insert-text)
+      (setq header-line-format '(:eval (codeql--graph-header-line))))
      (t
       (insert (propertize "Rendering graph ..." 'face 'shadow))
       (let ((default-directory (file-name-directory dot-path)))
@@ -5257,19 +5685,36 @@ nil."
           (t (codeql--org-open-file-link (cdr node))))))
 
 (defun codeql-graph-visit-node-at-mouse (event)
-  "Visit the location of the graph node clicked with EVENT."
-  (interactive "e")
-  (let ((area (nth 1 (event-start event))))
-    (if (and (stringp area) (string-match-p "\\`[0-9]+\\'" area))
-        (with-current-buffer (window-buffer (posn-window (event-start event)))
-          (codeql--graph-visit (string-to-number area)))
-      (message "Click a node to visit its location."))))
+  "Visit the location of the graph node clicked with EVENT.
 
-(defun codeql-graph-visit-node ()
-  "Visit the location of a graph node chosen by its label."
-  (interactive)
+In a text diagram, the clicked node is selected, and visited when it
+already was."
+  (interactive "e")
+  (let* ((position (event-start event))
+         (area (nth 1 position)))
+    (with-current-buffer (window-buffer (posn-window position))
+      (let ((id (and (posn-point position) (codeql--graph-text-node-at (posn-point position)))))
+        (cond ((and (stringp area) (string-match-p "\\`[0-9]+\\'" area))
+               (codeql--graph-visit (string-to-number area)))
+              ((and id (eql id codeql--graph-selected))
+               (codeql--graph-visit id))
+              (id (codeql--graph-select id (cons codeql--graph-selected codeql--graph-trail)))
+              (t (message "Click a node to visit its location.")))))))
+
+(defun codeql-graph-visit-node (&optional choose)
+  "Visit the location of a graph node chosen by its label.
+
+In a text diagram, visit the node of the row at point, or the selected
+node, unless CHOOSE is non-nil, interactively with a prefix argument."
+  (interactive "P")
   (unless codeql--graph-nodes
     (user-error "The node locations of this graph are unknown"))
+  (if (and (codeql--graph-text-p) (not choose))
+      (codeql--graph-visit (or (codeql--graph-text-node-at (point)) codeql--graph-selected))
+    (codeql--graph-choose-node)))
+
+(defun codeql--graph-choose-node ()
+  "Visit the location of a graph node chosen by its label."
   (let* ((candidates
           (cl-loop for (label . link) across codeql--graph-nodes
                    for id from 0
@@ -5289,12 +5734,18 @@ nil."
     (codeql--graph-visit (cdr (assoc choice candidates)))))
 
 (defun codeql-graph-cycle-format ()
-  "Show the graph in the next of the formats of `codeql-graph-format'."
+  "Show the graph in the next of the formats of `codeql-graph-format'.
+
+Image formats are skipped when they can't be rendered or shown."
   (interactive)
-  (let* ((formats '("svg" "png" nil))
-         (next (cadr (member codeql--graph-format formats))))
-    (when (and (null codeql--graph-format) (executable-find "dot"))
-      (setq next (car formats)))
+  (let* ((dot (executable-find "dot" (file-remote-p codeql--graph-dot-path)))
+         (formats (cl-remove-if (lambda (format)
+                                  (and (member format '("svg" "png"))
+                                       (not (and dot (codeql--graph-images-p format)))))
+                                '("svg" "png" "text" nil)))
+         (next (if (member codeql--graph-format formats)
+                   (car (or (cdr (member codeql--graph-format formats)) formats))
+                 (car formats))))
     (setq codeql--graph-format next)
     (codeql--graph-render)
     (message "Showing the graph as %s." (or next "dot"))))
@@ -5308,22 +5759,46 @@ nil."
 (declare-function image-bob "image-mode")
 (declare-function image-eob "image-mode")
 
-(defvar codeql-graph-mode-map
+(defvar codeql-graph-image-map
   (let ((map (make-sparse-keymap)))
-    (define-key map [mouse-1] #'codeql-graph-visit-node-at-mouse)
-    (define-key map (kbd "RET") #'codeql-graph-visit-node)
-    (define-key map (kbd "f") #'codeql-graph-cycle-format)
+    (when (boundp 'image-map)
+      (set-keymap-parent map image-map))
     ;; scroll large graphs like `image-mode' does
-    (define-key map [remap next-line] #'image-next-line)
-    (define-key map [remap previous-line] #'image-previous-line)
-    (define-key map [remap forward-char] #'image-forward-hscroll)
-    (define-key map [remap backward-char] #'image-backward-hscroll)
     (define-key map [remap scroll-up-command] #'image-scroll-up)
     (define-key map [remap scroll-down-command] #'image-scroll-down)
     (define-key map [remap beginning-of-buffer] #'image-bob)
     (define-key map [remap end-of-buffer] #'image-eob)
     map)
+  "Keymap of the graph images of `codeql-graph-mode' buffers.")
+
+(defvar codeql-graph-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-1] #'codeql-graph-visit-node-at-mouse)
+    (define-key map (kbd "RET") #'codeql-graph-visit-node)
+    (define-key map (kbd "f") #'codeql-graph-cycle-format)
+    (define-key map (kbd "n") #'codeql-graph-next)
+    (define-key map (kbd "p") #'codeql-graph-previous)
+    (define-key map [remap next-line] #'codeql-graph-next)
+    (define-key map [remap previous-line] #'codeql-graph-previous)
+    (define-key map [remap forward-char] #'codeql-graph-forward)
+    (define-key map [remap right-char] #'codeql-graph-forward)
+    (define-key map [remap backward-char] #'codeql-graph-backward)
+    (define-key map [remap left-char] #'codeql-graph-backward)
+    map)
   "Keymap for `codeql-graph-mode'.")
+
+(declare-function evil-define-key* "evil-core")
+
+(with-eval-after-load 'evil
+  (evil-define-key* '(normal motion) codeql-graph-mode-map
+                    "j" #'codeql-graph-next
+                    "k" #'codeql-graph-previous
+                    "l" #'codeql-graph-forward
+                    "h" #'codeql-graph-backward
+                    "f" #'codeql-graph-cycle-format
+                    (kbd "RET") #'codeql-graph-visit-node
+                    "gr" #'revert-buffer
+                    "q" #'quit-window))
 
 (define-derived-mode codeql-graph-mode special-mode "CodeQL-Graph"
   "Major mode for the graphs of `@kind graph' query results.
@@ -5331,6 +5806,10 @@ nil."
 Click a node to visit its location, or choose one by its label with
 \\<codeql-graph-mode-map>\\[codeql-graph-visit-node].  \\[codeql-graph-cycle-format] switches between the formats of
 `codeql-graph-format', \\[revert-buffer] renders the graph again.
+
+In a text diagram, \\[codeql-graph-next] and \\[codeql-graph-previous] move to a successor and back to a
+predecessor of the selected node, \\[codeql-graph-forward] and \\[codeql-graph-backward] switch between the
+branches it is on, and \\[codeql-graph-visit-node] visits it, like in `undo-tree-visualize'.
 
 \\{codeql-graph-mode-map}"
   (require 'image-mode)
@@ -5348,6 +5827,9 @@ graph is shown as set by `codeql-graph-format'."
                           (format "*codeql-graph: %s*" (file-name-base dot-path)))
       (codeql-graph-mode)
       (setq codeql--graph-dot-path dot-path
+            codeql--graph-text nil
+            codeql--graph-selected nil
+            codeql--graph-trail nil
             codeql--graph-format codeql-graph-format
             codeql--graph-nodes nodes
             codeql--org-query-buffer query-buffer)
