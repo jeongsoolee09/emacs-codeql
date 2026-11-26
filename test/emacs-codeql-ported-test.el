@@ -938,5 +938,42 @@ an alist from argument lists to results."
                      (buffer-string))))
         (kill-buffer)))))
 
+;;; Language server
+
+(ert-deftest codeql-ported-test-lsp-single-server ()
+  (require 'eglot)
+  (let* ((project '(transient . "/tmp/"))
+         (contact (list '(ql-tree-sitter-mode) project 'eglot-lsp-server
+                        '("codeql") '("ql")))
+         (connects 0))
+    (cl-letf (((symbol-function 'eglot--guess-contact) (lambda (&rest _) contact))
+              ((symbol-function 'eglot--connect) (lambda (&rest _) (cl-incf connects)))
+              ((symbol-function 'eglot--maybe-activate-editing-mode) #'ignore))
+      (codeql-ported-test--with-query-buffer
+        (setq buffer-file-name "/tmp/codeql-ported-test.ql")
+        ;; a mode hook's eglot-ensure would connect before the search paths are known
+        (eglot-ensure)
+        (should-not (local-variable-p 'post-command-hook))
+        (codeql--lsp-connect nil)
+        (should (= connects 1))
+        ;; eglot only registers a server for its project once it is up
+        (let ((server (make-instance
+                       'eglot-lsp-server
+                       :name "codeql-ported-test-server"
+                       :process (make-process :name "codeql-ported-test-server"
+                                              :command '("cat")
+                                              :connection-type 'pipe
+                                              :noquery t))))
+          (unwind-protect
+              (progn
+                (setf (eglot--project server) project)
+                (setf (eglot--languages server) '((ql-tree-sitter-mode . "ql")))
+                (codeql--lsp-connect nil)
+                (should (= connects 1))
+                (setf (eglot--project server) '(transient . "/elsewhere/"))
+                (codeql--lsp-connect nil)
+                (should (= connects 2)))
+            (delete-process (jsonrpc--process server))))))))
+
 (provide 'emacs-codeql-ported-test)
 ;;; emacs-codeql-ported-test.el ends here
