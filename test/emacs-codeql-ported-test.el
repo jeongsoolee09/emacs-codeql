@@ -1277,8 +1277,14 @@ an alist from argument lists to results."
   "Return the keys of the suffixes of the transient PREFIX."
   (let (keys)
     (named-let walk ((layout (get prefix 'transient--layout)))
-      (cond ((and (proper-list-p layout) (plist-get layout :command))
-             (push (plist-get layout :key) keys))
+      (cond ((and (proper-list-p layout)
+                  ;; Newer transients put the class before the plist.
+                  (let ((plist (if (and (car layout) (symbolp (car layout))
+                                         (not (keywordp (car layout))))
+                                    (cdr layout)
+                                  layout)))
+                    (and (plist-get plist :command)
+                         (push (plist-get plist :key) keys)))))
             ((or (vectorp layout) (proper-list-p layout))
              (mapc #'walk layout))))
     (nreverse keys)))
