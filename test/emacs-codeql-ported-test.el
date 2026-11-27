@@ -1208,6 +1208,41 @@ OUTPUT is called with the arguments when it is a function."
           (setq codeql--graph-search-string "nothing")
           (should-error (codeql-graph-search) :type 'user-error))))))
 
+(ert-deftest codeql-ported-test-graph-node-at-position ()
+  "The innermost node at a position is the one starting last, then ending first."
+  (let ((nodes [("function" . "/src/a.js::1:1:9:1")
+                ("name" . "/src/a.js::1:10:1:14")
+                ("body" . "/src/a.js::1:16:9:1")
+                ("stmt" . "/src/a.js::2:3:2:30")
+                ("expr" . "/src/a.js::2:3:2:20")
+                ("other file" . "/src/b.js::2:1:2:40")
+                ("no location" . nil)]))
+    (should (eql (codeql--graph-node-at-position nodes '("/src/a.js" 2 . 5)) 4))
+    (should (eql (codeql--graph-node-at-position nodes '("/src/a.js" 2 . 25)) 3))
+    (should (eql (codeql--graph-node-at-position nodes '("/src/a.js" 1 . 12)) 1))
+    (should (eql (codeql--graph-node-at-position nodes '("/src/a.js" 5 . 1)) 2))
+    (should-not (codeql--graph-node-at-position nodes '("/src/a.js" 12 . 1)))
+    (should-not (codeql--graph-node-at-position nodes '("/src/c.js" 2 . 5)))
+    (should-not (codeql--graph-node-at-position nodes nil))
+    (should-not (codeql--graph-node-at-position nil '("/src/a.js" 2 . 5)))))
+
+(ert-deftest codeql-ported-test-show-graph-at-position ()
+  "Graphs are shown with the node at the given position selected."
+  (codeql-ported-test--with-temp-dir dir
+    (let ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--diamond-dot))
+          (codeql-graph-format "text")
+          (codeql-graph-follow-source nil))
+      (cl-letf (((symbol-function 'switch-to-buffer-other-window) #'set-buffer))
+        (codeql--show-graph dot codeql-ported-test--diamond-nodes nil nil
+                            '("/arch/src/a.js" 3 . 2))
+        (with-current-buffer (format "*codeql-graph: %s*" (file-name-base dot))
+          (unwind-protect
+              (progn
+                (should (eql codeql--graph-selected 2))
+                (should (looking-at "x  then"))
+                (should (eql (get-text-property (point) 'codeql-graph-node) 2)))
+            (kill-buffer)))))))
+
 (ert-deftest codeql-ported-test-graph-text-faces ()
   "Nodes are bold, and the selected node and its label stand out."
   (codeql-ported-test--with-temp-dir dir
@@ -1445,7 +1480,9 @@ OUTPUT is called with the arguments when it is a function."
           (codeql-graph-format "text"))
       (codeql-ported-test--with-graph-buffer dot nil
         (should (equal (plist-get codeql--graph-text :roots) '(0 1 5)))
-        (should (= codeql--graph-selected 0))
+        ;; the first node with edges is selected, rather than the lone node 0
+        (should (= codeql--graph-selected 1))
+        (codeql--graph-select 0)
         (should-error (codeql-graph-previous-root) :type 'user-error)
         (codeql-graph-next-root)
         (should (= codeql--graph-selected 1))
