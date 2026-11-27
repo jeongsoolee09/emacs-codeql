@@ -1086,7 +1086,21 @@ OUTPUT is called with the arguments when it is a function."
               (should (equal (plist-get codeql--graph-text :roots) '(0 4)))
               ;; rows show node types, the selected node is described in full
               (should codeql--graph-compact)
-              (should (string-match-p "  \\[CallExpr\\]$" (buffer-string)))
+              ;; drawn in place of their nodes, each lane as wide as its labels
+              (should (string-prefix-p
+                       (concat "  [CallExpr]--.\n"
+                               "  |           |\n"
+                               "  [VarRef]    (Arguments)\n"
+                               "              |\n"
+                               "              [Literal]\n"
+                               "  \n"
+                               "  [ExprStmt]\n")
+                       (buffer-substring-no-properties (point-min) (point-max))))
+              (should (equal (buffer-substring-no-properties (point) (+ (point) 9)) "[Literal]"))
+              (should (equal (get-text-property (point) 'face) '(:inverse-video t)))
+              (should (eql (codeql--graph-text-node-at (point)) 3))
+              ;; the rest of the diagram belongs to the nearest node
+              (should (eql (codeql--graph-text-node-at (+ (point-min) 2)) 0))
               (should-not (string-match-p "f(\"x\")" (buffer-string)))
               (should (string-match-p "\\[Literal\\] \"x\"" (codeql--graph-header-line)))
               (should (string-match-p "\\[Literal\\] \"x\"" (buffer-string))))
@@ -1127,6 +1141,26 @@ OUTPUT is called with the arguments when it is a function."
               (codeql--org-open-file-link (concat source "::1:5:1:5")))
             (should (eq (buffer-local-value 'codeql--org-query-buffer src-buffer)
                         query-buffer))))))))
+
+(ert-deftest codeql-ported-test-follow-source-pulse ()
+  "The source shown for the selected node of a viewer flashes."
+  (codeql-ported-test--with-temp-dir dir
+    (let* ((source (codeql-ported-test--write (concat dir "a.js") "let x = f(1);\n"))
+           (pulses nil))
+      (cl-letf (((symbol-function 'pulse-momentary-highlight-region)
+                 (lambda (beg end &rest _)
+                   (push (buffer-substring-no-properties beg end) pulses))))
+        (with-temp-buffer
+          (unwind-protect
+              (progn
+                (codeql--follow-source (list source 1 9 1 12))
+                (should (equal pulses '("f(1)")))
+                (let ((codeql-follow-source-pulse nil))
+                  (codeql--follow-source (list source 1 1 1 3)))
+                (should (equal pulses '("f(1)")))
+                (should (< (overlay-get codeql--follow-overlay 'priority) 1)))
+            (codeql--unfollow-source)
+            (kill-buffer (get-file-buffer source))))))))
 
 (ert-deftest codeql-ported-test-ast-follow-source ()
   "Moving point in the AST viewer highlights the source of its node."
