@@ -39,6 +39,8 @@ private StmtContainer selectedContainer() {
 
 query predicate nodes(ControlFlowNode node, string key, string value) {
   node.getContainer() = selectedContainer() and
+  // A declaration's name is bound by hoisting and never evaluated, so it has no edges.
+  not node = any(Function f).getIdentifier() and
   key = "semmle.label" and
   value = node.toString()
 }
