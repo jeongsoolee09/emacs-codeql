@@ -3887,6 +3887,15 @@ printCfg query of `codeql-view-cfg'."
   (add-hook 'kill-buffer-hook #'codeql--unfollow-source nil t)
   (add-hook 'change-major-mode-hook #'codeql--unfollow-source nil t))
 
+(defvar codeql--follow-source-quietly nil
+  "Non-nil to only move the highlight of `codeql--follow-source'.
+
+The source window then keeps its point and scroll position, as when the
+selection follows point in the source, see `codeql--sync-src-to-ast-graph'.")
+
+(defvar-local codeql--ast-graph-last-point nil
+  "Point when the AST graph of a source file was last synchronized.")
+
 (defun codeql--follow-source (location &optional query-buffer)
   "Show and highlight LOCATION in another window, without selecting it.
 
@@ -3923,7 +3932,8 @@ highlighted for a missing file or location."
                           (codeql--eglot--lsp-position-to-point
                            `(:line ,(1- end-line) :character ,end-column))
                         (save-excursion (goto-char beg) (line-end-position))))
-                 (window (display-buffer buffer '(nil (inhibit-same-window . t)))))
+                 (window (unless codeql--follow-source-quietly
+                           (display-buffer buffer '(nil (inhibit-same-window . t))))))
             (move-overlay overlay beg (max beg end) buffer)
             (overlay-put overlay 'face 'codeql-follow-source-face)
             (overlay-put overlay 'priority 100)
@@ -3933,7 +3943,9 @@ highlighted for a missing file or location."
                 (with-selected-window window
                   (goto-char beg)
                   (recenter)))
-              (set-window-point window beg))
+              (set-window-point window beg)
+              ;; not a move of point to synchronize viewers with
+              (setq codeql--ast-graph-last-point beg))
             overlay))))))
 
 ;; mutual highlighting at point for src/ast buffers
@@ -5575,7 +5587,15 @@ The link is resolved with the database of QUERY-BUFFER."
   "Return non-nil when the location of AST ITEM contains POSITION.
 
 POSITION is a (LINE . COLUMN) cons, 1-based like locations are."
-  (when-let* ((url (codeql--location-url (codeql--ast-item-location item)))
+  (codeql--location-url-contains-p
+   (codeql--location-url (codeql--ast-item-location item)) position))
+
+(defun codeql--location-url-contains-p (url position)
+  "Return non-nil when the location URL contains POSITION.
+
+URL is as returned by `codeql--location-url', and POSITION a (LINE .
+COLUMN) cons, 1-based like locations are."
+  (when-let* ((url)
               (line (alist-get 'startLine url))
               ((natnump line))
               ((> line 0)))
@@ -5586,6 +5606,15 @@ POSITION is a (LINE . COLUMN) cons, 1-based like locations are."
                       (or (< (car a) (car b))
                           (and (= (car a) (car b)) (<= (cdr a) (cdr b)))))))
       (and (funcall before-p start position) (funcall before-p position end)))))
+
+(defvar-local codeql--ast-graph-urls nil
+  "The locations of the nodes of an AST graph buffer, by dot node id.
+
+They are as returned by `codeql--location-url', or nil for nodes
+without a location.")
+
+(defvar-local codeql--ast-graph-buffer nil
+  "The AST graph buffer of a source file, see `codeql-view-ast-graph'.")
 
 (defun codeql--ast-to-graph (sorted-tree src-filename &optional query-buffer position)
   "Show the AST SORTED-TREE of SRC-FILENAME as a graph.
@@ -5598,7 +5627,7 @@ COLUMN) cons, is selected when the graph is shown as text."
   (let ((dot-path (expand-file-name (format "ast-%s.dot" (file-name-nondirectory src-filename))
                                     codeql--ast-graph-directory))
         (count 0)
-        nodes edges selected)
+        nodes edges selected urls)
     ;; nodes are numbered in preorder, so children come after their parents
     (cl-labels ((walk (item parent)
                   (let ((id count)
@@ -5607,6 +5636,7 @@ COLUMN) cons, is selected when the graph is shown as text."
                                              (format "%s" (codeql--ast-item-label item))))))
                     (setq count (1+ count))
                     (push (cons label (codeql--ast-item-link item query-buffer)) nodes)
+                    (push (codeql--location-url (codeql--ast-item-location item)) urls)
                     (when parent
                       (push (cons parent id) edges))
                     (when (and position (codeql--ast-item-contains-p item position))
@@ -5626,8 +5656,45 @@ COLUMN) cons, is selected when the graph is shown as text."
     (codeql--show-graph dot-path nodes query-buffer t)
     (when-let ((buffer (get-buffer (format "*codeql-graph: %s*" (file-name-base dot-path)))))
       (with-current-buffer buffer
+        (setq codeql--ast-graph-urls (vconcat (nreverse urls)))
         (when (and selected (codeql--graph-text-p))
-          (codeql--graph-select selected))))))
+          (codeql--graph-select selected)))
+      (when codeql-ast-sync-highlighting
+        (setq codeql--ast-graph-buffer buffer
+              codeql--ast-graph-last-point nil)
+        (add-hook 'post-command-hook #'codeql--sync-src-to-ast-graph 99 :local)))))
+
+(defun codeql--ast-graph-node-at (urls position)
+  "Return the innermost node of URLS containing POSITION, or nil.
+
+URLS are the locations of the nodes, `codeql--ast-graph-urls', whose
+dot node ids are in preorder, so the innermost node is the last one."
+  (cl-loop with found = nil
+           for url across urls
+           for id from 0
+           when (codeql--location-url-contains-p url position)
+           do (setq found id)
+           finally return found))
+
+(defvar codeql--graph-selected)
+
+(defun codeql--sync-src-to-ast-graph ()
+  "Select the node at point of the source file in its visible AST graph."
+  (let ((graph codeql--ast-graph-buffer))
+    (cond
+     ((not (buffer-live-p graph))
+      (remove-hook 'post-command-hook #'codeql--sync-src-to-ast-graph :local))
+     ((and (not (eql (point) codeql--ast-graph-last-point))
+           (get-buffer-window graph t))
+      (setq codeql--ast-graph-last-point (point))
+      (when-let* ((position (cons (line-number-at-pos)
+                                  (1+ (- (point) (line-beginning-position)))))
+                  (id (codeql--ast-graph-node-at
+                       (buffer-local-value 'codeql--ast-graph-urls graph) position)))
+        (with-current-buffer graph
+          (when (and (codeql--graph-text-p) (not (eql id codeql--graph-selected)))
+            (let ((codeql--follow-source-quietly t))
+              (codeql--graph-select id)))))))))
 
 (defun codeql--ast-to-org (sorted-tree src-filename src-buffer &optional buffer-context)
   ;; src-filename is (buffer-filename) for the src buffer ... XXX: check with TRAMP
