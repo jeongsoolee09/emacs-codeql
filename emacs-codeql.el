@@ -6428,6 +6428,7 @@ This is the [TYPE] of AST node labels like \"[TYPE] text\", after the
                                  "   \\[codeql-graph-forward]/\\[codeql-graph-backward] beside"
                                  "   \\[codeql-graph-next-root]/\\[codeql-graph-previous-root] root"
                                  "   \\[codeql-graph-visit-node] visit"
+                                 "   \\[codeql-graph-search] search"
                                  "   \\[codeql-graph-cycle-format] format"
                                  "   \\[quit-window] quit"))
                         'face 'shadow)
@@ -6684,6 +6685,118 @@ From a node that isn't a root, this selects the root above it."
       (codeql--graph-text-root -1)
     (user-error "Roots are only selected in text diagrams")))
 
+(defvar codeql--graph-search-history nil
+  "The history of `codeql-graph-search'.")
+
+(defvar codeql--graph-search-buffer nil
+  "The graph buffer of the running `codeql-graph-search'.")
+
+(defvar-local codeql--graph-search-string nil
+  "The last string searched for with `codeql-graph-search'.")
+
+(defun codeql--graph-search-order ()
+  "Return the dot node ids of a text diagram from top to bottom, left to right."
+  (cl-loop for (nodes) in (plist-get codeql--graph-text :rows)
+           append (mapcar #'car nodes)))
+
+(defun codeql--graph-search-find (string from direction)
+  "Return the next node of the text diagram whose label contains STRING.
+
+The search starts at the node with dot node ID FROM, which matches too
+when DIRECTION is 0, and goes down the diagram when DIRECTION is 1, up
+when it is -1, wrapping around.  Like isearch, it ignores case unless
+STRING has upper case letters.  Return nil when no node matches."
+  (unless (string-empty-p string)
+    (let* ((order (vconcat (codeql--graph-search-order)))
+           (n (length order))
+           (start (or (cl-position from order) 0))
+           (case-fold-search (not (string-match-p "[[:upper:]]" string)))
+           (regexp (regexp-quote string)))
+      (cl-loop for i from (if (eql direction 0) 0 1) below (1+ n)
+               for id = (aref order (mod (+ start (* i (if (eql direction -1) -1 1))) n))
+               when (string-match-p regexp (codeql--graph-text-label id))
+               return id))))
+
+(defun codeql--graph-search-update (direction)
+  "Select the next match of the minibuffer input in the searched graph.
+
+DIRECTION is as for `codeql--graph-search-find'."
+  (let ((string (minibuffer-contents-no-properties))
+        (graph codeql--graph-search-buffer))
+    (when (buffer-live-p graph)
+      (with-current-buffer graph
+        (when-let ((id (codeql--graph-search-find string codeql--graph-selected direction)))
+          (unless (eql id codeql--graph-selected)
+            ;; keep the source of the node from being shown in the graph window
+            (with-selected-window (or (get-buffer-window graph) (selected-window))
+              (with-current-buffer graph
+                (codeql--graph-select id codeql--graph-trail)))))))
+    (when (and (not (string-empty-p string))
+               (not (with-current-buffer graph
+                      (codeql--graph-search-find string codeql--graph-selected 0))))
+      (minibuffer-message "No match"))))
+
+(defun codeql-graph-search-forward ()
+  "Select the next node matching the input of `codeql-graph-search'."
+  (interactive)
+  (codeql--graph-search-update 1))
+
+(defun codeql-graph-search-backward ()
+  "Select the previous node matching the input of `codeql-graph-search'."
+  (interactive)
+  (codeql--graph-search-update -1))
+
+(defvar codeql-graph-search-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map minibuffer-local-map)
+    (define-key map (kbd "C-s") #'codeql-graph-search-forward)
+    (define-key map (kbd "C-r") #'codeql-graph-search-backward)
+    map)
+  "Keymap of the minibuffer of `codeql-graph-search'.")
+
+(defun codeql-graph-search ()
+  "Search the labels of the nodes of a text graph diagram, incrementally.
+
+As you type, the first node from the selected one down whose label
+contains the input is selected.  In the minibuffer, \\<codeql-graph-search-map>\\[codeql-graph-search-forward] and \\[codeql-graph-search-backward] select the
+next and previous match, and \\[abort-recursive-edit] goes back to the node selected
+before the search.  With an empty input, search for the next match of
+the last search.  Afterwards, \\<codeql-graph-mode-map>\\[codeql-graph-previous] goes back to that node too."
+  (interactive)
+  (unless (codeql--graph-text-p)
+    (user-error "Nodes are only searched in text diagrams"))
+  (let* ((graph (current-buffer))
+         (start codeql--graph-selected)
+         (trail codeql--graph-trail)
+         (string
+          (condition-case nil
+              (let ((codeql--graph-search-buffer graph))
+                (minibuffer-with-setup-hook
+                    (lambda ()
+                      (add-hook 'after-change-functions
+                                (lambda (&rest _) (codeql--graph-search-update 0))
+                                nil t))
+                  (read-from-minibuffer
+                   (if codeql--graph-search-string
+                       (format "Search nodes (default %s): " codeql--graph-search-string)
+                     "Search nodes: ")
+                   nil codeql-graph-search-map nil 'codeql--graph-search-history)))
+            (quit
+             (with-current-buffer graph
+               (codeql--graph-select start trail))
+             (signal 'quit nil)))))
+    (with-current-buffer graph
+      (if (string-empty-p string)
+          (let ((last codeql--graph-search-string))
+            (unless last
+              (user-error "No previous search"))
+            (if-let ((id (codeql--graph-search-find last codeql--graph-selected 1)))
+                (codeql--graph-select id trail)
+              (user-error "No node matches %s" last)))
+        (setq codeql--graph-search-string string))
+      (unless (or (null start) (eql start codeql--graph-selected))
+        (setq codeql--graph-trail (cons start trail))))))
+
 (defun codeql--graph-image-p ()
   "Return non-nil when the current graph buffer shows a rendered image."
   (eq (car-safe (get-text-property (point-min) 'display)) 'image))
@@ -6885,6 +6998,8 @@ Image formats are skipped when they can't be rendered or shown."
     (define-key map (kbd "P") #'codeql-graph-previous-root)
     (define-key map (kbd "M-n") #'codeql-graph-next-root)
     (define-key map (kbd "M-p") #'codeql-graph-previous-root)
+    (define-key map (kbd "s") #'codeql-graph-search)
+    (define-key map (kbd "/") #'codeql-graph-search)
     (define-key map [remap next-line] #'codeql-graph-next)
     (define-key map [remap previous-line] #'codeql-graph-previous)
     (define-key map [remap forward-char] #'codeql-graph-forward)
@@ -6905,6 +7020,8 @@ Image formats are skipped when they can't be rendered or shown."
                     "J" #'codeql-graph-next-root
                     "K" #'codeql-graph-previous-root
                     "f" #'codeql-graph-cycle-format
+                    "/" #'codeql-graph-search
+                    "s" #'codeql-graph-search
                     (kbd "RET") #'codeql-graph-visit-node
                     "gr" #'revert-buffer
                     "q" #'quit-window))
