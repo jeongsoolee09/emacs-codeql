@@ -418,6 +418,15 @@ page holding at most this many tuples.  See `codeql-results-pagination-mode'."
   :type 'integer
   :group 'emacs-codeql)
 
+(defcustom codeql-results-large-threshold 50000
+  "The number of rows above which a result set counts as large.
+
+Sorting a large result set with `codeql-results-sort' may take a while,
+and filtering it with `codeql-results-filter' decodes all of its rows into
+memory, so both ask for confirmation first.  When nil, never ask."
+  :type '(choice (const :tag "Never ask" nil) integer)
+  :group 'emacs-codeql)
+
 (defcustom codeql-graph-format "svg"
   "The format that graph results are shown in.
 
@@ -2949,11 +2958,20 @@ problem and path-problem results.  Both kinds have the keys :page, the
 
 Raw results also have :source-bqrs-path, the bqrs the query produced, and
 :bqrs-path, the bqrs pages are decoded from, which is a sorted copy when
-:sort is a (COLUMN . DIRECTION) pair.  :result-sets holds the alists of
-all result sets as reported by `codeql bqrs info', :result-set the name of
-the shown one, :offsets the vector of page byte offsets as computed by
-`codeql bqrs info --paginate-rows', or nil for a single page, and :style,
-see `codeql-raw-results-style'.
+:sort is a list of (COLUMN . DIRECTION) sort keys.  :result-sets holds the
+alists of all result sets as reported by `codeql bqrs info', :result-set
+the name of the shown one, :offsets the vector of page byte offsets as
+computed by `codeql bqrs info --paginate-rows', or nil for a single page,
+and :style, see `codeql-raw-results-style'.
+
+:where is a list of (COLUMN OPERATOR VALUE) conditions rows must all meet,
+see `codeql-results-filter', and :projection nil or the list of the
+columns to show, see `codeql-results-project'.  COLUMNs are 0-based
+indexes into the columns of the result set.  When :where is non-nil, the
+whole result set is decoded into :decoded, a list (BQRS-PATH RESULT-SET
+TUPLES COLUMNS), and pages are cut from :tuples, the vector of the rows
+that meet the conditions, whose columns are :columns.  :total-rows is then
+the number of those rows, and :source-rows that of the whole result set.
 
 SARIF results have :results, the vector of all parsed SARIF results,
 and :link-prefix, see `codeql--sarif-results-to-org'.")
@@ -3096,16 +3114,49 @@ A hit marks PAGE as most recently used."
     (cons (1+ (* page page-size))
           (min (plist-get pagination :total-rows) (* (1+ page) page-size)))))
 
+(defun codeql--raw-results-state-column-names (state)
+  "Return the column names of the result set shown by STATE."
+  (codeql--raw-results-column-names
+   (cl-find (plist-get state :result-set) (plist-get state :result-sets)
+            :key (lambda (rs) (alist-get 'name rs)) :test #'equal)))
+
+(defun codeql--raw-results-column-name (state column)
+  "Return the name of the 0-based COLUMN of the result set shown by STATE."
+  (or (nth column (codeql--raw-results-state-column-names state))
+      (format "column %d" (1+ column))))
+
 (defun codeql--raw-results-sort-description (state)
   "Return a description of how the results described by STATE are sorted."
   (if-let ((sort (plist-get state :sort)))
-      (let ((result-set (cl-find (plist-get state :result-set) (plist-get state :result-sets)
-                                 :key (lambda (rs) (alist-get 'name rs)) :test #'equal)))
-        (format "%s %s"
-                (or (nth (car sort) (codeql--raw-results-column-names result-set))
-                    (format "column %d" (1+ (car sort))))
-                (cdr sort)))
+      (mapconcat (lambda (key)
+                   (format "%s %s" (codeql--raw-results-column-name state (car key)) (cdr key)))
+                 sort ", ")
     "original order"))
+
+(defun codeql--raw-results-condition-description (state condition)
+  "Return a description of the filter CONDITION of the results of STATE."
+  (let ((value (nth 2 condition)))
+    (format "%s %s %s" (codeql--raw-results-column-name state (nth 0 condition))
+            (nth 1 condition)
+            (if (string-match-p "\\`[^[:space:]\"]+\\'" value) value (prin1-to-string value)))))
+
+(defun codeql--raw-results-filter-description (state)
+  "Return a description of the filter of STATE, or nil if there is none."
+  (when-let ((where (plist-get state :where)))
+    (mapconcat (lambda (condition) (codeql--raw-results-condition-description state condition))
+               where " and ")))
+
+(defun codeql--raw-results-projection-description (state)
+  "Return a description of the projection of STATE, or nil if there is none."
+  (when-let ((projection (plist-get state :projection)))
+    (mapconcat (lambda (column) (codeql--raw-results-column-name state column))
+               projection ", ")))
+
+(defun codeql--raw-results-rows-description (state)
+  "Return a description of the number of rows STATE shows."
+  (if (plist-get state :where)
+      (format "%d, filtered from %d" (plist-get state :total-rows) (plist-get state :source-rows))
+    (format "%d" (plist-get state :total-rows))))
 
 (defun codeql--raw-results-pagination-footer ()
   "Return the results footer for the current paginated results buffer."
@@ -3120,17 +3171,21 @@ A hit marks PAGE as most recently used."
                 (format "#+RESULTS_PAGE: %d/%d\n#+RESULTS_ALERTS: %d-%d of %d\n"
                         (1+ page) (codeql--raw-results-pages pagination)
                         first-row last-row total-rows)
-              (format
-               (mapconcat
-                #'identity
-                '("#+RESULT_SET: %s"
-                  "#+RESULTS_SORT: %s"
-                  "#+RESULTS_PAGE: %d/%d"
-                  "#+RESULTS_ROWS: %d-%d of %d" "") "\n")
-               (plist-get pagination :result-set)
-               (codeql--raw-results-sort-description pagination)
-               (1+ page) (codeql--raw-results-pages pagination)
-               first-row last-row total-rows)))))
+              (concat
+               (format "#+RESULT_SET: %s\n#+RESULTS_SORT: %s\n"
+                       (plist-get pagination :result-set)
+                       (codeql--raw-results-sort-description pagination))
+               (when-let ((filter (codeql--raw-results-filter-description pagination)))
+                 (format "#+RESULTS_FILTER: %s\n" filter))
+               (when-let ((projection (codeql--raw-results-projection-description pagination)))
+                 (format "#+RESULTS_COLUMNS: %s\n" projection))
+               (format "#+RESULTS_PAGE: %d/%d\n#+RESULTS_ROWS: %d-%d of %s\n"
+                       (1+ page) (codeql--raw-results-pages pagination)
+                       first-row last-row
+                       (if (plist-get pagination :where)
+                           (format "%d (filtered from %d)"
+                                   total-rows (plist-get pagination :source-rows))
+                         total-rows)))))))
 
 (defun codeql--raw-results-header-line ()
   "Return a header line describing the current results page."
@@ -3151,17 +3206,24 @@ A hit marks PAGE as most recently used."
                     (funcall key 'codeql-results-next-page)
                     (funcall key 'codeql-results-previous-page)
                     (funcall key 'codeql-results-goto-page))
-          (format " %s, %s: page %d/%d (rows %d-%d of %d)   %s next, %s previous, %s jump, %s sort, %s result set"
-                  (funcall text (plist-get pagination :result-set))
-                  (funcall text (codeql--raw-results-sort-description pagination))
-                  (1+ page) (codeql--raw-results-pages pagination)
-                  (car rows) (cdr rows)
-                  (plist-get pagination :total-rows)
-                  (funcall key 'codeql-results-next-page)
-                  (funcall key 'codeql-results-previous-page)
-                  (funcall key 'codeql-results-goto-page)
-                  (funcall key 'codeql-results-sort)
-                  (funcall key 'codeql-results-select-result-set)))))))
+          (let ((filter (codeql--raw-results-filter-description pagination))
+                (projection (codeql--raw-results-projection-description pagination)))
+            (format " %s, %s%s%s: page %d/%d (rows %d-%d of %s)   %s next, %s previous, %s jump, %s sort, %s filter, %s columns, %s reset, %s result set"
+                    (funcall text (plist-get pagination :result-set))
+                    (funcall text (codeql--raw-results-sort-description pagination))
+                    (if filter (funcall text (format ", where %s" filter)) "")
+                    (if projection (funcall text (format ", columns %s" projection)) "")
+                    (1+ page) (codeql--raw-results-pages pagination)
+                    (car rows) (cdr rows)
+                    (codeql--raw-results-rows-description pagination)
+                    (funcall key 'codeql-results-next-page)
+                    (funcall key 'codeql-results-previous-page)
+                    (funcall key 'codeql-results-goto-page)
+                    (funcall key 'codeql-results-sort)
+                    (funcall key 'codeql-results-filter)
+                    (funcall key 'codeql-results-project)
+                    (funcall key 'codeql-results-reset)
+                    (funcall key 'codeql-results-select-result-set))))))))
 
 (defun codeql--raw-tuples-to-query-results (tuples)
   "Transform raw result TUPLES into a list of result node rows."
@@ -3202,72 +3264,202 @@ A hit marks PAGE as most recently used."
                (cl-pushnew row-data query-results)))
     query-results))
 
-(defun codeql--raw-results-page-to-org (bqrs-path result-set offsets page page-size &optional style)
+(defun codeql--raw-results-project (vector projection)
+  "Return the elements of VECTOR at the column indexes of PROJECTION.
+
+When PROJECTION is nil, return VECTOR."
+  (if projection
+      (vconcat (mapcar (lambda (column) (aref vector column)) projection))
+    vector))
+
+(defun codeql--raw-results-tuples-to-org (tuples columns start result-set page-size
+                                                 &optional style projection)
+  "Return org data for the raw result TUPLES of RESULT-SET, or nil if none.
+
+COLUMNS is the vector of the columns of TUPLES, START the 0-based index of
+the first of them, PAGE-SIZE the number of rows of a page, STYLE either
+`table' (the default) or `outline' and PROJECTION nil or the list of the
+0-based columns to show, see `codeql-results-project'."
+  (when (> (length tuples) 0)
+    ;; size the org-table conversion limit by this buffer's page size, which
+    ;; may differ from the current `codeql-max-raw-results'
+    (let ((codeql-max-raw-results (max page-size codeql-max-raw-results)))
+      (codeql--query-results-to-org
+       (codeql--raw-tuples-to-query-results
+        (if projection
+            (cl-map 'vector (lambda (tuple) (codeql--raw-results-project tuple projection)) tuples)
+          tuples))
+       (if (eq style 'outline) 'raw-outline 'raw)
+       (and columns (codeql--raw-results-project columns projection))
+       start
+       result-set))))
+
+(defun codeql--raw-results-page-to-org (bqrs-path result-set offsets page page-size
+                                                  &optional style projection tuples columns)
   "Return org data for PAGE of RESULT-SET in BQRS-PATH, or nil if empty.
 
 PAGE is 0-based and indexes into the byte OFFSETS vector of pages holding
 PAGE-SIZE rows.  When OFFSETS is nil the whole result set is decoded.
 STYLE is either `table' (the default) or `outline', see
-`codeql-raw-results-style'."
+`codeql-raw-results-style', and PROJECTION nil or the list of the columns
+to show.  When TUPLES is non-nil, the page is cut from that vector of
+already decoded rows, whose columns are COLUMNS, instead."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (when-let* ((json-data (codeql--bqrs-to-json
-                          bqrs-path "string,url" result-set
-                          (when offsets page-size)
-                          (when offsets (aref offsets page))))
-              (json (json-parse-string json-data :object-type 'alist))
-              (tuples (alist-get 'tuples json))
-              ((> (length tuples) 0)))
-    ;; size the org-table conversion limit by this buffer's page size, which
-    ;; may differ from the current `codeql-max-raw-results'
-    (let ((codeql-max-raw-results (or (and offsets page-size) codeql-max-raw-results)))
-      (codeql--query-results-to-org
-       (codeql--raw-tuples-to-query-results tuples)
-       (if (eq style 'outline) 'raw-outline 'raw)
-       (alist-get 'columns json)
+  (if tuples
+      (let ((start (* page page-size)))
+        (codeql--raw-results-tuples-to-org
+         (cl-subseq tuples (min start (length tuples))
+                    (min (+ start page-size) (length tuples)))
+         columns start result-set page-size style projection))
+    (when-let* ((json-data (codeql--bqrs-to-json
+                            bqrs-path "string,url" result-set
+                            (when offsets page-size)
+                            (when offsets (aref offsets page))))
+                (json (json-parse-string json-data :object-type 'alist)))
+      (codeql--raw-results-tuples-to-org
+       (alist-get 'tuples json) (alist-get 'columns json)
        (if offsets (* page page-size) 0)
-       result-set))))
+       result-set (if offsets page-size 0) style projection))))
+
+(defun codeql--raw-results-sorted-path (bqrs-path result-set sort)
+  "Return the path of the copy of RESULT-SET of BQRS-PATH sorted by SORT."
+  (format "%s.sorted-%s.bqrs" bqrs-path (md5 (format "%s\0%S" result-set sort))))
 
 (defun codeql--raw-results-sorted-bqrs (bqrs-path result-set sort)
   "Return a bqrs file holding RESULT-SET of BQRS-PATH sorted by SORT.
 
-SORT is a (COLUMN . DIRECTION) pair with a 0-based COLUMN and a DIRECTION
-of either \"asc\" or \"desc\".  Sorted copies are kept next to BQRS-PATH
-and reused."
+SORT is a list of (COLUMN . DIRECTION) sort keys with a 0-based COLUMN
+and a DIRECTION of either \"asc\" or \"desc\".  Rows are ordered by the
+first key, rows that are equal in it by the second, and so on.  Sorted
+copies are kept next to BQRS-PATH and reused."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (let ((sorted-path (format "%s.sorted-%s.bqrs" bqrs-path
-                             (md5 (format "%s\0%d\0%s" result-set (car sort) (cdr sort))))))
+  (let ((sorted-path (codeql--raw-results-sorted-path bqrs-path result-set sort)))
     (if (codeql--file-exists-p sorted-path)
         sorted-path
       (message "Sorting results ...")
       (when (codeql--cli-command-to-string
              (list "bqrs" "decode" "--format=bqrs"
                    (format "--result-set=%s" result-set)
-                   (format "--sort-key=%d" (car sort))
-                   (format "--sort-direction=%s" (cdr sort))
+                   (format "--sort-key=%s"
+                           (mapconcat (lambda (key) (number-to-string (car key))) sort ","))
+                   (format "--sort-direction=%s" (mapconcat #'cdr sort ","))
                    (format "--output=%s" (codeql--tramp-unwrap sorted-path))
                    "--" (codeql--tramp-unwrap bqrs-path)))
         sorted-path))))
 
-(defun codeql--raw-results-setup (bqrs-path result-sets result-set footer &optional sort style)
-  "Prepare RESULT-SET of BQRS-PATH for display, optionally sorted by SORT.
+(defconst codeql--raw-results-operators '("=" "!=" "<" "<=" ">" ">=" "~" "!~")
+  "The operators of raw results filter conditions, see `codeql-results-filter'.")
+
+(defun codeql--raw-results-cell-value (element)
+  "Return the value of the decoded bqrs tuple ELEMENT that filters compare.
+
+That is the label of entities, and the number or string of literals."
+  (cond ((consp element) (or (alist-get 'label element) ""))
+        ((eq element t) "true")
+        ((eq element :false) "false")
+        ((memq element '(nil :null)) "")
+        (t element)))
+
+(defun codeql--raw-results-number (value)
+  "Return VALUE as a number, or nil if it is neither a number nor numeric."
+  (cond ((numberp value) value)
+        ((and (stringp value)
+              (string-match-p
+               "\\`[-+]?\\([0-9]+\\.?[0-9]*\\|\\.[0-9]+\\)\\([eE][-+]?[0-9]+\\)?\\'" value))
+         (string-to-number value))))
+
+(defun codeql--raw-results-condition-p (value operator operand)
+  "Return non-nil if the cell VALUE meets the condition OPERATOR OPERAND.
+
+The regexp OPERATORs ~ and !~ match the OPERAND string against VALUE.
+The others compare numerically when both VALUE and OPERAND are numbers,
+and as strings otherwise."
+  (let ((string (format "%s" value)))
+    (pcase operator
+      ("~" (string-match-p operand string))
+      ("!~" (not (string-match-p operand string)))
+      (_
+       (let* ((a (codeql--raw-results-number value))
+              (b (codeql--raw-results-number operand))
+              (order (if (and a b)
+                         (cond ((< a b) -1) ((> a b) 1) (t 0))
+                       (let ((c (compare-strings string nil nil operand nil nil)))
+                         (cond ((eq c t) 0) ((< c 0) -1) (t 1))))))
+         (pcase operator
+           ("=" (= order 0))
+           ("!=" (/= order 0))
+           ("<" (< order 0))
+           ("<=" (<= order 0))
+           (">" (> order 0))
+           (">=" (>= order 0))
+           (_ (error "Unknown filter operator: %s" operator))))))))
+
+(defun codeql--raw-results-filter-tuples (tuples where)
+  "Return the vector of the TUPLES that meet all conditions of WHERE."
+  (cl-remove-if-not
+   (lambda (tuple)
+     (cl-every (lambda (condition)
+                 (codeql--raw-results-condition-p
+                  (codeql--raw-results-cell-value (aref tuple (nth 0 condition)))
+                  (nth 1 condition) (nth 2 condition)))
+               where))
+   tuples))
+
+(defun codeql--raw-results-decode-all (bqrs-path result-set)
+  "Decode all rows of RESULT-SET in BQRS-PATH.
+
+Return a list (BQRS-PATH RESULT-SET TUPLES COLUMNS) of the vectors of the
+decoded rows and of their columns."
+  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (message "Decoding all rows of %s ..." result-set)
+  (let* ((json-data (or (codeql--bqrs-to-json bqrs-path "string,url" result-set)
+                        (user-error "Failed to decode result set %s" result-set)))
+         (json (json-parse-string json-data :object-type 'alist)))
+    (list bqrs-path result-set
+          (or (alist-get 'tuples json) [])
+          (alist-get 'columns json))))
+
+(defun codeql--raw-results-decoded-p (decoded bqrs-path result-set)
+  "Return non-nil if DECODED holds the rows of RESULT-SET of BQRS-PATH."
+  (and decoded (equal (nth 0 decoded) bqrs-path) (equal (nth 1 decoded) result-set)))
+
+(defun codeql--raw-results-setup (bqrs-path result-sets result-set footer
+                                            &optional ops style decoded)
+  "Prepare RESULT-SET of BQRS-PATH for display with the table operations OPS.
 
 RESULT-SETS holds the alists of all result sets in BQRS-PATH as reported
 by `codeql bqrs info', and RESULT-SET is the alist of the one to show.
-SORT is nil or a (COLUMN . DIRECTION) pair, see
-`codeql--raw-results-sorted-bqrs'.  STYLE defaults to
-`codeql-raw-results-style'.
+OPS is a plist of the :sort, :where and :projection of the rows to show,
+see `codeql--raw-results-pagination'.  STYLE defaults to
+`codeql-raw-results-style'.  DECODED is nil or a list holding the
+:decoded rows of a previous setup, which are reused when they are those
+of the same sorted result set; rows decoded anew replace them in DECODED,
+even when no row meets the conditions.
 
 Return a cons of the results state, see `codeql--raw-results-pagination',
-and the org data of its first page, or nil when there is nothing to show."
+and the org data of its first page, or nil when there is nothing to show.
+Signal a user error when no row meets the conditions of :where."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
   (let* ((name (alist-get 'name result-set))
-         (total-rows (or (alist-get 'rows result-set) 0))
+         (sort (plist-get ops :sort))
+         (where (plist-get ops :where))
+         (projection (plist-get ops :projection))
+         (source-rows (or (alist-get 'rows result-set) 0))
          (decode-path (if sort
                           (or (codeql--raw-results-sorted-bqrs bqrs-path name sort)
                               (user-error "Failed to sort result set %s" name))
                         bqrs-path))
+         (decoded (when where
+                    (if (codeql--raw-results-decoded-p (car decoded) decode-path name)
+                        (car decoded)
+                      (let ((rows (codeql--raw-results-decode-all decode-path name)))
+                        (when decoded (setcar decoded rows))
+                        rows))))
+         (tuples (when where
+                   (codeql--raw-results-filter-tuples (nth 2 decoded) where)))
+         (total-rows (if where (length tuples) source-rows))
          (offsets
-          (when (> total-rows codeql-max-raw-results)
+          (when (and (not where) (> total-rows codeql-max-raw-results))
             (when-let ((info (codeql--bqrs-info decode-path codeql-max-raw-results name)))
               (alist-get 'offsets
                          (alist-get 'pagination
@@ -3275,23 +3467,34 @@ and the org data of its first page, or nil when there is nothing to show."
                                              :key (lambda (rs) (alist-get 'name rs))
                                              :test #'equal))))))
          (offsets (and (> (length offsets) 1) offsets))
-         (page-size (if offsets codeql-max-raw-results (max total-rows 1)))
+         (page-size (if (or offsets where) codeql-max-raw-results (max total-rows 1)))
          (style (or style codeql-raw-results-style)))
-    (when (and (> total-rows codeql-max-raw-results) (not offsets))
+    (when (and where (zerop total-rows))
+      (user-error "No rows of %s meet %s" name
+                  (codeql--raw-results-filter-description
+                   (list :result-set name :result-sets result-sets :where where))))
+    (when (and (not where) (> total-rows codeql-max-raw-results) (not offsets))
       (message "Could not compute result pagination offsets, rendering all %d rows."
                total-rows))
     (when (> total-rows 0)
       (when-let ((org-data (codeql--raw-results-page-to-org
-                            decode-path name offsets 0 page-size style)))
+                            decode-path name offsets 0 page-size style projection
+                            tuples (nth 3 decoded))))
         (cons (list :kind 'raw
                     :source-bqrs-path bqrs-path
                     :bqrs-path decode-path
                     :result-sets result-sets
                     :result-set name
                     :sort sort
+                    :where where
+                    :projection projection
+                    :decoded decoded
+                    :tuples tuples
+                    :columns (nth 3 decoded)
                     :offsets offsets
                     :page 0
                     :total-rows total-rows
+                    :source-rows source-rows
                     :page-size page-size
                     :style style
                     :footer footer)
@@ -3325,7 +3528,10 @@ and the org data of its first page, or nil when there is nothing to show."
                       (plist-get pagination :offsets)
                       page
                       (plist-get pagination :page-size)
-                      (plist-get pagination :style))))))))
+                      (plist-get pagination :style)
+                      (plist-get pagination :projection)
+                      (plist-get pagination :tuples)
+                      (plist-get pagination :columns))))))))
       (unless org-data
         (user-error "Failed to load results page %d" (1+ page)))
       (codeql--raw-results-cache-put page org-data)
@@ -3375,9 +3581,11 @@ and the org data of its first page, or nil when there is nothing to show."
 (defun codeql--raw-results-state ()
   "Return the raw results state of the current buffer, or signal a user error."
   (let ((state (or codeql--raw-results-pagination
-                   (user-error "Not a CodeQL raw results buffer"))))
+                   (if (codeql--results-buffer-p (current-buffer))
+                       (user-error "Only raw (table) results can be sorted, filtered or switched to another result set")
+                     (user-error "Not a CodeQL raw results buffer")))))
     (when (codeql--sarif-results-p state)
-      (user-error "Problem results can't be sorted or switched to another result set"))
+      (user-error "Only raw (table) results can be sorted, filtered or switched to another result set"))
     state))
 
 (defun codeql--raw-results-column-names (result-set)
@@ -3387,11 +3595,11 @@ and the org data of its first page, or nil when there is nothing to show."
            collect (or (alist-get 'name column)
                        (format "column %d (%s)" i (alist-get 'kind column)))))
 
-(defun codeql--raw-results-redisplay (result-set-name sort)
-  "Show RESULT-SET-NAME sorted by SORT from the first page in this buffer.
+(defun codeql--raw-results-redisplay (result-set-name ops)
+  "Show RESULT-SET-NAME with the table operations OPS from its first page.
 
-SORT is nil or a (COLUMN . DIRECTION) pair, see
-`codeql--raw-results-sorted-bqrs'."
+OPS is a plist of the :sort, :where and :projection of the rows to show,
+see `codeql--raw-results-pagination'."
   (let* ((state (codeql--raw-results-state))
          (query-buffer codeql--org-query-buffer)
          (result-set (or (cl-find result-set-name (plist-get state :result-sets)
@@ -3402,14 +3610,22 @@ SORT is nil or a (COLUMN . DIRECTION) pair, see
       (user-error "Result set %s has no rows" result-set-name))
     (unless (buffer-live-p query-buffer)
       (user-error "The query buffer for these results is no longer live"))
-    (let ((setup (with-current-buffer query-buffer
-                   (codeql--raw-results-setup
-                    (plist-get state :source-bqrs-path)
-                    (plist-get state :result-sets)
-                    result-set
-                    (plist-get state :footer)
-                    sort
-                    (plist-get state :style)))))
+    (let* ((decoded (list (plist-get state :decoded)))
+           (setup
+            (unwind-protect
+                (with-current-buffer query-buffer
+                  (codeql--raw-results-setup
+                   (plist-get state :source-bqrs-path)
+                   (plist-get state :result-sets)
+                   result-set
+                   (plist-get state :footer)
+                   ops
+                   (plist-get state :style)
+                   decoded))
+              ;; keep rows decoded for a filter no row met, for the next one
+              (unless (eq (car decoded) (plist-get state :decoded))
+                (setq codeql--raw-results-pagination
+                      (plist-put (copy-sequence state) :decoded (car decoded)))))))
       (unless setup
         (user-error "Failed to load result set %s" result-set-name))
       (setq codeql--raw-results-pagination (car setup)
@@ -3419,7 +3635,9 @@ SORT is nil or a (COLUMN . DIRECTION) pair, see
       (force-mode-line-update))))
 
 (defun codeql-results-select-result-set (result-set-name)
-  "Show the result set named RESULT-SET-NAME of the current CodeQL results."
+  "Show the result set named RESULT-SET-NAME of the current CodeQL results.
+
+The sort, filter and columns of the previous result set don't carry over."
   (interactive
    (let* ((state (codeql--raw-results-state))
           (result-sets (plist-get state :result-sets))
@@ -3435,31 +3653,188 @@ SORT is nil or a (COLUMN . DIRECTION) pair, see
   (codeql--raw-results-redisplay result-set-name nil)
   (message "Showing result set %s." result-set-name))
 
-(defun codeql-results-sort (column direction)
-  "Sort the current CodeQL results by the 0-based COLUMN in DIRECTION.
+(defun codeql--raw-results-ops (state &rest ops)
+  "Return the table operations of STATE, with those of the plist OPS instead."
+  (let ((result (list :sort (plist-get state :sort)
+                      :where (plist-get state :where)
+                      :projection (plist-get state :projection))))
+    (while ops
+      (setq result (plist-put result (pop ops) (pop ops))))
+    result))
 
-DIRECTION is either \"asc\" or \"desc\".  When COLUMN is nil, restore the
-original order of the results."
+(defun codeql--raw-results-confirm-large (state ops)
+  "Ask whether to apply OPS to the results of STATE if they are large.
+
+Sorting in an order there is no sorted copy of yet, and decoding all
+rows for a filter, is slow and takes memory for result sets of more than
+`codeql-results-large-threshold' rows.  Signal a user error unless the
+user confirms."
+  (let* ((rows (or (plist-get state :source-rows) (plist-get state :total-rows) 0))
+         (name (plist-get state :result-set))
+         (source (plist-get state :source-bqrs-path))
+         (sort (plist-get ops :sort))
+         (decode-path (if sort (codeql--raw-results-sorted-path source name sort) source))
+         (sorting (and sort
+                       (not (equal sort (plist-get state :sort)))
+                       (not (and (buffer-live-p codeql--org-query-buffer)
+                                 (with-current-buffer codeql--org-query-buffer
+                                   (codeql--file-exists-p decode-path))))))
+         (decoding (and (plist-get ops :where)
+                        (not (codeql--raw-results-decoded-p
+                              (plist-get state :decoded) decode-path name)))))
+    (when (and codeql-results-large-threshold
+               (> rows codeql-results-large-threshold)
+               (or sorting decoding)
+               (not (y-or-n-p
+                     (format "Result set %s has %d rows: %s.  Continue? "
+                             (plist-get state :result-set) rows
+                             (mapconcat #'identity
+                                        (delq nil (list (and sorting "sorting them may take a while")
+                                                        (and decoding "filtering decodes them all into memory")))
+                                        ", and ")))))
+      (user-error "Cancelled"))))
+
+(defun codeql--raw-results-apply (ops)
+  "Show the current raw results with the table operations OPS."
+  (let ((state (codeql--raw-results-state)))
+    (codeql--raw-results-confirm-large state ops)
+    (codeql--raw-results-redisplay (plist-get state :result-set) ops)))
+
+(defun codeql--raw-results-check-column (state column)
+  "Signal a user error unless COLUMN is a column of the results of STATE."
+  (let ((count (length (codeql--raw-results-state-column-names state))))
+    (unless (and (integerp column) (<= 0 column) (< column count))
+      (user-error "No such column: %s (the result set has %d columns)" column count))))
+
+(defun codeql--raw-results-read-columns (state prompt)
+  "Read a list of columns of the results of STATE with PROMPT.
+
+Return their 0-based indexes, in the order they were given."
+  (let ((names (codeql--raw-results-state-column-names state)))
+    (cl-remove-duplicates
+     (mapcar (lambda (name) (cl-position name names :test #'equal))
+             (completing-read-multiple prompt names nil t))
+     :from-end t)))
+
+(defun codeql-results-sort (keys &optional direction)
+  "Sort the current CodeQL results by the sort KEYS.
+
+KEYS is a list of (COLUMN . DIRECTION) pairs of a 0-based COLUMN and a
+DIRECTION of either \"asc\" or \"desc\", which order the rows
+lexicographically: by the first key, rows that are equal in it by the
+second, and so on.  When KEYS is nil, restore the original order.  KEYS
+may also be a single COLUMN, sorted in DIRECTION.
+
+Interactively, read the columns to sort by, in order, which are sorted
+in ascending order; with a prefix argument, also read the direction of
+each.  The whole result set is sorted, not just the current page, which
+asks for confirmation first when it is large, see
+`codeql-results-large-threshold'."
   (interactive
    (let* ((state (codeql--raw-results-state))
-          (result-set (cl-find (plist-get state :result-set) (plist-get state :result-sets)
-                               :key (lambda (rs) (alist-get 'name rs)) :test #'equal))
-          (names (codeql--raw-results-column-names result-set))
-          (original "(original order)")
-          (choice (completing-read "Sort by column: "
-                                   (append names (when (plist-get state :sort) (list original)))
-                                   nil t))
-          (column (unless (equal choice original) (cl-position choice names :test #'equal))))
-     (list column
-           (when column
-             (completing-read "Direction: " '("asc" "desc") nil t nil nil "asc")))))
-  (unless (or (null column) (member direction '("asc" "desc")))
-    (user-error "Sort direction must be \"asc\" or \"desc\", not %s" direction))
-  (codeql--raw-results-redisplay
-   (plist-get (codeql--raw-results-state) :result-set)
-   (when column (cons column direction)))
-  (message (if column "Sorted results by column %d (%s)." "Restored the original order.")
-           (and column (1+ column)) direction))
+          (columns (codeql--raw-results-read-columns
+                    state "Sort by columns, in order (empty for the original order): ")))
+     (list (mapcar (lambda (column)
+                     (cons column
+                           (if current-prefix-arg
+                               (completing-read
+                                (format "Direction of %s: "
+                                        (codeql--raw-results-column-name state column))
+                                '("asc" "desc") nil t nil nil "asc")
+                             "asc")))
+                   columns))))
+  (let ((state (codeql--raw-results-state))
+        (keys (if (integerp keys) (list (cons keys (or direction "asc"))) keys)))
+    (dolist (key keys)
+      (codeql--raw-results-check-column state (car key))
+      (unless (member (cdr key) '("asc" "desc"))
+        (user-error "Sort direction must be \"asc\" or \"desc\", not %s" (cdr key))))
+    (codeql--raw-results-apply (codeql--raw-results-ops state :sort keys))
+    (message (if keys "Sorted results by %s." "Restored the original order.")
+             (codeql--raw-results-sort-description codeql--raw-results-pagination))))
+
+(defun codeql-results-filter (where)
+  "Show only the rows of the current CodeQL results that meet WHERE.
+
+WHERE is a list of (COLUMN OPERATOR VALUE) conditions a row must all
+meet, of a 0-based COLUMN, a VALUE string and an OPERATOR of:
+
+  =  !=  <  <=  >  >=   comparing numerically when both the cell and
+                        VALUE are numbers, and as strings otherwise
+  ~  !~                 matching the regexp VALUE, or not
+
+Entities are compared by their label.  When WHERE is nil, show all rows.
+
+Interactively, add a condition to those of the current filter; with a
+prefix argument, remove conditions instead.  The whole result set is
+filtered, not just the current page, which decodes all of its rows into
+memory and asks for confirmation first when it is large, see
+`codeql-results-large-threshold'."
+  (interactive
+   (let* ((state (codeql--raw-results-state))
+          (where (plist-get state :where)))
+     (if current-prefix-arg
+         (let* ((descriptions
+                 (mapcar (lambda (condition)
+                           (codeql--raw-results-condition-description state condition))
+                         where))
+                (remove (progn
+                          (unless where (user-error "These results aren't filtered"))
+                          (completing-read-multiple "Remove filter conditions: "
+                                                    descriptions nil t))))
+           (list (cl-loop for condition in where
+                          for description in descriptions
+                          unless (member description remove) collect condition)))
+       (let* ((names (codeql--raw-results-state-column-names state))
+              (name (completing-read "Filter by column: " names nil t))
+              (column (or (cl-position name names :test #'equal)
+                          (user-error "No column given")))
+              (operator (completing-read (format "Operator for %s: " name)
+                                         codeql--raw-results-operators nil t nil nil "="))
+              (value (read-string (format "%s %s " name operator))))
+         (list (append where (list (list column operator value))))))))
+  (let ((state (codeql--raw-results-state)))
+    (dolist (condition where)
+      (pcase-let ((`(,column ,operator ,value) condition))
+        (codeql--raw-results-check-column state column)
+        (unless (member operator codeql--raw-results-operators)
+          (user-error "Unknown filter operator %s, use one of %s"
+                      operator (string-join codeql--raw-results-operators " ")))
+        (unless (stringp value)
+          (user-error "Filter values must be strings, not %S" value))
+        (when (member operator '("~" "!~"))
+          (condition-case err
+              (string-match-p value "")
+            (invalid-regexp (user-error "Invalid regexp %S: %s" value (cadr err)))))))
+    (codeql--raw-results-apply (codeql--raw-results-ops state :where where))
+    (let ((state codeql--raw-results-pagination))
+      (if where
+          (message "Showing %s rows where %s." (codeql--raw-results-rows-description state)
+                   (codeql--raw-results-filter-description state))
+        (message "Showing all %d rows." (plist-get state :total-rows))))))
+
+(defun codeql-results-project (columns)
+  "Show only the COLUMNS of the current CodeQL results, in that order.
+
+COLUMNS is a list of 0-based columns.  When it is nil, show all columns."
+  (interactive
+   (list (codeql--raw-results-read-columns
+          (codeql--raw-results-state) "Show columns, in order (empty for all): ")))
+  (let* ((state (codeql--raw-results-state))
+         (count (length (codeql--raw-results-state-column-names state))))
+    (dolist (column columns)
+      (codeql--raw-results-check-column state column))
+    (when (equal columns (number-sequence 0 (1- count)))
+      (setq columns nil))
+    (codeql--raw-results-apply (codeql--raw-results-ops state :projection columns))
+    (message (if columns "Showing columns %s." "Showing all columns.")
+             (codeql--raw-results-projection-description codeql--raw-results-pagination))))
+
+(defun codeql-results-reset ()
+  "Show all rows and columns of the current CodeQL results in the original order."
+  (interactive)
+  (codeql--raw-results-apply nil)
+  (message "Showing all rows and columns in the original order."))
 
 (defun codeql-results-toggle-raw-style ()
   "Show the raw results of this buffer as org headings or as an org table.
@@ -3555,11 +3930,14 @@ This needs the org-ql package."
     (define-key map (kbd "C-c >") #'codeql-results-last-page)
     (define-key map (kbd "C-c C-r") #'codeql-results-select-result-set)
     (define-key map (kbd "C-c C-s") #'codeql-results-sort)
+    (define-key map (kbd "C-c C-w") #'codeql-results-filter)
+    (define-key map (kbd "C-c C-v") #'codeql-results-project)
+    (define-key map (kbd "C-c C-k") #'codeql-results-reset)
     map)
   "Keymap for `codeql-results-pagination-mode'.")
 
 (define-minor-mode codeql-results-pagination-mode
-  "Minor mode for paging, sorting and switching CodeQL raw result sets.
+  "Minor mode for paging, sorting, filtering and switching CodeQL raw result sets.
 
 \\{codeql-results-pagination-mode-map}"
   :lighter " CodeQL-Pages"
@@ -7627,23 +8005,18 @@ QUERY-PATH, and is shown in the Query Source section of the results."
                          bqrs-path result-sets result-set-info footer))))
           (if (not setup)
               (message "No results in bqrs.")
-            (let* ((state (car setup))
-                   (rendered
-                    (codeql--org-render-raw-query-results
-                     (cdr setup) query-buffer footer
-                     (codeql--results-marker query-path)
-                     state
-                     (list :provenance provenance
-                           :database db-path
-                           :query-kind "raw"))))
-              ;; results that can be paged, sorted or switched to other result
-              ;; sets are re-rendered from the bqrs on reload so that they
-              ;; remain interactive, only cache plain single page results
-              (if (or (plist-get state :offsets) (> (length result-sets) 1))
-                  (when (file-exists-p (format "%s.org" bqrs-path))
-                    (delete-file (format "%s.org" bqrs-path)))
-                (with-temp-file (format "%s.org" bqrs-path)
-                  (insert rendered)))))))))))
+            (progn
+              (codeql--org-render-raw-query-results
+               (cdr setup) query-buffer footer
+               (codeql--results-marker query-path)
+               (car setup)
+               (list :provenance provenance
+                     :database db-path
+                     :query-kind "raw"))
+              ;; raw results are re-rendered from the bqrs on reload so that
+              ;; they can still be paged, sorted, filtered and so on
+              (when (file-exists-p (format "%s.org" bqrs-path))
+                (delete-file (format "%s.org" bqrs-path)))))))))))
 
 ;; loading SARIF files, e.g. the output of codeql database analyze
 

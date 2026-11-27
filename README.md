@@ -604,15 +604,25 @@ Raw (table) result sets with more tuples than `codeql-max-raw-results` (default:
 | `C-c <`   | `codeql-results-first-page`         |
 | `C-c >`   | `codeql-results-last-page`          |
 | `C-c C-s` | `codeql-results-sort`               |
+| `C-c C-w` | `codeql-results-filter`             |
+| `C-c C-v` | `codeql-results-project`            |
+| `C-c C-k` | `codeql-results-reset`              |
 | `C-c C-r` | `codeql-results-select-result-set`  |
 
-`codeql-results-sort` sorts the whole result set by a column, in ascending or descending order, or restores the original order. Sorting is done by `codeql bqrs decode --sort-key --sort-direction`, which writes a sorted copy of the result set next to the BQRS file that is reused when sorting by the same column again.
+These commands work like `ORDER BY`, `WHERE` and `SELECT` on the whole result set, not just the current page, and they combine: rows are sorted, then filtered, then only the chosen columns are shown. The header line and the results footer show the current sort, filter and columns.
+
+- `codeql-results-sort` sorts by one or more columns, in the order you give them: rows are ordered by the first column, rows that are equal in it by the second, and so on. Columns sort in ascending order; with a prefix argument (`C-u C-c C-s`) you choose the direction of each. Empty input restores the original order. Sorting is done by `codeql bqrs decode --sort-key --sort-direction`, which writes a sorted copy of the result set next to the BQRS file that is reused when sorting the same way again.
+- `codeql-results-filter` adds a condition on a column: a row is shown when it meets all conditions. The operators `=`, `!=`, `<`, `<=`, `>` and `>=` compare numerically when both the cell and the value are numbers and as strings otherwise, and `~` and `!~` match a regexp. Entities are compared by their label. With a prefix argument (`C-u C-c C-w`) it removes conditions instead. Filtering decodes all rows of the result set into memory, which are then reused for other filters of the same order.
+- `codeql-results-project` shows only the columns you choose, in that order. Filters may still use the hidden columns. Empty input shows all columns.
+- `codeql-results-reset` goes back to all rows and columns in the original order.
+
+Sorting and filtering result sets of more than `codeql-results-large-threshold` rows (default: 50000) asks for confirmation first, as they may take a while and a lot of memory. Set it to `nil` to never ask.
 
 Queries can produce more than one result set, e.g. through `query predicate` declarations. The `#select` result set is shown by default, and `codeql-results-select-result-set` switches to another one.
 
-Problem and path-problem queries are paginated as well: when they produce more alerts than `codeql-max-sarif-results` (default: 100), the interpreted SARIF results of all runs are kept in the results buffer and rendered `codeql-max-sarif-results` alerts at a time. The page commands above work the same way; sorting and result set selection are only available for raw results.
+Problem and path-problem queries are paginated as well: when they produce more alerts than `codeql-max-sarif-results` (default: 100), the interpreted SARIF results of all runs are kept in the results buffer and rendered `codeql-max-sarif-results` alerts at a time. The page commands above work the same way; sorting, filtering, choosing columns and result set selection are only available for raw results.
 
-Loading a page that isn't cached requires the query buffer that produced the results to still be live. Paginated results, and results with more than one result set, are re-rendered from the BQRS file when loaded from query history.
+Loading a page that isn't cached requires the query buffer that produced the results to still be live. Raw results, and paginated problem results, are re-rendered from the BQRS file when loaded from query history, so that they can be paged, sorted and filtered again.
 
 Recently visited pages are cached per results buffer, so going back to them is near instant. The number of cached pages is controlled by `codeql-results-page-cache-size` (default: 50, set to 0 to disable).
 

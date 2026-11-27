@@ -716,7 +716,7 @@ sent, and `codeql-load-bqrs' pushes (:loaded BQRS-PATH PROVENANCE)."
     (codeql-test--with-query-buffer
       (let ((buffer (codeql-test--render-raw '(:kind file :path "/q/R.ql") 'table)))
         (cl-letf (((symbol-function 'codeql--raw-results-page-to-org)
-                   (lambda (_bqrs _set _offsets _page _size style)
+                   (lambda (_bqrs _set _offsets _page _size style &rest _)
                      (codeql-test--raw-org style))))
           (with-current-buffer buffer
             (should (= (codeql-results-org-ql "(regexp \"foo\")") 1))
@@ -725,6 +725,193 @@ sent, and `codeql-load-bqrs' pushes (:loaded BQRS-PATH PROVENANCE)."
             (codeql-results-toggle-raw-style)
             (should (eq (plist-get codeql--raw-results-pagination :style) 'table))
             (should-not (codeql-test--result-properties buffer))))))))
+
+;;; Table operations on raw results
+
+(defconst codeql-test--table-tuples
+  "[[{\"label\": \"foo(x)\", \"url\": {\"uri\": \"file:/src/app.js\",
+       \"startLine\": 4, \"startColumn\": 2, \"endLine\": 4, \"endColumn\": 7}},
+     \"foo\", 3],
+    [{\"label\": \"bar(y)\", \"url\": {\"uri\": \"file:/src/db.js\",
+       \"startLine\": 9, \"startColumn\": 1, \"endLine\": 9, \"endColumn\": 6}},
+     \"bar\", 10],
+    [{\"label\": \"baz(z)\", \"url\": {\"uri\": \"file:/src/db.js\",
+       \"startLine\": 11, \"startColumn\": 1, \"endLine\": 11, \"endColumn\": 6}},
+     \"baz\", 1]]"
+  "Three raw result tuples of the columns `codeql-test--raw-columns'.")
+
+(defmacro codeql-test--with-table (bindings &rest body)
+  "Run BODY in a raw results buffer of `codeql-test--table-tuples'.
+
+BINDINGS are extra `cl-letf' bindings.  Decoding the bqrs returns the
+tuples, `decodes' counts whole result set decodes and `cli' collects the
+other CLI commands, as lists of their arguments."
+  (declare (indent 1) (debug t))
+  `(codeql-test--with-query-buffer
+     (let* ((decodes 0)
+            (cli nil)
+            (columns (json-parse-string codeql-test--raw-columns :object-type 'alist))
+            (result-sets (list `((name . "#select") (rows . 3) (columns . ,columns)))))
+       (cl-letf (((symbol-function 'codeql--bqrs-to-json)
+                  (lambda (_path _entities &optional _set rows _start)
+                    (unless rows (cl-incf decodes))
+                    (format "{\"columns\": %s, \"tuples\": %s}"
+                            codeql-test--raw-columns codeql-test--table-tuples)))
+                 ((symbol-function 'codeql--cli-command-to-string)
+                  (lambda (args) (push args cli) ""))
+                 ,@bindings)
+         (let* ((query-buffer (current-buffer))
+                (setup (codeql--raw-results-setup
+                        "/r/q.bqrs" result-sets (car result-sets) "#+QUERY_KIND: raw\n"
+                        nil 'table))
+                (buffer (codeql-test--new-results-buffer
+                         (lambda ()
+                           (codeql--org-render-raw-query-results
+                            (cdr setup) query-buffer "#+QUERY_KIND: raw\n" "T.ql" (car setup)
+                            (list :provenance '(:kind file :path "/q/T.ql")
+                                  :database "/dbs/js-db" :query-kind "raw"))))))
+           (setq decodes 0)
+           (with-current-buffer buffer
+             ,@body))))))
+
+(defun codeql-test--table-rows ()
+  "Return the cells of the rows of the results table of the current buffer."
+  (save-excursion
+    (codeql-test--goto-heading "Results$")
+    (re-search-forward "^|")
+    (let ((rows (org-table-to-lisp)))
+      (mapcar (lambda (row) (mapcar #'substring-no-properties row))
+              (cl-remove-if-not #'listp rows)))))
+
+(ert-deftest codeql-test-raw-condition ()
+  "Filter conditions compare numbers numerically and anything else as strings."
+  (should (codeql--raw-results-condition-p 10 ">" "9"))
+  (should-not (codeql--raw-results-condition-p "10" "<" "9"))
+  (should (codeql--raw-results-condition-p "10" "<" "9x"))
+  (should (codeql--raw-results-condition-p 3 "=" "3.0"))
+  (should (codeql--raw-results-condition-p "foo" "!=" "bar"))
+  (should (codeql--raw-results-condition-p "abc" "<=" "abd"))
+  (should (codeql--raw-results-condition-p "foo(x)" "~" "^fo+("))
+  (should (codeql--raw-results-condition-p "foo(x)" "!~" "bar"))
+  (should (equal (codeql--raw-results-cell-value '((label . "f()") (url . nil))) "f()"))
+  (should (equal (codeql--raw-results-cell-value :false) "false")))
+
+(ert-deftest codeql-test-raw-sort-keys ()
+  "Sorting by several keys sorts the whole result set with all of them."
+  (codeql-test--with-table ()
+    (codeql-results-sort '((2 . "desc") (1 . "asc")))
+    (let ((args (seq-find (lambda (args) (member "--format=bqrs" args)) cli)))
+      (should (member "--sort-key=2,1" args))
+      (should (member "--sort-direction=desc,asc" args)))
+    (should (equal (plist-get codeql--raw-results-pagination :sort) '((2 . "desc") (1 . "asc"))))
+    (should (string-match-p "^#\\+RESULTS_SORT: column 3 (Integer) desc, callee name asc$"
+                            (buffer-string)))
+    ;; a single column, as before
+    (codeql-results-sort 1 "desc")
+    (should (equal (plist-get codeql--raw-results-pagination :sort) '((1 . "desc"))))
+    (codeql-results-sort nil)
+    (should-not (plist-get codeql--raw-results-pagination :sort))
+    (should-error (codeql-results-sort '((7 . "asc"))) :type 'user-error)
+    (should-error (codeql-results-sort '((0 . "up"))) :type 'user-error)))
+
+(ert-deftest codeql-test-raw-filter ()
+  "Filtering shows the rows that meet all conditions and pages through them."
+  (codeql-test--with-table ()
+    (should (= (length (codeql-test--table-rows)) 4))
+    (codeql-results-filter '((2 ">=" "3")))
+    (should (= decodes 1))
+    (should (equal (mapcar #'cadr (cdr (codeql-test--table-rows))) '("foo" "bar")))
+    (should (string-match-p "^#\\+RESULTS_FILTER: column 3 (Integer) >= 3$" (buffer-string)))
+    (should (string-match-p "^#\\+RESULTS_ROWS: 1-2 of 2 (filtered from 3)$" (buffer-string)))
+    ;; the decoded rows are reused for another filter of the same order
+    (codeql-results-filter '((2 ">=" "3") (0 "~" "^bar")))
+    (should (= decodes 1))
+    (should (equal (mapcar #'cadr (cdr (codeql-test--table-rows))) '("bar")))
+    ;; a filter no row meets leaves the results as they are
+    (should (equal (cadr (should-error (codeql-results-filter '((1 "=" "no pe")))
+                                       :type 'user-error))
+                   "No rows of #select meet callee name = \"no pe\""))
+    (should (= (plist-get codeql--raw-results-pagination :total-rows) 1))
+    (should-error (codeql-results-filter '((1 "~" "[")))  :type 'user-error)
+    (should-error (codeql-results-filter '((1 "<>" "x"))) :type 'user-error)
+    ;; filtered rows are paged too
+    (let ((codeql-max-raw-results 1))
+      (codeql-results-filter '((2 ">=" "3")))
+      (should (= (codeql--raw-results-pages codeql--raw-results-pagination) 2))
+      (should (equal (mapcar #'cadr (cdr (codeql-test--table-rows))) '("foo")))
+      (codeql-results-next-page)
+      (should (equal (mapcar #'cadr (cdr (codeql-test--table-rows))) '("bar"))))
+    (codeql-results-filter nil)
+    (should (= (plist-get codeql--raw-results-pagination :total-rows) 3))
+    (should-not (string-match-p "RESULTS_FILTER" (buffer-string)))))
+
+(ert-deftest codeql-test-raw-project ()
+  "Projecting shows the chosen columns in the chosen order, in both styles."
+  (codeql-test--with-table ()
+    (codeql-results-project '(2 1))
+    (should (equal (car (codeql-test--table-rows)) '("Integer" "callee name")))
+    (should (equal (cadr (codeql-test--table-rows)) '("3" "foo")))
+    (should (string-match-p "^#\\+RESULTS_COLUMNS: column 3 (Integer), callee name$" (buffer-string)))
+    ;; with a filter on a column that isn't shown
+    (codeql-results-filter '((0 "~" "^ba")))
+    (should (equal (cdr (codeql-test--table-rows)) '(("10" "bar") ("1" "baz"))))
+    (codeql-results-toggle-raw-style)
+    (let ((props (codeql-test--result-properties (current-buffer))))
+      (should (= (length props) 2))
+      (should (equal (cdr (assoc "CODEQL_COL_CALLEE_NAME" (car props))) "bar"))
+      (should-not (assoc "CODEQL_COL_CALL" (car props))))
+    (codeql-results-toggle-raw-style)
+    ;; all columns in their order is no projection
+    (codeql-results-project '(0 1 2))
+    (should-not (plist-get codeql--raw-results-pagination :projection))
+    (should-error (codeql-results-project '(3)) :type 'user-error)
+    (codeql-results-reset)
+    (should-not (plist-get codeql--raw-results-pagination :where))
+    (should (= (length (codeql-test--table-rows)) 4))))
+
+(ert-deftest codeql-test-raw-ops-elsewhere ()
+  "Table operations explain where they apply."
+  (codeql-test--with-query-buffer
+    (with-current-buffer (codeql-test--render-sarif '(:kind file :path "/q/P.ql"))
+      (should (string-prefix-p "Only raw (table) results"
+                               (cadr (should-error (codeql-results-filter nil) :type 'user-error))))))
+  (with-temp-buffer
+    (should (equal (cadr (should-error (codeql-results-sort nil) :type 'user-error))
+                   "Not a CodeQL raw results buffer"))))
+
+(ert-deftest codeql-test-raw-large-confirm ()
+  "Sorting or filtering large result sets asks for confirmation first."
+  (let (asked answer)
+    (codeql-test--with-table
+        (((symbol-function 'y-or-n-p) (lambda (prompt) (push prompt asked) answer)))
+      (let ((codeql-results-large-threshold 2))
+        (should-error (codeql-results-filter '((2 ">" "1"))) :type 'user-error)
+        (should (= decodes 0))
+        (should (string-match-p "has 3 rows: filtering decodes them all into memory"
+                                (car asked)))
+        (setq answer t)
+        (codeql-results-filter '((2 ">" "1")))
+        (should (= decodes 1))
+        ;; refining the filter reuses the decoded rows, without asking
+        (setq asked nil)
+        (codeql-results-filter '((2 ">" "5")))
+        (should-not asked)
+        ;; and so does a filter after one no row met
+        (should-error (codeql-results-filter '((1 "=" "nope"))) :type 'user-error)
+        (codeql-results-filter '((1 "=" "bar")))
+        (should-not asked)
+        (should (= decodes 1))
+        ;; a new order needs sorting and decoding again
+        (codeql-results-sort '((2 . "asc")))
+        (should (string-match-p "sorting them may take a while, and filtering" (car asked)))
+        ;; projections don't
+        (setq asked nil)
+        (codeql-results-project '(1))
+        (should-not asked))
+      (let ((codeql-results-large-threshold nil))
+        (setq answer nil)
+        (codeql-results-sort '((1 . "asc")))
+        (should (equal (plist-get codeql--raw-results-pagination :sort) '((1 . "asc"))))))))
 
 ;;; Provenance of loaded SARIF and variant analysis results
 
