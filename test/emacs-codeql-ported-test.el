@@ -1044,6 +1044,61 @@ OUTPUT is called with the arguments when it is a function."
           (push-button)
           (should (= codeql--graph-selected 1)))))))
 
+(ert-deftest codeql-ported-test-graph-follow-source ()
+  "The source of the selected node of a text diagram is shown highlighted."
+  (codeql-ported-test--with-temp-dir dir
+    (let* ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--diamond-dot))
+           (source (codeql-ported-test--write (concat dir "a.js")
+                                              "if (x)\n  then();\nelse();\njoin();\n"))
+           (nodes `(("if (x)" . ,(concat source "::1:1:1:6"))
+                    ("then" . ,(concat source "::2:3:2:8"))
+                    ("else" . nil)
+                    ("join" . ,(concat dir "missing.js::4:1:4:4"))))
+           (codeql-graph-format "text")
+           (codeql-graph-follow-source t))
+      (codeql-ported-test--with-graph-buffer dot nodes
+        (let ((highlighted
+               (lambda ()
+                 (when-let ((overlay codeql--graph-source-overlay)
+                            ((overlay-buffer overlay)))
+                   (with-current-buffer (overlay-buffer overlay)
+                     (buffer-substring-no-properties (overlay-start overlay)
+                                                     (overlay-end overlay)))))))
+          (unwind-protect
+              (let ((window (selected-window)))
+                (codeql--graph-follow)
+                (should (equal (funcall highlighted) "if (x)"))
+                (should (eq (overlay-get codeql--graph-source-overlay 'face)
+                            'codeql-graph-source-face))
+                (should (get-buffer-window (get-file-buffer source)))
+                ;; the graph keeps the focus
+                (should (eq (selected-window) window))
+                (should-not (eq (get-file-buffer source) (window-buffer window)))
+                (codeql-graph-next)
+                (should (equal (funcall highlighted) "then()"))
+                ;; nodes without a location or source file have no highlight
+                (codeql-graph-forward)
+                (should-not (funcall highlighted))
+                (codeql-graph-next)
+                (should-not (funcall highlighted))
+                (codeql--graph-select 1)
+                (should (equal (funcall highlighted) "then()"))
+                ;; nor have other formats
+                (codeql-graph-cycle-format)
+                (should-not codeql--graph-format)
+                (should-not (funcall highlighted))
+                (let ((codeql-graph-follow-source nil))
+                  (setq codeql--graph-format "text")
+                  (codeql--graph-select 0)
+                  (should-not (funcall highlighted)))
+                (codeql--graph-select 1)
+                (should (funcall highlighted))
+                (let ((overlay codeql--graph-source-overlay))
+                  (kill-buffer (current-buffer))
+                  (should-not (overlay-buffer overlay))))
+            (when (get-file-buffer source)
+              (kill-buffer (get-file-buffer source)))))))))
+
 (defconst codeql-ported-test--parts-dot
   (concat "digraph {\n"
           "  0[\"label\"=\"f\"; ];\n  1[\"label\"=\"entry\"; ];\n"

@@ -415,6 +415,22 @@ this is nil, the dot file itself is shown.
                  (const :tag "Show the dot file" nil))
   :group 'emacs-codeql)
 
+(defcustom codeql-graph-follow-source t
+  "Whether the source of the selected node of a text graph diagram is shown.
+
+When non-nil, selecting a node of a text diagram, see
+`codeql-graph-format', shows its location in another window, without
+selecting it, and highlights it with `codeql-graph-source-face'."
+  :type 'boolean
+  :group 'emacs-codeql)
+
+(defface codeql-graph-source-face
+  '((t :inherit highlight :extend nil))
+  "Face of the location of the selected node of a text graph diagram.
+
+See `codeql-graph-follow-source'."
+  :group 'emacs-codeql)
+
 (defcustom codeql-max-sarif-results 100
   "The max amount of problem or path-problem results to render at once.
 
@@ -6219,7 +6235,69 @@ TRAIL is the new `codeql--graph-trail'."
   (let ((inhibit-read-only t))
     (erase-buffer)
     (codeql--graph-insert-text)
-    (set-buffer-modified-p nil)))
+    (set-buffer-modified-p nil))
+  (codeql--graph-follow))
+
+(defvar-local codeql--graph-source-overlay nil
+  "The overlay on the source of the selected node of a text graph diagram.")
+
+(defun codeql--graph-unfollow ()
+  "Remove the highlight of the source of the selected node of a graph."
+  (when (overlayp codeql--graph-source-overlay)
+    (delete-overlay codeql--graph-source-overlay)))
+
+(defun codeql--graph-follow ()
+  "Show and highlight the source of the selected node of a text graph diagram.
+
+See `codeql-graph-follow-source'.  The source file is shown in another
+window, and nothing happens for nodes whose source file is unknown or
+missing."
+  (codeql--graph-unfollow)
+  (when-let* (codeql-graph-follow-source
+              ((codeql--graph-text-p))
+              (id codeql--graph-selected)
+              (link (and codeql--graph-nodes (< id (length codeql--graph-nodes))
+                         (cdr (aref codeql--graph-nodes id))))
+              (location (codeql--parse-link-location link))
+              (filename (car location))
+              ((nth 1 location))
+              ((> (nth 1 location) 0))
+              ((not (directory-name-p filename)))
+              ((file-exists-p filename)))
+    (pcase-let* ((`(,_ ,line ,column ,end-line ,end-column) location)
+                 (query-buffer codeql--org-query-buffer)
+                 (buffer (find-file-noselect filename))
+                 (overlay (or codeql--graph-source-overlay
+                              (setq codeql--graph-source-overlay (make-overlay 1 1)))))
+      (with-current-buffer buffer
+        ;; like files visited from results, see `codeql--org-open-file-link'
+        (when (and (buffer-live-p query-buffer)
+                   (not (buffer-live-p codeql--org-query-buffer))
+                   (with-current-buffer query-buffer
+                     (and codeql--database-source-archive-root
+                          (codeql--database-src-path-p filename))))
+          (setq codeql--org-query-buffer query-buffer)
+          (setq buffer-read-only t))
+        (save-restriction
+          (widen)
+          (let* ((beg (codeql--eglot--lsp-position-to-point
+                       `(:line ,(1- line) :character ,(1- (or column 1)))))
+                 (end (if (and end-line end-column)
+                          ;; an inclusive 1-based end column is an exclusive 0-based one
+                          (codeql--eglot--lsp-position-to-point
+                           `(:line ,(1- end-line) :character ,end-column))
+                        (line-end-position)))
+                 (window (display-buffer buffer '(nil (inhibit-same-window . t)))))
+            (move-overlay overlay beg (max beg end) buffer)
+            (overlay-put overlay 'face 'codeql-graph-source-face)
+            (overlay-put overlay 'priority 100)
+            (when window
+              (unless (and (pos-visible-in-window-p beg window)
+                           (pos-visible-in-window-p end window))
+                (with-selected-window window
+                  (goto-char beg)
+                  (recenter)))
+              (set-window-point window beg))))))))
 
 (defun codeql--graph-text-node-at (pos)
   "Return the dot node id of the text diagram row at POS, or nil."
@@ -6379,6 +6457,7 @@ nil."
          note)
     (when (process-live-p codeql--graph-render-process)
       (delete-process codeql--graph-render-process))
+    (codeql--graph-unfollow)
     (erase-buffer)
     (setq header-line-format nil)
     (when (and (member format '("svg" "png"))
@@ -6400,7 +6479,10 @@ nil."
       (codeql--graph-insert-dot dot-path note))
      ((equal format "text")
       (codeql--graph-insert-text)
-      (setq header-line-format '(:eval (codeql--graph-header-line))))
+      (setq header-line-format '(:eval (codeql--graph-header-line)))
+      ;; a new graph buffer follows once it is shown, see `codeql--show-graph'
+      (when (get-buffer-window buffer t)
+        (codeql--graph-follow)))
      (t
       (insert (propertize "Rendering graph ..." 'face 'shadow))
       (let ((default-directory (file-name-directory dot-path)))
@@ -6586,11 +6668,14 @@ In a text diagram, \\[codeql-graph-next] and \\[codeql-graph-previous] move to a
 predecessor of the selected node, \\[codeql-graph-forward] and \\[codeql-graph-backward] move to the
 nodes beside it, on the other branches, \\[codeql-graph-next-root] and \\[codeql-graph-previous-root] jump between the
 roots of the graph, and \\[codeql-graph-visit-node] visits it, like in `undo-tree-visualize'.
+The source of the selected node is shown and highlighted in another window,
+see `codeql-graph-follow-source'.
 
 \\{codeql-graph-mode-map}"
   (require 'image-mode)
   (setq truncate-lines t)
-  (setq-local revert-buffer-function #'codeql--graph-revert))
+  (setq-local revert-buffer-function #'codeql--graph-revert)
+  (add-hook 'kill-buffer-hook #'codeql--graph-unfollow nil t))
 
 (defun codeql--show-graph (dot-path &optional nodes query-buffer)
   "Show the graph of the dot file at DOT-PATH in a `codeql-graph-mode' buffer.
@@ -6610,7 +6695,8 @@ graph is shown as set by `codeql-graph-format'."
             codeql--graph-nodes nodes
             codeql--org-query-buffer query-buffer)
       (codeql--graph-render)
-      (switch-to-buffer-other-window (current-buffer)))))
+      (switch-to-buffer-other-window (current-buffer))
+      (codeql--graph-follow))))
 
 (defun codeql--process-ast (json src-filename src-root src-buffer)
   ;; only allow this to be called as part of a templated flow
