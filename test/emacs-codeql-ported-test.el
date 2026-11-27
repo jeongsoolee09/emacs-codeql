@@ -1094,6 +1094,56 @@ OUTPUT is called with the arguments when it is a function."
             (kill-buffer "*codeql-graph: ast-a.js*"))
           (delete-directory codeql--ast-graph-directory t))))))
 
+(ert-deftest codeql-ported-test-ast-graph-follows-point ()
+  "Moving point in the source selects the innermost node at point."
+  (let* ((url (lambda (line column end-line end-column)
+                `((uri . "file:///a.js") (startLine . ,line) (startColumn . ,column)
+                  (endLine . ,end-line) (endColumn . ,end-column))))
+         (item (lambda (label location &rest children)
+                 (let ((item (codeql--ast-item-create :label label :location location
+                                                      :children (vconcat children))))
+                   (dolist (child children)
+                     (setf (codeql--ast-item-parent child) item))
+                   item)))
+         (tree (vector
+                (funcall item "[CallExpr] f(\"x\")" (funcall url 1 1 1 6)
+                         (funcall item "[VarRef] f" (funcall url 1 1 1 1))
+                         (funcall item "(Arguments)" nil
+                                  (funcall item "[Literal] \"x\"" (funcall url 1 3 1 5))))
+                (funcall item "[ExprStmt] g;" (funcall url 2 1 2 2))))
+         (codeql-graph-format "text")
+         (codeql-graph-follow-source nil)
+         (codeql-ast-sync-highlighting t)
+         (codeql--ast-graph-directory nil))
+    (codeql-ported-test--with-query-buffer
+      (cl-letf (((symbol-function 'switch-to-buffer-other-window) #'ignore)
+                ((symbol-function 'get-buffer-window) (lambda (&rest _) t))
+                ((symbol-function 'message) #'ignore))
+        (with-temp-buffer
+          (insert "f(\"x\")\ng;\n")
+          (goto-char (point-min))
+          (let ((codeql--source-link-prefix-box (list "/arch/src")))
+            (codeql--ast-to-graph tree "/arch/src/a.js" query-buffer '(1 . 1)))
+          (unwind-protect
+              (let* ((graph (get-buffer "*codeql-graph: ast-a.js*"))
+                     (sync (lambda (line column)
+                            (goto-char (point-min))
+                            (forward-line (1- line))
+                            (forward-char (1- column))
+                            (run-hooks 'post-command-hook)
+                            (buffer-local-value 'codeql--graph-selected graph))))
+                (should (memq #'codeql--sync-src-to-ast-graph post-command-hook))
+                (should (eql (funcall sync 1 4) 3))
+                (should (eql (funcall sync 1 2) 0))
+                (should (eql (funcall sync 2 1) 4))
+                ;; the graph is gone, and so is the hook
+                (kill-buffer graph)
+                (funcall sync 1 4)
+                (should-not (memq #'codeql--sync-src-to-ast-graph post-command-hook)))
+            (when (get-buffer "*codeql-graph: ast-a.js*")
+              (kill-buffer "*codeql-graph: ast-a.js*"))
+            (delete-directory codeql--ast-graph-directory t)))))))
+
 (ert-deftest codeql-ported-test-graph-text-faces ()
   "Nodes are bold, and the selected node and its label stand out."
   (codeql-ported-test--with-temp-dir dir
