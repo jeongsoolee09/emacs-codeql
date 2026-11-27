@@ -6986,8 +6986,11 @@ nil."
          (map-path (concat base ".cmapx"))
          (inhibit-read-only t)
          note)
-    (when (process-live-p codeql--graph-render-process)
-      (delete-process codeql--graph-render-process))
+    ;; forget the process first, so its sentinel doesn't take it for a failure
+    (when-let ((process codeql--graph-render-process))
+      (setq codeql--graph-render-process nil)
+      (when (process-live-p process)
+        (delete-process process)))
     (codeql--unfollow-source)
     (erase-buffer)
     (setq header-line-format nil)

@@ -852,7 +852,15 @@ OUTPUT is called with the arguments when it is a function."
           (codeql-graph-next)
           (codeql-graph-forward)
           (codeql-ported-test--wait #'codeql-ported-test--graph-rendered-p)
-          (should (= (length inserted) 3)))))))
+          (should (= (length inserted) 3))
+          ;; switching formats while rendering doesn't fail the next render
+          (codeql-graph-cycle-format)
+          (should (process-live-p codeql--graph-render-process))
+          (codeql-graph-cycle-format)
+          (should (equal codeql--graph-format "text"))
+          (accept-process-output nil 0.5)
+          (should (equal codeql--graph-format "text"))
+          (should (string-prefix-p "  x  a b" (buffer-string))))))))
 
 (ert-deftest codeql-ported-test-graph-insert-image ()
   "Rendered graphs are shown as images with a clickable map of their nodes."
