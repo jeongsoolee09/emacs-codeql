@@ -869,6 +869,16 @@ other CLI commands, as lists of their arguments."
     (should-not (plist-get codeql--raw-results-pagination :where))
     (should (= (length (codeql-test--table-rows)) 4))))
 
+(ert-deftest codeql-test-raw-ops-elsewhere ()
+  "Table operations explain where they apply."
+  (codeql-test--with-query-buffer
+    (with-current-buffer (codeql-test--render-sarif '(:kind file :path "/q/P.ql"))
+      (should (string-prefix-p "Only raw (table) results"
+                               (cadr (should-error (codeql-results-filter nil) :type 'user-error))))))
+  (with-temp-buffer
+    (should (equal (cadr (should-error (codeql-results-sort nil) :type 'user-error))
+                   "Not a CodeQL raw results buffer"))))
+
 (ert-deftest codeql-test-raw-large-confirm ()
   "Sorting or filtering large result sets asks for confirmation first."
   (let (asked answer)

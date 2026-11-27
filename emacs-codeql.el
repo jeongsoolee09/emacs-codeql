@@ -3581,9 +3581,11 @@ Signal a user error when no row meets the conditions of :where."
 (defun codeql--raw-results-state ()
   "Return the raw results state of the current buffer, or signal a user error."
   (let ((state (or codeql--raw-results-pagination
-                   (user-error "Not a CodeQL raw results buffer"))))
+                   (if (codeql--results-buffer-p (current-buffer))
+                       (user-error "Only raw (table) results can be sorted, filtered or switched to another result set")
+                     (user-error "Not a CodeQL raw results buffer")))))
     (when (codeql--sarif-results-p state)
-      (user-error "Problem results can't be sorted, filtered or switched to another result set"))
+      (user-error "Only raw (table) results can be sorted, filtered or switched to another result set"))
     state))
 
 (defun codeql--raw-results-column-names (result-set)
@@ -8003,23 +8005,18 @@ QUERY-PATH, and is shown in the Query Source section of the results."
                          bqrs-path result-sets result-set-info footer))))
           (if (not setup)
               (message "No results in bqrs.")
-            (let* ((state (car setup))
-                   (rendered
-                    (codeql--org-render-raw-query-results
-                     (cdr setup) query-buffer footer
-                     (codeql--results-marker query-path)
-                     state
-                     (list :provenance provenance
-                           :database db-path
-                           :query-kind "raw"))))
-              ;; results that can be paged, sorted or switched to other result
-              ;; sets are re-rendered from the bqrs on reload so that they
-              ;; remain interactive, only cache plain single page results
-              (if (or (plist-get state :offsets) (> (length result-sets) 1))
-                  (when (file-exists-p (format "%s.org" bqrs-path))
-                    (delete-file (format "%s.org" bqrs-path)))
-                (with-temp-file (format "%s.org" bqrs-path)
-                  (insert rendered)))))))))))
+            (progn
+              (codeql--org-render-raw-query-results
+               (cdr setup) query-buffer footer
+               (codeql--results-marker query-path)
+               (car setup)
+               (list :provenance provenance
+                     :database db-path
+                     :query-kind "raw"))
+              ;; raw results are re-rendered from the bqrs on reload so that
+              ;; they can still be paged, sorted, filtered and so on
+              (when (file-exists-p (format "%s.org" bqrs-path))
+                (delete-file (format "%s.org" bqrs-path)))))))))))
 
 ;; loading SARIF files, e.g. the output of codeql database analyze
 

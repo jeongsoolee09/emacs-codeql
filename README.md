@@ -622,7 +622,7 @@ Queries can produce more than one result set, e.g. through `query predicate` dec
 
 Problem and path-problem queries are paginated as well: when they produce more alerts than `codeql-max-sarif-results` (default: 100), the interpreted SARIF results of all runs are kept in the results buffer and rendered `codeql-max-sarif-results` alerts at a time. The page commands above work the same way; sorting, filtering, choosing columns and result set selection are only available for raw results.
 
-Loading a page that isn't cached requires the query buffer that produced the results to still be live. Paginated results, and results with more than one result set, are re-rendered from the BQRS file when loaded from query history.
+Loading a page that isn't cached requires the query buffer that produced the results to still be live. Raw results, and paginated problem results, are re-rendered from the BQRS file when loaded from query history, so that they can be paged, sorted and filtered again.
 
 Recently visited pages are cached per results buffer, so going back to them is near instant. The number of cached pages is controlled by `codeql-results-page-cache-size` (default: 50, set to 0 to disable).
 
