@@ -250,6 +250,15 @@ with `codeql-follow-source-face'."
   :type 'boolean
   :group 'emacs-codeql)
 
+(defcustom codeql-follow-source-pulse t
+  "Whether the source of the node selected in a viewer flashes when shown.
+
+The source is flashed with `pulse-momentary-highlight-region' as the
+selection moves, like the AST viewer flashes the node at point, see
+`codeql-ast-sync-highlighting' and `codeql-graph-follow-source'."
+  :type 'boolean
+  :group 'emacs-codeql)
+
 (defface codeql-follow-source-face
   '((t :inherit highlight :extend nil))
   "Face of the source of the node selected in a viewer.
@@ -3920,14 +3929,17 @@ highlighted for a missing file or location."
                  (window (display-buffer buffer '(nil (inhibit-same-window . t)))))
             (move-overlay overlay beg (max beg end) buffer)
             (overlay-put overlay 'face 'codeql-follow-source-face)
-            (overlay-put overlay 'priority 100)
+            ;; under the flash of `pulse', whose overlay has priority 1
+            (overlay-put overlay 'priority 0)
             (when window
               (unless (and (pos-visible-in-window-p beg window)
                            (pos-visible-in-window-p end window))
                 (with-selected-window window
                   (goto-char beg)
                   (recenter)))
-              (set-window-point window beg))
+              (set-window-point window beg)
+              (when codeql-follow-source-pulse
+                (pulse-momentary-highlight-region beg (max (1+ beg) end))))
             overlay))))))
 
 ;; mutual highlighting at point for src/ast buffers
@@ -4431,7 +4443,9 @@ See `codeql-highlight-visited-location'."
           ;; is still related to the query history I suppose?
           (unless query-buffer
             (message "No active query buffer for these results, opened from history?"))
-          (when database-file-p
+          ;; links of buffers without a query buffer, e.g. from history,
+          ;; don't detach files from the query buffer they already have
+          (when (and database-file-p (buffer-live-p query-buffer))
             (setq codeql--org-query-buffer query-buffer))
           (when permalink-info
             (setq codeql--permalink-info permalink-info))
@@ -5443,6 +5457,15 @@ commands can be repeated without the prefix key.")
            do
            (cl-return t)))
 
+(defvar-local codeql--ast-as-graph nil
+  "How the AST of this source file is to be shown when it is ready.
+
+This is nil for the org tree of `codeql-view-ast', or the (LINE . COLUMN)
+position of the node to select in the graph of `codeql-view-ast-graph'.")
+
+(defvar codeql--ast-graph-directory nil
+  "The directory of the dot files of the AST graphs of this Emacs session.")
+
 (defun codeql--render-ast (json src-root src-filename src-buffer)
   (message "Rendering AST")
   ;; oh boy.
@@ -5533,10 +5556,84 @@ commands can be repeated without the prefix key.")
         (message "Tree is sorted (%d roots) ... rendering." (length sorted-tree))
         ;; render with buffer context ...
         (with-current-buffer src-buffer
-          (if (buffer-live-p codeql--org-query-buffer)
-              (codeql--ast-to-org sorted-tree src-filename src-buffer codeql--org-query-buffer)
+          (cond
+           (codeql--ast-as-graph
+            (codeql--ast-to-graph sorted-tree src-filename codeql--org-query-buffer
+                                  codeql--ast-as-graph))
+           ((buffer-live-p codeql--org-query-buffer)
+            (codeql--ast-to-org sorted-tree src-filename src-buffer codeql--org-query-buffer))
+           (t
             (message "No active buffer context available to render AST with, going to plaintext.")
-            (codeql--ast-to-org sorted-tree src-filename src-buffer)))))))
+            (codeql--ast-to-org sorted-tree src-filename src-buffer))))))))
+
+(defun codeql--ast-item-link (item query-buffer)
+  "Return the codeql: link path of the location of AST ITEM, or nil.
+
+The link is resolved with the database of QUERY-BUFFER."
+  (when-let* (((buffer-live-p query-buffer))
+              (url (codeql--location-url (codeql--ast-item-location item)))
+              ((natnump (alist-get 'startLine url)))
+              ((> (alist-get 'startLine url) 0)))
+    (with-current-buffer query-buffer
+      (ignore-errors (codeql--location-link-path url)))))
+
+(defun codeql--ast-item-contains-p (item position)
+  "Return non-nil when the location of AST ITEM contains POSITION.
+
+POSITION is a (LINE . COLUMN) cons, 1-based like locations are."
+  (when-let* ((url (codeql--location-url (codeql--ast-item-location item)))
+              (line (alist-get 'startLine url))
+              ((natnump line))
+              ((> line 0)))
+    (let ((start (cons line (or (alist-get 'startColumn url) 1)))
+          (end (cons (or (alist-get 'endLine url) line)
+                     (or (alist-get 'endColumn url) most-positive-fixnum)))
+          (before-p (lambda (a b)
+                      (or (< (car a) (car b))
+                          (and (= (car a) (car b)) (<= (cdr a) (cdr b)))))))
+      (and (funcall before-p start position) (funcall before-p position end)))))
+
+(defun codeql--ast-to-graph (sorted-tree src-filename &optional query-buffer position)
+  "Show the AST SORTED-TREE of SRC-FILENAME as a graph.
+
+The graph is shown by `codeql--show-graph', with its locations resolved
+with QUERY-BUFFER.  The innermost node containing POSITION, a (LINE .
+COLUMN) cons, is selected when the graph is shown as text."
+  (unless (and codeql--ast-graph-directory (file-directory-p codeql--ast-graph-directory))
+    (setq codeql--ast-graph-directory (make-temp-file "codeql-ast-graphs-" t)))
+  (let ((dot-path (expand-file-name (format "ast-%s.dot" (file-name-nondirectory src-filename))
+                                    codeql--ast-graph-directory))
+        (count 0)
+        nodes edges selected)
+    ;; nodes are numbered in preorder, so children come after their parents
+    (cl-labels ((walk (item parent)
+                  (let ((id count)
+                        (label (string-trim (replace-regexp-in-string
+                                             "[ \t\n]+" " "
+                                             (format "%s" (codeql--ast-item-label item))))))
+                    (setq count (1+ count))
+                    (push (cons label (codeql--ast-item-link item query-buffer)) nodes)
+                    (when parent
+                      (push (cons parent id) edges))
+                    (when (and position (codeql--ast-item-contains-p item position))
+                      (setq selected id))
+                    (cl-loop for child across (codeql--ast-item-children item)
+                             do (walk child id)))))
+      (cl-loop for root across sorted-tree do (walk root nil)))
+    (setq nodes (nreverse nodes))
+    (with-temp-file dot-path
+      (insert "digraph {\n")
+      (cl-loop for (label . _) in nodes for id from 0 do
+               (insert (format "%d[\"label\"=\"%s\"];\n" id
+                               (replace-regexp-in-string "[\"\\]" "\\\\\\&" label))))
+      (pcase-dolist (`(,from . ,to) (nreverse edges))
+        (insert (format "%d -> %d;\n" from to)))
+      (insert "}\n"))
+    (codeql--show-graph dot-path nodes query-buffer t)
+    (when-let ((buffer (get-buffer (format "*codeql-graph: %s*" (file-name-base dot-path)))))
+      (with-current-buffer buffer
+        (when (and selected (codeql--graph-text-p))
+          (codeql--graph-select selected))))))
 
 (defun codeql--ast-to-org (sorted-tree src-filename src-buffer &optional buffer-context)
   ;; src-filename is (buffer-filename) for the src buffer ... XXX: check with TRAMP
@@ -5554,6 +5651,8 @@ commands can be repeated without the prefix key.")
       (setq buffer-read-only t)
       (save-excursion
         (org-mode)
+        ;; its links are visited with the database of the query buffer
+        (setq codeql--org-query-buffer buffer-context)
         ;; add our highlighting sync
         (when codeql-ast-sync-highlighting
           (setq codeql--ast-last-point (point))
@@ -5648,9 +5747,13 @@ commands can be repeated without the prefix key.")
                (< (codeql--ast-item-order left)
                   (codeql--ast-item-order right)))))
 
-(defun codeql-view-ast ()
-  "Display the AST for the current source archive file."
+(defun codeql-view-ast (&optional as-graph)
+  "Display the AST for the current source archive file.
+
+With AS-GRAPH, show it as a graph instead, see `codeql-view-ast-graph'."
   (interactive)
+  (setq codeql--ast-as-graph
+        (and as-graph (cons (line-number-at-pos) (codeql--lsp-abiding-column))))
   (cl-multiple-value-bind (json src-root) (gethash (buffer-file-name) codeql--ast-cache)
     (if json
         ;; render the AST from cache
@@ -5664,6 +5767,15 @@ commands can be repeated without the prefix key.")
               (let ((language (intern (format ":%s" codeql--active-database-language))))
                 (codeql--run-templated-query language "printAst" src-filename src-buffer))))
         (message "Did not recognize this file as being part of an active codeql database.")))))
+
+(defun codeql-view-ast-graph ()
+  "Display the AST for the current source archive file as a graph.
+
+The AST is shown in a `codeql-graph-mode' buffer as set by
+`codeql-graph-format', like the graphs of `codeql-view-cfg', with the
+innermost node at point selected in text diagrams."
+  (interactive)
+  (codeql-view-ast t))
 
 (defun codeql-view-cfg ()
   "Display the control flow graph of the function at point.
@@ -5715,6 +5827,14 @@ by `codeql--graph-text-layout'.  Its :places are the (ROW . LANE) of the
 nodes and :back the successors their edges point back up to, vectors by
 dot node id, and its :roots the nodes no edge leads down the diagram to,
 from top to bottom.  It is nil until the graph is first shown as text.")
+
+(defvar-local codeql--graph-compact nil
+  "Non-nil when the rows of a text graph diagram show short node labels.
+
+Dense graphs like ASTs list the node types of their rows, like
+[IfStmt], without locations, while the header line and the description
+below the diagram show the full label and location of the selected node,
+see `codeql--graph-text-short-label'.")
 
 (defvar-local codeql--graph-selected nil
   "The dot node id of the selected node of a text graph diagram.")
@@ -6177,6 +6297,18 @@ numbered from 0, see `codeql--dot-node-labels'."
   (let ((label (aref (plist-get codeql--graph-text :labels) id)))
     (if width (truncate-string-to-width label width nil nil "…") label)))
 
+(defun codeql--graph-text-short-label (id)
+  "Return the short label of the node with dot node ID.
+
+See `codeql--graph-compact'.
+
+This is the [TYPE] of AST node labels like \"[TYPE] text\", after the
+\"EDGE: \" label they may have, or else the label truncated to 20."
+  (let ((label (codeql--graph-text-label id)))
+    (if (string-match "\\`\\(?:[^][]*: \\)?\\[[^]]*\\]" label)
+        (match-string 0 label)
+      (truncate-string-to-width label 20 nil nil "…"))))
+
 (defun codeql--graph-text-location (id)
   "Return the location of the node with dot node ID as FILE:LINE, or nil."
   (when-let* ((node (and codeql--graph-nodes (aref codeql--graph-nodes id)))
@@ -6235,12 +6367,23 @@ numbered from 0, see `codeql--dot-node-labels'."
 Point is left on the selected node, see `codeql--graph-selected'.  The
 labels of the nodes of a row follow the diagram from left to right."
   (let* ((rows (plist-get codeql--graph-text :rows))
-         (width (apply #'max 0 (mapcar (lambda (row) (length (nth 1 row))) rows)))
+         ;; the labels of each part are aligned after its own diagram, an
+         ;; empty link line ends a part, see `codeql--graph-text-ranks'
+         (widths (let (widths (width 0) (count 0))
+                   (pcase-dolist (`(,_ ,node-line ,link-line) rows)
+                     (setq width (max width (length node-line))
+                           count (1+ count))
+                     (when (or (null link-line) (string-empty-p link-line))
+                       (setq widths (append widths (make-list count width))
+                             width 0
+                             count 0)))
+                   widths))
          target)
     (unless codeql--graph-selected
       (setq codeql--graph-selected (car (car (car (car rows))))))
     (pcase-dolist (`(,nodes ,node-line ,link-line) rows)
       (let ((start (point))
+            (width (pop widths))
             (label-width (if (cdr nodes) (max 20 (/ 60 (length nodes))) 60)))
         (setq node-line (copy-sequence node-line))
         (insert "  " node-line (make-string (- width (length node-line)) ?\s))
@@ -6261,17 +6404,25 @@ labels of the nodes of a row follow the diagram from left to right."
                  for location = (codeql--graph-text-location id)
                  for help = (format "%s\n%s" (codeql--graph-text-label id)
                                     (or location "No location"))
+                 for shown-location = (and (not codeql--graph-compact) location)
                  do
                  (unless first
                    (insert (propertize " │ " 'face 'shadow)))
                  (let ((label-start (point)))
-                   (insert (propertize (codeql--graph-text-label id label-width)
+                   (insert (propertize (if codeql--graph-compact
+                                           (codeql--graph-text-short-label id)
+                                         (codeql--graph-text-label id label-width))
                                        'face (and selected 'bold)
-                                       'mouse-face 'highlight)
-                           (if location (propertize (concat "  " location) 'face 'shadow) "")
+                                       'mouse-face 'highlight
+                                       'help-echo help)
+                           (if shown-location
+                               (propertize (concat "  " shown-location) 'face 'shadow)
+                             "")
                            (mapconcat (lambda (other)
                                         (propertize (format "  ^ %s"
-                                                            (codeql--graph-text-label other 30))
+                                                            (if codeql--graph-compact
+                                                                (codeql--graph-text-short-label other)
+                                                              (codeql--graph-text-label other 30)))
                                                     'face 'shadow))
                                       back ""))
                    (put-text-property label-start (point) 'codeql-graph-node id))
@@ -6705,12 +6856,13 @@ see `codeql-graph-follow-source'.
   (setq-local revert-buffer-function #'codeql--graph-revert)
   (codeql--follow-source-setup))
 
-(defun codeql--show-graph (dot-path &optional nodes query-buffer)
+(defun codeql--show-graph (dot-path &optional nodes query-buffer compact)
   "Show the graph of the dot file at DOT-PATH in a `codeql-graph-mode' buffer.
 
 NODES are the nodes of the graph as returned by `codeql--bqrs-graph-nodes',
 their locations are visited with the database of QUERY-BUFFER.  The
-graph is shown as set by `codeql-graph-format'."
+graph is shown as set by `codeql-graph-format', with the short labels of
+`codeql--graph-compact' when COMPACT is non-nil."
   (let ((nodes (and nodes (codeql--graph-match-nodes dot-path nodes))))
     (with-current-buffer (get-buffer-create
                           (format "*codeql-graph: %s*" (file-name-base dot-path)))
@@ -6721,6 +6873,7 @@ graph is shown as set by `codeql-graph-format'."
             codeql--graph-trail nil
             codeql--graph-format codeql-graph-format
             codeql--graph-nodes nodes
+            codeql--graph-compact compact
             codeql--org-query-buffer query-buffer)
       (codeql--graph-render)
       (switch-to-buffer-other-window (current-buffer))

@@ -1044,6 +1044,110 @@ OUTPUT is called with the arguments when it is a function."
           (push-button)
           (should (= codeql--graph-selected 1)))))))
 
+(ert-deftest codeql-ported-test-ast-graph ()
+  "ASTs are shown as graphs, with the innermost node at point selected."
+  (let* ((url (lambda (line column end-line end-column)
+                `((uri . "file:///a.js") (startLine . ,line) (startColumn . ,column)
+                  (endLine . ,end-line) (endColumn . ,end-column))))
+         (item (lambda (label location &rest children)
+                 (let ((item (codeql--ast-item-create :label label :location location
+                                                      :children (vconcat children))))
+                   (dolist (child children)
+                     (setf (codeql--ast-item-parent child) item))
+                   item)))
+         (tree (vector
+                (funcall item "[CallExpr] f(\"x\")" (funcall url 1 1 1 6)
+                         (funcall item "[VarRef] f" (funcall url 1 1 1 1))
+                         (funcall item "(Arguments)" nil
+                                  (funcall item "[Literal] \"x\"" (funcall url 1 3 1 5))))
+                (funcall item "[ExprStmt] g;" (funcall url 2 1 2 2))))
+         (codeql-graph-format "text")
+         (codeql-graph-follow-source nil)
+         (codeql--ast-graph-directory nil))
+    (codeql-ported-test--with-query-buffer
+      (cl-letf (((symbol-function 'switch-to-buffer-other-window) #'ignore)
+                ((symbol-function 'message) #'ignore))
+        (let ((codeql--source-link-prefix-box (list "/arch/src")))
+          (codeql--ast-to-graph tree "/arch/src/a.js" query-buffer '(1 . 4)))
+        (unwind-protect
+            (with-current-buffer "*codeql-graph: ast-a.js*"
+              (should (eq major-mode 'codeql-graph-mode))
+              (should (equal codeql--graph-nodes
+                             [("[CallExpr] f(\"x\")" . "/arch/src/a.js::1:1:1:6")
+                              ("[VarRef] f" . "/arch/src/a.js::1:1:1:1")
+                              ("(Arguments)" . nil)
+                              ("[Literal] \"x\"" . "/arch/src/a.js::1:3:1:5")
+                              ("[ExprStmt] g;" . "/arch/src/a.js::2:1:2:2")]))
+              (should (equal (codeql--dot-edges codeql--graph-dot-path)
+                             '((0 1 nil) (0 2 nil) (2 3 nil))))
+              ;; the literal is the innermost node containing 1:4
+              (should (eql codeql--graph-selected 3))
+              ;; each tree is a part of its own
+              (should (equal (plist-get codeql--graph-text :roots) '(0 4)))
+              ;; rows show node types, the selected node is described in full
+              (should codeql--graph-compact)
+              (should (string-match-p "  \\[CallExpr\\]$" (buffer-string)))
+              (should-not (string-match-p "f(\"x\")" (buffer-string)))
+              (should (string-match-p "\\[Literal\\] \"x\"" (codeql--graph-header-line)))
+              (should (string-match-p "\\[Literal\\] \"x\"" (buffer-string))))
+          (when (get-buffer "*codeql-graph: ast-a.js*")
+            (kill-buffer "*codeql-graph: ast-a.js*"))
+          (delete-directory codeql--ast-graph-directory t))))))
+
+(ert-deftest codeql-ported-test-graph-short-labels ()
+  "Short labels are the types of AST node labels."
+  (let ((codeql--graph-text
+         (list :labels ["[IfStmt] if (x) ..." "then: [BlockStmt] { }" "(Parameters)"
+                        "a very long label without any type"])))
+    (should (equal (codeql--graph-text-short-label 0) "[IfStmt]"))
+    (should (equal (codeql--graph-text-short-label 1) "then: [BlockStmt]"))
+    (should (equal (codeql--graph-text-short-label 2) "(Parameters)"))
+    (should (equal (codeql--graph-text-short-label 3) "a very long label w…"))))
+
+(ert-deftest codeql-ported-test-ast-org-query-buffer ()
+  "The org AST viewer visits its links with the database of its query buffer."
+  (codeql-ported-test--with-query-buffer
+    (cl-letf (((symbol-function 'switch-to-buffer-other-window) #'ignore))
+      (let ((codeql-ast-sync-highlighting t))
+        (codeql--ast-to-org (vector (codeql--ast-item-create :label "[Toplevel]" :children []))
+                            "/arch/src/a.js" nil query-buffer)
+        (with-current-buffer "* AST viewer: /arch/src/a.js *"
+          (should (eq codeql--org-query-buffer query-buffer)))))))
+
+(ert-deftest codeql-ported-test-open-link-keeps-query-buffer ()
+  "Links without a query buffer don't detach files from theirs."
+  (codeql-ported-test--with-temp-dir dir
+    (let ((source (codeql-ported-test--write (concat dir "a.js") "let x;\n")))
+      (codeql-ported-test--with-query-buffer
+        (cl-letf (((symbol-function 'message) #'ignore))
+          (let ((src-buffer (find-file-noselect source)))
+            (with-current-buffer src-buffer
+              (setq codeql--org-query-buffer query-buffer))
+            (with-temp-buffer
+              (codeql--org-open-file-link (concat source "::1:5:1:5")))
+            (should (eq (buffer-local-value 'codeql--org-query-buffer src-buffer)
+                        query-buffer))))))))
+
+(ert-deftest codeql-ported-test-follow-source-pulse ()
+  "The source shown for the selected node of a viewer flashes."
+  (codeql-ported-test--with-temp-dir dir
+    (let* ((source (codeql-ported-test--write (concat dir "a.js") "let x = f(1);\n"))
+           (pulses nil))
+      (cl-letf (((symbol-function 'pulse-momentary-highlight-region)
+                 (lambda (beg end &rest _)
+                   (push (buffer-substring-no-properties beg end) pulses))))
+        (with-temp-buffer
+          (unwind-protect
+              (progn
+                (codeql--follow-source (list source 1 9 1 12))
+                (should (equal pulses '("f(1)")))
+                (let ((codeql-follow-source-pulse nil))
+                  (codeql--follow-source (list source 1 1 1 3)))
+                (should (equal pulses '("f(1)")))
+                (should (< (overlay-get codeql--follow-overlay 'priority) 1)))
+            (codeql--unfollow-source)
+            (kill-buffer (get-file-buffer source))))))))
+
 (ert-deftest codeql-ported-test-ast-follow-source ()
   "Moving point in the AST viewer highlights the source of its node."
   (codeql-ported-test--with-temp-dir dir
