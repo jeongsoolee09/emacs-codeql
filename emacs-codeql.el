@@ -4431,7 +4431,9 @@ See `codeql-highlight-visited-location'."
           ;; is still related to the query history I suppose?
           (unless query-buffer
             (message "No active query buffer for these results, opened from history?"))
-          (when database-file-p
+          ;; links of buffers without a query buffer, e.g. from history,
+          ;; don't detach files from the query buffer they already have
+          (when (and database-file-p (buffer-live-p query-buffer))
             (setq codeql--org-query-buffer query-buffer))
           (when permalink-info
             (setq codeql--permalink-info permalink-info))
@@ -5615,7 +5617,7 @@ COLUMN) cons, is selected when the graph is shown as text."
       (pcase-dolist (`(,from . ,to) (nreverse edges))
         (insert (format "%d -> %d;\n" from to)))
       (insert "}\n"))
-    (codeql--show-graph dot-path nodes query-buffer)
+    (codeql--show-graph dot-path nodes query-buffer t)
     (when-let ((buffer (get-buffer (format "*codeql-graph: %s*" (file-name-base dot-path)))))
       (with-current-buffer buffer
         (when (and selected (codeql--graph-text-p))
@@ -5637,6 +5639,8 @@ COLUMN) cons, is selected when the graph is shown as text."
       (setq buffer-read-only t)
       (save-excursion
         (org-mode)
+        ;; its links are visited with the database of the query buffer
+        (setq codeql--org-query-buffer buffer-context)
         ;; add our highlighting sync
         (when codeql-ast-sync-highlighting
           (setq codeql--ast-last-point (point))
@@ -5811,6 +5815,14 @@ by `codeql--graph-text-layout'.  Its :places are the (ROW . LANE) of the
 nodes and :back the successors their edges point back up to, vectors by
 dot node id, and its :roots the nodes no edge leads down the diagram to,
 from top to bottom.  It is nil until the graph is first shown as text.")
+
+(defvar-local codeql--graph-compact nil
+  "Non-nil when the rows of a text graph diagram show short node labels.
+
+Dense graphs like ASTs list the node types of their rows, like
+[IfStmt], without locations, while the header line and the description
+below the diagram show the full label and location of the selected node,
+see `codeql--graph-text-short-label'.")
 
 (defvar-local codeql--graph-selected nil
   "The dot node id of the selected node of a text graph diagram.")
@@ -6273,6 +6285,18 @@ numbered from 0, see `codeql--dot-node-labels'."
   (let ((label (aref (plist-get codeql--graph-text :labels) id)))
     (if width (truncate-string-to-width label width nil nil "…") label)))
 
+(defun codeql--graph-text-short-label (id)
+  "Return the short label of the node with dot node ID.
+
+See `codeql--graph-compact'.
+
+This is the [TYPE] of AST node labels like \"[TYPE] text\", after the
+\"EDGE: \" label they may have, or else the label truncated to 20."
+  (let ((label (codeql--graph-text-label id)))
+    (if (string-match "\\`\\(?:[^][]*: \\)?\\[[^]]*\\]" label)
+        (match-string 0 label)
+      (truncate-string-to-width label 20 nil nil "…"))))
+
 (defun codeql--graph-text-location (id)
   "Return the location of the node with dot node ID as FILE:LINE, or nil."
   (when-let* ((node (and codeql--graph-nodes (aref codeql--graph-nodes id)))
@@ -6331,12 +6355,23 @@ numbered from 0, see `codeql--dot-node-labels'."
 Point is left on the selected node, see `codeql--graph-selected'.  The
 labels of the nodes of a row follow the diagram from left to right."
   (let* ((rows (plist-get codeql--graph-text :rows))
-         (width (apply #'max 0 (mapcar (lambda (row) (length (nth 1 row))) rows)))
+         ;; the labels of each part are aligned after its own diagram, an
+         ;; empty link line ends a part, see `codeql--graph-text-ranks'
+         (widths (let (widths (width 0) (count 0))
+                   (pcase-dolist (`(,_ ,node-line ,link-line) rows)
+                     (setq width (max width (length node-line))
+                           count (1+ count))
+                     (when (or (null link-line) (string-empty-p link-line))
+                       (setq widths (append widths (make-list count width))
+                             width 0
+                             count 0)))
+                   widths))
          target)
     (unless codeql--graph-selected
       (setq codeql--graph-selected (car (car (car (car rows))))))
     (pcase-dolist (`(,nodes ,node-line ,link-line) rows)
       (let ((start (point))
+            (width (pop widths))
             (label-width (if (cdr nodes) (max 20 (/ 60 (length nodes))) 60)))
         (setq node-line (copy-sequence node-line))
         (insert "  " node-line (make-string (- width (length node-line)) ?\s))
@@ -6357,17 +6392,25 @@ labels of the nodes of a row follow the diagram from left to right."
                  for location = (codeql--graph-text-location id)
                  for help = (format "%s\n%s" (codeql--graph-text-label id)
                                     (or location "No location"))
+                 for shown-location = (and (not codeql--graph-compact) location)
                  do
                  (unless first
                    (insert (propertize " │ " 'face 'shadow)))
                  (let ((label-start (point)))
-                   (insert (propertize (codeql--graph-text-label id label-width)
+                   (insert (propertize (if codeql--graph-compact
+                                           (codeql--graph-text-short-label id)
+                                         (codeql--graph-text-label id label-width))
                                        'face (and selected 'bold)
-                                       'mouse-face 'highlight)
-                           (if location (propertize (concat "  " location) 'face 'shadow) "")
+                                       'mouse-face 'highlight
+                                       'help-echo help)
+                           (if shown-location
+                               (propertize (concat "  " shown-location) 'face 'shadow)
+                             "")
                            (mapconcat (lambda (other)
                                         (propertize (format "  ^ %s"
-                                                            (codeql--graph-text-label other 30))
+                                                            (if codeql--graph-compact
+                                                                (codeql--graph-text-short-label other)
+                                                              (codeql--graph-text-label other 30)))
                                                     'face 'shadow))
                                       back ""))
                    (put-text-property label-start (point) 'codeql-graph-node id))
@@ -6801,12 +6844,13 @@ see `codeql-graph-follow-source'.
   (setq-local revert-buffer-function #'codeql--graph-revert)
   (codeql--follow-source-setup))
 
-(defun codeql--show-graph (dot-path &optional nodes query-buffer)
+(defun codeql--show-graph (dot-path &optional nodes query-buffer compact)
   "Show the graph of the dot file at DOT-PATH in a `codeql-graph-mode' buffer.
 
 NODES are the nodes of the graph as returned by `codeql--bqrs-graph-nodes',
 their locations are visited with the database of QUERY-BUFFER.  The
-graph is shown as set by `codeql-graph-format'."
+graph is shown as set by `codeql-graph-format', with the short labels of
+`codeql--graph-compact' when COMPACT is non-nil."
   (let ((nodes (and nodes (codeql--graph-match-nodes dot-path nodes))))
     (with-current-buffer (get-buffer-create
                           (format "*codeql-graph: %s*" (file-name-base dot-path)))
@@ -6817,6 +6861,7 @@ graph is shown as set by `codeql-graph-format'."
             codeql--graph-trail nil
             codeql--graph-format codeql-graph-format
             codeql--graph-nodes nodes
+            codeql--graph-compact compact
             codeql--org-query-buffer query-buffer)
       (codeql--graph-render)
       (switch-to-buffer-other-window (current-buffer))

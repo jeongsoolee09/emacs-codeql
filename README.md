@@ -521,7 +521,7 @@ Just like the vscode extension, `emacs-codeql` lets you browse the AST of a data
 
 Moving point in the source file highlights its node in the AST viewer, and moving point in the AST viewer shows the source of the node at point in another window, highlighted with `codeql-follow-source-face`, like the CFG viewer below. `codeql-ast-sync-highlighting` turns both off.
 
-`M-x RET codeql-view-ast-graph RET` shows the AST as a graph instead, in the formats of the CFG viewer below. As a text diagram, each top-level node is a part of its own, its children run side by side, and the innermost node at point is selected.
+`M-x RET codeql-view-ast-graph RET` shows the AST as a graph instead, in the formats of the CFG viewer below. As a text diagram, each top-level node is a part of its own, its children run side by side, and the innermost node at point is selected. Since ASTs are dense, the rows only list node types like `[IfStmt]`, and the header line and the description below the diagram show the full label and location of the selected node.
 
 ### Graph results and the CFG Viewer
 
