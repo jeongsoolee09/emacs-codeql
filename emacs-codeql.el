@@ -242,8 +242,19 @@ An alias for `ql-tree-sitter-mode'.")
   :group 'emacs-codeql)
 
 (defcustom codeql-ast-sync-highlighting t
-  "Enable fancy AST viewer synchronized highlighting."
+  "Enable fancy AST viewer synchronized highlighting.
+
+Moving point in a source file highlights its node in the AST viewer, and
+moving point in the AST viewer highlights the source of the node at point
+with `codeql-follow-source-face'."
   :type 'boolean
+  :group 'emacs-codeql)
+
+(defface codeql-follow-source-face
+  '((t :inherit highlight :extend nil))
+  "Face of the source of the node selected in a viewer.
+
+See `codeql-ast-sync-highlighting' and `codeql-graph-follow-source'."
   :group 'emacs-codeql)
 
 (defcustom codeql-query-server-timeout most-positive-fixnum
@@ -413,6 +424,15 @@ this is nil, the dot file itself is shown.
                  (const :tag "PNG" "png")
                  (const :tag "Text diagram" "text")
                  (const :tag "Show the dot file" nil))
+  :group 'emacs-codeql)
+
+(defcustom codeql-graph-follow-source t
+  "Whether the source of the selected node of a text graph diagram is shown.
+
+When non-nil, selecting a node of a text diagram, see
+`codeql-graph-format', shows its location in another window, without
+selecting it, and highlights it with `codeql-follow-source-face'."
+  :type 'boolean
   :group 'emacs-codeql)
 
 (defcustom codeql-max-sarif-results 100
@@ -3846,6 +3866,70 @@ printCfg query of `codeql-view-cfg'."
     (when (string-match-p prefix (codeql--tramp-unwrap path))
       t)))
 
+;; showing the source of the node selected in a viewer (AST, graph)
+
+(defvar-local codeql--follow-overlay nil
+  "The overlay on the source of the node selected in this viewer buffer.")
+
+(defun codeql--unfollow-source ()
+  "Remove the highlight of the source of the node selected in this viewer."
+  (when (overlayp codeql--follow-overlay)
+    (delete-overlay codeql--follow-overlay)))
+
+(defun codeql--follow-source-setup ()
+  "Remove the source highlight of this viewer with it, or its major mode."
+  (add-hook 'kill-buffer-hook #'codeql--unfollow-source nil t)
+  (add-hook 'change-major-mode-hook #'codeql--unfollow-source nil t))
+
+(defun codeql--follow-source (location &optional query-buffer)
+  "Show and highlight LOCATION in another window, without selecting it.
+
+LOCATION is (FILE LINE COLUMN END-LINE END-COLUMN), 1-based and inclusive,
+as returned by `codeql--parse-link-location'.  The highlight replaces the
+previous one of the current viewer buffer.  Database source files are
+associated with QUERY-BUFFER, like files visited from results.  Nothing is
+highlighted for a missing file or location."
+  (codeql--unfollow-source)
+  (when-let* ((filename (car location))
+              (line (nth 1 location))
+              ((> line 0))
+              ((not (directory-name-p filename)))
+              ((file-exists-p filename)))
+    (pcase-let* ((`(,_ ,_ ,column ,end-line ,end-column) location)
+                 (buffer (find-file-noselect filename))
+                 (overlay (or codeql--follow-overlay
+                              (setq codeql--follow-overlay (make-overlay 1 1)))))
+      (with-current-buffer buffer
+        ;; like files visited from results, see `codeql--org-open-file-link'
+        (when (and (buffer-live-p query-buffer)
+                   (not (buffer-live-p codeql--org-query-buffer))
+                   (with-current-buffer query-buffer
+                     (and codeql--database-source-archive-root
+                          (codeql--database-src-path-p filename))))
+          (setq codeql--org-query-buffer query-buffer)
+          (setq buffer-read-only t))
+        (save-restriction
+          (widen)
+          (let* ((beg (codeql--eglot--lsp-position-to-point
+                       `(:line ,(1- line) :character ,(1- (or column 1)))))
+                 (end (if (and end-line end-column)
+                          ;; an inclusive 1-based end column is an exclusive 0-based one
+                          (codeql--eglot--lsp-position-to-point
+                           `(:line ,(1- end-line) :character ,end-column))
+                        (save-excursion (goto-char beg) (line-end-position))))
+                 (window (display-buffer buffer '(nil (inhibit-same-window . t)))))
+            (move-overlay overlay beg (max beg end) buffer)
+            (overlay-put overlay 'face 'codeql-follow-source-face)
+            (overlay-put overlay 'priority 100)
+            (when window
+              (unless (and (pos-visible-in-window-p beg window)
+                           (pos-visible-in-window-p end window))
+                (with-selected-window window
+                  (goto-char beg)
+                  (recenter)))
+              (set-window-point window beg))
+            overlay))))))
+
 ;; mutual highlighting at point for src/ast buffers
 
 (defvar codeql--ast-to-src-buffer (make-hash-table :test #'equal))
@@ -3955,8 +4039,18 @@ printCfg query of `codeql-view-cfg'."
             ;; I prefer having a visual ping for each event in the AST
             (pulse-momentary-highlight-one-line (point))))))))
 
-;; XXX: TODO: placeholder
-(defun codeql--ast-point-to-src-region-highlight (_src-buffer))
+(defun codeql--ast-point-to-src-region-highlight (src-buffer)
+  "Show and highlight the source in SRC-BUFFER of the AST node at point."
+  (if-let* ((filename (buffer-file-name src-buffer))
+            (ast-line (line-number-at-pos))
+            ;; the newest AST of the file comes first
+            (definition (seq-find (lambda (definition) (eql (aref definition 4) ast-line))
+                                  (gethash filename codeql--ast-backwards-definitions))))
+      (codeql--follow-source
+       (list filename (aref definition 0) (aref definition 2)
+             (aref definition 1) (aref definition 3))
+       (buffer-local-value 'codeql--org-query-buffer src-buffer))
+    (codeql--unfollow-source)))
 
 ;; post-command hooks that run locally in ast/src buffers
 (defun codeql--sync-src-to-ast-overlay ()
@@ -3967,14 +4061,12 @@ printCfg query of `codeql-view-cfg'."
         ;; do a thing
         (codeql--src-point-to-ast-region-highlight ast-buffer)))))
 
-;; XXX: TODO: I find ast->src less useful than src->ast
-;; XXX: but we depend on codeql--ast-last-point being available
-;; XXX: so still keep this code around
 (defun codeql--sync-ast-to-src-overlay ()
   (let ((src-buffer (gethash (current-buffer) codeql--ast-to-src-buffer)))
     (when (buffer-live-p src-buffer)
-      (unless (= (point) codeql--ast-last-point)
-        (setq codeql--ast-last-point (point))))))
+      (unless (eql (point) codeql--ast-last-point)
+        (setq codeql--ast-last-point (point))
+        (codeql--ast-point-to-src-region-highlight src-buffer)))))
 
 ;; xref backend for our global ref/def caches
 
@@ -5465,6 +5557,7 @@ commands can be repeated without the prefix key.")
         ;; add our highlighting sync
         (when codeql-ast-sync-highlighting
           (setq codeql--ast-last-point (point))
+          (codeql--follow-source-setup)
           (add-hook 'post-command-hook #'codeql--sync-ast-to-src-overlay 99 :local))
         (switch-to-buffer-other-window (current-buffer))))))
 
@@ -6219,7 +6312,20 @@ TRAIL is the new `codeql--graph-trail'."
   (let ((inhibit-read-only t))
     (erase-buffer)
     (codeql--graph-insert-text)
-    (set-buffer-modified-p nil)))
+    (set-buffer-modified-p nil))
+  (codeql--graph-follow))
+
+(defun codeql--graph-follow ()
+  "Show and highlight the source of the selected node of a text graph diagram.
+
+See `codeql-graph-follow-source'."
+  (if-let* ((codeql-graph-follow-source)
+            ((codeql--graph-text-p))
+            (id codeql--graph-selected)
+            (link (and codeql--graph-nodes (< id (length codeql--graph-nodes))
+                       (cdr (aref codeql--graph-nodes id)))))
+      (codeql--follow-source (codeql--parse-link-location link) codeql--org-query-buffer)
+    (codeql--unfollow-source)))
 
 (defun codeql--graph-text-node-at (pos)
   "Return the dot node id of the text diagram row at POS, or nil."
@@ -6379,6 +6485,7 @@ nil."
          note)
     (when (process-live-p codeql--graph-render-process)
       (delete-process codeql--graph-render-process))
+    (codeql--unfollow-source)
     (erase-buffer)
     (setq header-line-format nil)
     (when (and (member format '("svg" "png"))
@@ -6400,7 +6507,10 @@ nil."
       (codeql--graph-insert-dot dot-path note))
      ((equal format "text")
       (codeql--graph-insert-text)
-      (setq header-line-format '(:eval (codeql--graph-header-line))))
+      (setq header-line-format '(:eval (codeql--graph-header-line)))
+      ;; a new graph buffer follows once it is shown, see `codeql--show-graph'
+      (when (get-buffer-window buffer t)
+        (codeql--graph-follow)))
      (t
       (insert (propertize "Rendering graph ..." 'face 'shadow))
       (let ((default-directory (file-name-directory dot-path)))
@@ -6586,11 +6696,14 @@ In a text diagram, \\[codeql-graph-next] and \\[codeql-graph-previous] move to a
 predecessor of the selected node, \\[codeql-graph-forward] and \\[codeql-graph-backward] move to the
 nodes beside it, on the other branches, \\[codeql-graph-next-root] and \\[codeql-graph-previous-root] jump between the
 roots of the graph, and \\[codeql-graph-visit-node] visits it, like in `undo-tree-visualize'.
+The source of the selected node is shown and highlighted in another window,
+see `codeql-graph-follow-source'.
 
 \\{codeql-graph-mode-map}"
   (require 'image-mode)
   (setq truncate-lines t)
-  (setq-local revert-buffer-function #'codeql--graph-revert))
+  (setq-local revert-buffer-function #'codeql--graph-revert)
+  (codeql--follow-source-setup))
 
 (defun codeql--show-graph (dot-path &optional nodes query-buffer)
   "Show the graph of the dot file at DOT-PATH in a `codeql-graph-mode' buffer.
@@ -6610,7 +6723,8 @@ graph is shown as set by `codeql-graph-format'."
             codeql--graph-nodes nodes
             codeql--org-query-buffer query-buffer)
       (codeql--graph-render)
-      (switch-to-buffer-other-window (current-buffer)))))
+      (switch-to-buffer-other-window (current-buffer))
+      (codeql--graph-follow))))
 
 (defun codeql--process-ast (json src-filename src-root src-buffer)
   ;; only allow this to be called as part of a templated flow

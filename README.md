@@ -519,6 +519,8 @@ It is left as a matter of user preference whether to invoke `codeql-xref-backend
 
 Just like the vscode extension, `emacs-codeql` lets you browse the AST of a database source archive file. Similar to the other results buffers, the AST is rendered as an org-mode tree. You can invoke the AST viewer with `M-x RET codeql-view-ast RET` for a database source archive file.
 
+Moving point in the source file highlights its node in the AST viewer, and moving point in the AST viewer shows the source of the node at point in another window, highlighted with `codeql-follow-source-face`, like the CFG viewer below. `codeql-ast-sync-highlighting` turns both off.
+
 ### Graph results and the CFG Viewer
 
 Results of `@kind graph` queries are interpreted as graphviz dot files with `codeql bqrs interpret --format=dot` and shown in a `codeql-graph-mode` buffer. The viewing format is set by `codeql-graph-format`: an `svg` (the default) or `png` image rendered by graphviz's `dot`, a `text` diagram, or `nil` for the dot source. When `dot` is not installed or the frame can't show images, e.g. in a terminal, the graph is drawn as text.
@@ -536,6 +538,8 @@ The text diagram is drawn like `undo-tree-visualize`, with the edges running dow
 ```
 
 `n`/`p` (or `C-n`/`C-p`) move the selection `x` to the next node and back the way you came, `C-f`/`C-b` move to the node beside it on the same row, `N`/`P` (or `M-n`/`M-p`) jump between the roots of the graph, the nodes no edge leads down to, and `RET` or clicking the selected node jumps to its location; `C-u RET` picks a node by label. The predecessors and successors of the selected node are listed below the diagram as buttons. With evil, `j`/`k`/`l`/`h` move like `n`/`p`/`C-f`/`C-b`, and `J`/`K` like `N`/`P`.
+
+As the selection moves, the source location of the selected node is shown in another window, without leaving the diagram, and highlighted with `codeql-follow-source-face`. Set `codeql-graph-follow-source` to nil to turn this off.
 
 `M-x RET codeql-view-cfg RET` shows the control flow graph of the function at point in a database source archive file, like the vscode extension's CFG viewer. It runs the printCfg query of the database language's library pack, which is available for e.g. C/C++, C#, Java, Python, Ruby and Swift. For JavaScript, which ships no printCfg query, `emacs-codeql` uses its own bundled query from the `queries` directory, so make sure your package recipe includes it (e.g. `:files (:defaults "bin" "queries")`).
 
