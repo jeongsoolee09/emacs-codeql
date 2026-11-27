@@ -5887,7 +5887,11 @@ returned by `codeql--dot-edges' and the :rows of its diagram as returned
 by `codeql--graph-text-layout'.  Its :places are the (ROW . LANE) of the
 nodes and :back the successors their edges point back up to, vectors by
 dot node id, and its :roots the nodes no edge leads down the diagram to,
-from top to bottom.  It is nil until the graph is first shown as text.")
+from top to bottom.  Only the nodes that aren't collapsed are part of
+the diagram, see `codeql--graph-visible': :all-predecessors are the
+predecessors of all the nodes, and :collapsed an alist of the shown
+collapsed nodes and the number of nodes they hide.  It is nil until the
+graph is first shown as text.")
 
 (defvar-local codeql--graph-compact nil
   "Non-nil when the rows of a text graph diagram show short node labels.
@@ -5910,6 +5914,11 @@ see `codeql--graph-text-short-label'.")
 
 (defvar-local codeql--graph-selected nil
   "The dot node id of the selected node of a text graph diagram.")
+
+(defvar-local codeql--graph-collapsed nil
+  "The dot node ids of the collapsed nodes of a text graph diagram.
+
+See `codeql-graph-toggle-collapse'.")
 
 (defvar-local codeql--graph-trail nil
   "The nodes selected before `codeql--graph-selected', most recent first.
@@ -6321,24 +6330,88 @@ point BACK up to, which aren't drawn."
       (setf (nth 2 (car rows)) nil))
     (nreverse rows)))
 
-(defun codeql--graph-text-graph (dot-path)
+(defun codeql--graph-visible (successors predecessors collapsed)
+  "Return the bool vector of the nodes of a graph that aren't collapsed.
+
+SUCCESSORS and PREDECESSORS are vectors of the lists of successors and
+predecessors of the nodes, by dot node id.  A node is hidden when it
+can't be reached from the nodes without predecessors, or from those on
+cycles no such node leads to, without going through one of the
+COLLAPSED nodes.  In a tree, those are the subtrees of the COLLAPSED
+nodes."
+  (let* ((count (length successors))
+         (visible (make-bool-vector count nil))
+         (reached (make-bool-vector count nil))
+         (walk (lambda (starts seen stop)
+                 (let ((stack starts))
+                   (dolist (start starts) (aset seen start t))
+                   (while stack
+                     (let ((id (pop stack)))
+                       (unless (memq id stop)
+                         (dolist (next (aref successors id))
+                           (unless (aref seen next)
+                             (aset seen next t)
+                             (push next stack)))))))))
+         (starts (cl-loop for id below count
+                          unless (cl-remove id (aref predecessors id))
+                          collect id)))
+    (funcall walk starts reached nil)
+    ;; the nodes on cycles no node without predecessors leads to, by id
+    (dotimes (id count)
+      (unless (aref reached id)
+        (push id starts)
+        (funcall walk (list id) reached nil)))
+    (funcall walk starts visible collapsed)
+    visible))
+
+(defun codeql--graph-text-graph (dot-path &optional collapsed)
   "Return the text diagram of the dot file at DOT-PATH, or nil.
 
 See `codeql--graph-text'.  This is nil when the nodes of DOT-PATH aren't
-numbered from 0, see `codeql--dot-node-labels'."
+numbered from 0, see `codeql--dot-node-labels'.  The descendants of the
+COLLAPSED nodes are left out, see `codeql--graph-visible'."
   (when-let ((labels (codeql--dot-node-labels dot-path)))
     (let* ((count (length labels))
-           (edges (cl-remove-if-not (lambda (edge)
-                                      (and (< (car edge) count) (< (nth 1 edge) count)))
-                                    (codeql--dot-edges dot-path)))
-           (successors (make-vector count nil))
-           (predecessors (make-vector count nil)))
-      (dolist (edge (reverse edges))
-        (cl-pushnew (nth 1 edge) (aref successors (car edge)))
-        (cl-pushnew (car edge) (aref predecessors (nth 1 edge))))
-      (let* ((rows (codeql--graph-text-layout successors))
+           (all-edges (cl-remove-if-not (lambda (edge)
+                                          (and (< (car edge) count) (< (nth 1 edge) count)))
+                                        (codeql--dot-edges dot-path)))
+           (all-successors (make-vector count nil))
+           (all-predecessors (make-vector count nil)))
+      (dolist (edge (reverse all-edges))
+        (cl-pushnew (nth 1 edge) (aref all-successors (car edge)))
+        (cl-pushnew (car edge) (aref all-predecessors (nth 1 edge))))
+      (let* ((visible (codeql--graph-visible all-successors all-predecessors collapsed))
+             (shown (cl-loop for id below count when (aref visible id) collect id))
+             (edges (cl-remove-if-not (lambda (edge)
+                                        (and (aref visible (car edge))
+                                             (aref visible (nth 1 edge))))
+                                      all-edges))
+             (filter (lambda (ids) (cl-remove-if-not (lambda (id) (aref visible id)) ids)))
+             (successors (vconcat (mapcar filter all-successors)))
+             (predecessors (vconcat (mapcar filter all-predecessors)))
+             ;; the layout is of the shown nodes only, renumbered from 0
+             (ids (vconcat shown))
+             (index (make-vector count nil))
+             (rows (progn
+                     (cl-loop for id across ids for new from 0 do (aset index id new))
+                     (mapcar
+                      (lambda (row)
+                        (cons (mapcar (pcase-lambda (`(,id ,lane ,up))
+                                        (list (aref ids id) lane
+                                              (mapcar (lambda (id) (aref ids id)) up)))
+                                      (car row))
+                              (cdr row)))
+                      (codeql--graph-text-layout
+                       (vconcat (mapcar (lambda (id)
+                                          (mapcar (lambda (next) (aref index next))
+                                                  (aref successors id)))
+                                        shown))))))
              (places (make-vector count nil))
              (back (make-vector count nil))
+             (hidden (cl-loop for id in collapsed
+                              when (aref visible id)
+                              collect (cons id (codeql--graph-hidden-below
+                                                id all-successors visible))))
              roots)
         (cl-loop for row in rows for index from 0 do
                  (pcase-dolist (`(,id ,lane ,up) (car row))
@@ -6359,10 +6432,28 @@ numbered from 0, see `codeql--dot-node-labels'."
               :edges edges
               :successors successors
               :predecessors predecessors
+              :all-predecessors all-predecessors
+              :collapsed hidden
               :rows rows
               :places places
               :back back
               :roots (nreverse roots))))))
+
+(defun codeql--graph-hidden-below (id successors visible)
+  "Return the number of hidden nodes the node ID leads to.
+
+SUCCESSORS is the vector of the successors of all the nodes, and VISIBLE
+the bool vector of `codeql--graph-visible'."
+  (let ((seen (make-bool-vector (length successors) nil))
+        (stack (list id))
+        (count 0))
+    (while stack
+      (dolist (next (aref successors (pop stack)))
+        (unless (or (aref seen next) (aref visible next))
+          (aset seen next t)
+          (setq count (1+ count))
+          (push next stack))))
+    count))
 
 (defun codeql--graph-text-label (id &optional width)
   "Return the label of the node with dot node ID, truncated to WIDTH."
@@ -6429,6 +6520,7 @@ This is the [TYPE] of AST node labels like \"[TYPE] text\", after the
                                  "   \\[codeql-graph-next-root]/\\[codeql-graph-previous-root] root"
                                  "   \\[codeql-graph-visit-node] visit"
                                  "   \\[codeql-graph-search] search"
+                                 "   \\[codeql-graph-toggle-collapse] collapse"
                                  "   \\[codeql-graph-cycle-format] format"
                                  "   \\[quit-window] quit"))
                         'face 'shadow)
@@ -6474,6 +6566,7 @@ labels of the nodes of a row follow the diagram from left to right."
         (cl-loop for (id lane back) in nodes
                  for first = t then nil
                  for selected = (eql id codeql--graph-selected)
+                 for hidden = (alist-get id (plist-get codeql--graph-text :collapsed))
                  for location = (codeql--graph-text-location id)
                  for help = (format "%s\n%s" (codeql--graph-text-label id)
                                     (or location "No location"))
@@ -6488,6 +6581,9 @@ labels of the nodes of a row follow the diagram from left to right."
                                        'face (and selected 'codeql-graph-selected-face)
                                        'mouse-face 'highlight
                                        'help-echo help)
+                           (if hidden
+                               (propertize (format " [+%d]" hidden) 'face 'codeql-graph-node-face)
+                             "")
                            (if shown-location
                                (propertize (concat "  " shown-location) 'face 'shadow)
                              "")
@@ -6502,6 +6598,12 @@ labels of the nodes of a row follow the diagram from left to right."
                  (let ((mark (+ start 2 (* 2 lane))))
                    (put-text-property mark (1+ mark) 'help-echo help)
                    (put-text-property mark (1+ mark) 'face 'codeql-graph-node-face)
+                   (when (and hidden (not selected))
+                     (save-excursion
+                       (goto-char mark)
+                       (delete-char 1)
+                       (insert (propertize "+" 'face 'codeql-graph-node-face
+                                           'codeql-graph-node id 'help-echo help))))
                    (when selected
                      (setq target mark)
                      (save-excursion
@@ -6531,14 +6633,78 @@ labels of the nodes of a row follow the diagram from left to right."
 (defun codeql--graph-select (id &optional trail)
   "Select the node with dot node ID of the text diagram, after TRAIL.
 
-TRAIL is the new `codeql--graph-trail'."
-  (setq codeql--graph-selected id
-        codeql--graph-trail trail)
+TRAIL is the new `codeql--graph-trail'.  A node hidden by a collapsed
+node selects the nearest node shown above it, see
+`codeql-graph-toggle-collapse'."
+  (setq codeql--graph-selected (codeql--graph-shown-node id)
+        codeql--graph-trail (cl-remove-if-not #'codeql--graph-shown-p trail))
   (let ((inhibit-read-only t))
     (erase-buffer)
     (codeql--graph-insert-text)
     (set-buffer-modified-p nil))
   (codeql--graph-follow))
+
+(defun codeql--graph-shown-p (id)
+  "Return non-nil when the node ID is shown in the text diagram."
+  (aref (plist-get codeql--graph-text :places) id))
+
+(defun codeql--graph-shown-node (id)
+  "Return the node ID, or the nearest node shown above it when it's hidden.
+
+Hidden nodes are found from the nodes their predecessors collapse, see
+`codeql--graph-visible'."
+  (if (codeql--graph-shown-p id)
+      id
+    (let ((predecessors (plist-get codeql--graph-text :all-predecessors))
+          (seen (list id))
+          (queue (list id))
+          found)
+      (while (and queue (not found))
+        (dolist (previous (aref predecessors (pop queue)))
+          (unless (or found (memq previous seen))
+            (push previous seen)
+            (if (codeql--graph-shown-p previous)
+                (setq found previous)
+              (setq queue (append queue (list previous)))))))
+      (or found id))))
+
+(defun codeql--graph-recollapse (collapsed)
+  "Show the text diagram with the COLLAPSED nodes, keeping the selection."
+  (let ((selected codeql--graph-selected)
+        (trail codeql--graph-trail))
+    (setq codeql--graph-collapsed collapsed
+          codeql--graph-text (codeql--graph-text-graph codeql--graph-dot-path collapsed))
+    (codeql--graph-select selected trail)))
+
+(defun codeql-graph-toggle-collapse ()
+  "Collapse the nodes below the selected node of a text diagram, or expand them.
+
+A collapsed node is drawn as a `+', its label followed by the number of
+nodes it hides.  These are the nodes that can only be reached through
+it, its subtree in an AST."
+  (interactive)
+  (unless (codeql--graph-text-p)
+    (user-error "Nodes are only collapsed in text diagrams"))
+  (let ((id codeql--graph-selected))
+    (if (memq id codeql--graph-collapsed)
+        (codeql--graph-recollapse (remq id codeql--graph-collapsed))
+      (let ((collapsed (cons id codeql--graph-collapsed)))
+        (unless (> (alist-get id (plist-get (codeql--graph-text-graph
+                                             codeql--graph-dot-path collapsed)
+                                            :collapsed)
+                              0)
+                   0)
+          (user-error "No nodes to collapse below %s" (codeql--graph-text-label id 40)))
+        (codeql--graph-recollapse collapsed)))))
+
+(defun codeql-graph-expand-all ()
+  "Expand all the collapsed nodes of a text diagram."
+  (interactive)
+  (unless (codeql--graph-text-p)
+    (user-error "Nodes are only collapsed in text diagrams"))
+  (unless codeql--graph-collapsed
+    (user-error "No collapsed nodes"))
+  (codeql--graph-recollapse nil))
 
 (defun codeql--graph-follow ()
   "Show and highlight the source of the selected node of a text graph diagram.
@@ -6834,7 +7000,7 @@ nil."
             codeql--graph-format format))
     (when (equal format "text")
       (unless codeql--graph-text
-        (setq codeql--graph-text (codeql--graph-text-graph dot-path)))
+        (setq codeql--graph-text (codeql--graph-text-graph dot-path codeql--graph-collapsed)))
       (unless codeql--graph-text
         (setq format nil
               codeql--graph-format nil
@@ -7000,6 +7166,8 @@ Image formats are skipped when they can't be rendered or shown."
     (define-key map (kbd "M-p") #'codeql-graph-previous-root)
     (define-key map (kbd "s") #'codeql-graph-search)
     (define-key map (kbd "/") #'codeql-graph-search)
+    (define-key map (kbd "TAB") #'codeql-graph-toggle-collapse)
+    (define-key map [backtab] #'codeql-graph-expand-all)
     (define-key map [remap next-line] #'codeql-graph-next)
     (define-key map [remap previous-line] #'codeql-graph-previous)
     (define-key map [remap forward-char] #'codeql-graph-forward)
@@ -7022,6 +7190,10 @@ Image formats are skipped when they can't be rendered or shown."
                     "f" #'codeql-graph-cycle-format
                     "/" #'codeql-graph-search
                     "s" #'codeql-graph-search
+                    (kbd "TAB") #'codeql-graph-toggle-collapse
+                    [backtab] #'codeql-graph-expand-all
+                    "za" #'codeql-graph-toggle-collapse
+                    "zR" #'codeql-graph-expand-all
                     (kbd "RET") #'codeql-graph-visit-node
                     "gr" #'revert-buffer
                     "q" #'quit-window))
@@ -7037,6 +7209,8 @@ In a text diagram, \\[codeql-graph-next] and \\[codeql-graph-previous] move to a
 predecessor of the selected node, \\[codeql-graph-forward] and \\[codeql-graph-backward] move to the
 nodes beside it, on the other branches, \\[codeql-graph-next-root] and \\[codeql-graph-previous-root] jump between the
 roots of the graph, and \\[codeql-graph-visit-node] visits it, like in `undo-tree-visualize'.
+\\[codeql-graph-toggle-collapse] collapses the nodes below the selected node, like a subtree of
+an AST, or expands them again, \\[codeql-graph-expand-all] expands them all.
 The source of the selected node is shown and highlighted in another window,
 see `codeql-graph-follow-source'.
 
@@ -7061,6 +7235,7 @@ graph is shown as set by `codeql-graph-format', with the short labels of
             codeql--graph-text nil
             codeql--graph-selected nil
             codeql--graph-trail nil
+            codeql--graph-collapsed nil
             codeql--graph-format codeql-graph-format
             codeql--graph-nodes nodes
             codeql--graph-compact compact
