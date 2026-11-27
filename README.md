@@ -165,7 +165,7 @@ For example, you can open `vscode-codeql-starter/codeql-custom-queries-ruby/exam
 
 ### Writing and Running Queries
 
-Edit a `.ql` or `.qll` file inside a `qlpack.yml` project root and run `M-x codeql-transient-query-server-interact` to open the `emacs-codeql` transient. This transient is bound to the value of `codeql-transient-binding` on initialization, which may be customized by the user by setting `codeql-transient-binding` to a keybinding of their liking.
+Edit a `.ql` or `.qll` file inside a `qlpack.yml` project root, start a query server with `M-x codeql-query-server-start`, register a database with `M-x codeql-query-server-register-database`, and run the query with `M-x codeql-query-server-run-query`. Both setup steps are also on the control panel (`codeql-transient-binding`, `C-c C-d` by default), and the query commands are in `codeql-command-map` (`codeql-command-binding`, `C-c C-q` by default), see [Commands](#commands). Running a query before a server is started or a database registered fails with a message saying which one is missing.
 
 #### Syntax highlighting and indentation
 
@@ -185,7 +185,7 @@ In org documents, `#+begin_src codeql` and `#+begin_src ql` blocks use this mode
 
 #### Database selection
 
-You can register a database for your current project via `M-x codeql-transient-query-server-interact` and selecting `d` to register an active database. Ensure you have started a query server first by using `s` from the same menu. If a database is active in another query buffer, it will automatically be deregistered there and registered for your current buffer.
+You can register a database for your current project with `M-x codeql-query-server-register-database`, or `d` on the control panel. Start a query server first, with `M-x codeql-query-server-start` or `s` on the control panel. If a database is active in another query buffer, it will automatically be deregistered there and registered for your current buffer.
 
 Database selection is per project by default (see [Sharing a query server](#sharing-a-query-server-across-query-and-library-files)), and you can run as many concurrent query projects as you have resources available.
 
@@ -225,13 +225,13 @@ Query servers are disposed of manually: killing the last buffer that uses a serv
 (setq codeql-share-query-server nil)      ; one server per buffer
 ```
 
-Select `i` (inherit) in the transient of a buffer without a query server to share the server, active database and query history of any other query buffer on the same host, whatever its project.
+Select `i` (inherit) on the control panel of a buffer without a query server to share the server, active database and query history of any other query buffer on the same host, whatever its project.
 
-`M-x codeql-query-server-start` starts a query server without the transient, with the options in `codeql-query-server-default-args`; with a prefix argument it opens the transient to pick the options.
+`M-x codeql-query-server-start` starts a query server with the options in `codeql-query-server-default-args`; with a prefix argument it opens a transient to pick the options.
 
 #### Managing query servers
 
-`M-x codeql-query-servers` (`m` in the transient) lists the running query servers, those of the current project first and the one of the current buffer first of all. Each is annotated with its active database, the number of query buffers that use it (or `detached` when none does) and how long it has been running. After picking one, choose an action: `b` to switch to one of its buffers, `r` to restart it, `k` to shut it down, `e` for its JSON-RPC events, `l` for its stderr, or `u` to use it in the current buffer. The actions are also commands of their own: `codeql-query-server-switch-to-buffer`, `codeql-query-server-restart`, `codeql-query-server-shutdown`, `codeql-query-server-events-buffer`, `codeql-query-server-stderr-buffer` and `codeql-query-server-use`. `codeql-query-server-shutdown-all` shuts down all of them.
+`M-x codeql-query-servers` (`m` on the control panel) lists the running query servers, those of the current project first and the one of the current buffer first of all. Each is annotated with its active database, the number of query buffers that use it (or `detached` when none does) and how long it has been running. After picking one, choose an action: `b` to switch to one of its buffers, `r` to restart it, `k` to shut it down, `e` for its JSON-RPC events, `l` for its stderr, or `u` to use it in the current buffer. The actions are also commands of their own: `codeql-query-server-switch-to-buffer`, `codeql-query-server-restart`, `codeql-query-server-shutdown`, `codeql-query-server-events-buffer`, `codeql-query-server-stderr-buffer` and `codeql-query-server-use`. `codeql-query-server-shutdown-all` shuts down all of them.
 
 Restarting a server starts a new one with the same options, used by the same buffers, which keep their query history, and registers their database again.
 
@@ -245,9 +245,9 @@ If there is an active region, `emacs-codeql` will attempt to quick-eval that reg
 
 If there is no active region, `emacs-codeql` will attempt to run the full query by default.
 
-The `e` (quick eval) transient command, `codeql-query-server-quick-eval`, always quick evaluates: the active region if there is one, and otherwise the predicate or expression at point, e.g. with point on the name of a predicate. The `n` (quick eval count) command, `codeql-query-server-quick-eval-count`, does the same but only counts the results, which is much faster for predicates with many tuples. The counts are shown as a table of the total number of tuples and the distinct values of each column. Quick evaluation counts need the `query-server2` query server.
+The `e` (quick eval) command of `codeql-command-map`, `codeql-query-server-quick-eval`, always quick evaluates: the active region if there is one, and otherwise the predicate or expression at point, e.g. with point on the name of a predicate. The `n` (quick eval count) command, `codeql-query-server-quick-eval-count`, does the same but only counts the results, which is much faster for predicates with many tuples. The counts are shown as a table of the total number of tuples and the distinct values of each column. Quick evaluation counts need the `query-server2` query server.
 
-The `p` (quick eval predicate) transient command, `codeql-query-server-quick-eval-predicate`, quick evaluates the predicate enclosing point, so point can be anywhere in its parameters or body rather than on its name. In a class, the characteristic predicate and member predicates are evaluated the same way. Outside of any predicate, e.g. in the select clause, it runs the whole query instead. With an active region it behaves like `e`.
+The `p` (quick eval predicate) command, `codeql-query-server-quick-eval-predicate`, quick evaluates the predicate enclosing point, so point can be anywhere in its parameters or body rather than on its name. In a class, the characteristic predicate and member predicates are evaluated the same way. Outside of any predicate, e.g. in the select clause, it runs the whole query instead. With an active region it behaves like `e`.
 
 #### Result rendering
 
@@ -333,13 +333,13 @@ Locations that span a whole file open that file at the top, and locations withou
 
 #### Comparing query results
 
-`codeql-query-history-compare` (`C` in the query server transient) compares the results of two runs from the query history, e.g. of two versions of the same query. It prompts for the two runs, which must be on the active database and have result sets with the same names and number of columns. Problem and path-problem results can only be compared with each other.
+`codeql-query-history-compare` (`C` in `codeql-command-map`) compares the results of two runs from the query history, e.g. of two versions of the same query. It prompts for the two runs, which must be on the active database and have result sets with the same names and number of columns. Problem and path-problem results can only be compared with each other.
 
 The rows only found in the first run and those only found in the second run are computed by `codeql bqrs diff` and shown side by side in two results buffers, named after the runs they came from. These work like any other results buffer, so problem results are rendered as org trees and raw results as tables that can be sorted and paged. The echo area summarizes how many rows each side has to itself.
 
 #### Loading SARIF files
 
-`codeql-load-sarif` (`l` in the query server transient) renders an existing SARIF file, e.g. the output of `codeql database analyze` or a code scanning run, like the results of a problem or path-problem query, with pagination, alert navigation and diagnostics.
+`codeql-load-sarif` (`l` in `codeql-command-map`) renders an existing SARIF file, e.g. the output of `codeql database analyze` or a code scanning run, like the results of a problem or path-problem query, with pagination, alert navigation and diagnostics.
 
 When the query buffer has an active database, result locations are taken to be files of its source archive, so that they work with the database source archive xref backend like regular results. With a prefix argument, or without an active database, they are taken to be files of a source checkout instead, which is prompted for when the SARIF has relative locations that its `originalUriBaseIds` don't resolve. Locations missing from the checkout whose contents are embedded in the SARIF (`codeql database analyze --sarif-add-file-contents`) are shown from a read-only copy of those contents.
 
@@ -354,7 +354,7 @@ When the SARIF records the repository and revision it was produced for in its `v
 
 #### Multi-repository variant analysis
 
-`codeql-mrva` (`v` in the query server transient) browses the results of [gh-mrva](https://github.com/GitHubSecurityLab/gh-mrva) sessions, which you submit with `gh mrva submit`. Install the extension with `gh extension install GitHubSecurityLab/gh-mrva`.
+`codeql-mrva` (`v` in `codeql-command-map`) browses the results of [gh-mrva](https://github.com/GitHubSecurityLab/gh-mrva) sessions, which you submit with `gh mrva submit`. Install the extension with `gh extension install GitHubSecurityLab/gh-mrva`.
 
 After picking a session, its repositories with findings are listed in a `codeql-mrva-mode` buffer, along with their finding and star counts. `RET` downloads the results of the repository at point below `codeql-state-dir` and renders them for the query buffer `codeql-mrva` was called from, like `codeql-load-sarif` does. `g` refreshes the status of the session. The source files of result locations are fetched from GitHub with `gh api` as you visit them, at the revision that was analyzed, and `codeql-copy-permalink` works on them too. Results of queries that aren't problem or path-problem queries are shown decoded.
 
@@ -362,7 +362,7 @@ The `Query Source` section of variant analysis results holds the whole query as 
 
 #### Query performance
 
-Each query run writes a structured evaluator log next to its results (set `codeql-evaluator-log` to `nil` to turn this off; it needs query-server2). `codeql-query-performance` (`t` in the query server transient) summarizes the log of a run from the query history with `codeql generate log-summary` and lists the predicates that were computed, the slowest first, in an org table with their time, tuple count, number of iterations and evaluation strategy. The header shows the total evaluation time and how many predicates came from the cache. Predicate names link to their definitions, `C-c C-a` shows the relational algebra of the predicate at point together with its iteration deltas, and the table can be sorted by any column with `org-table-sort-lines` (`C-c ^`). Only the `codeql-performance-max-predicates` (default: 300) slowest predicates are listed.
+Each query run writes a structured evaluator log next to its results (set `codeql-evaluator-log` to `nil` to turn this off; it needs query-server2). `codeql-query-performance` (`t` in `codeql-command-map`) summarizes the log of a run from the query history with `codeql generate log-summary` and lists the predicates that were computed, the slowest first, in an org table with their time, tuple count, number of iterations and evaluation strategy. The header shows the total evaluation time and how many predicates came from the cache. Predicate names link to their definitions, `C-c C-a` shows the relational algebra of the predicate at point together with its iteration deltas, and the table can be sorted by any column with `org-table-sort-lines` (`C-c ^`). Only the `codeql-performance-max-predicates` (default: 300) slowest predicates are listed.
 
 `codeql-query-performance-compare` (`T`) matches the computed predicates of two runs by name and lists the time and tuples of each run, the largest difference in time first. Predicates that were taken from the cache in one of the runs show `-` for that run.
 
@@ -513,7 +513,7 @@ Alternatively, any invocation of the default `xref-find-references` or `xref-fin
 
 It is left as a matter of user preference whether to invoke `codeql-xref-backend` themselves, or to deal with a single layer of indirection and wait for one of the xref API to invoke it for them.
 
-`codeql-database-grep` (`g` in the query server transient) searches the source archive of the active database for a regexp and lists the matches in an xref buffer. With a prefix argument it prompts for a wildcard to restrict the searched files, e.g. `*.java`. Archive files visited from those matches are set up like ones opened from a result buffer, so the codeql xref backend is available in them right away.
+`codeql-database-grep` (`g` in `codeql-command-map`) searches the source archive of the active database for a regexp and lists the matches in an xref buffer. With a prefix argument it prompts for a wildcard to restrict the searched files, e.g. `*.java`. Archive files visited from those matches are set up like ones opened from a result buffer, so the codeql xref backend is available in them right away.
 
 ### AST Viewer
 
@@ -551,13 +551,42 @@ There is AST xref support bound to `M->` in any database source file that also h
 
 ### Commands
 
-All query server interaction for your query buffer routes via an intuitive `transient` interface. You can configure which keybinding is associated with starting this interface via the `codeql-transient-binding` variable.
+The control panel, a `transient` bound to `codeql-transient-binding` (default `C-c C-d`) in query buffers, shows the query server and active database of the buffer and manages them and other settings:
 
-This interface is self-documenting and allows you to start/stop query servers, select databases, run queries, and fetch query history.
+| Key | Command |
+|-----|---------|
+| `s` | start (with server options) or stop the query server |
+| `i` | inherit the query server of another query buffer |
+| `m` | manage the running query servers |
+| `d` | register a database |
+| `k` | pick a known database from the history |
+| `u` | remove a stale database lock |
+| `P` | max paths of path problem results |
+| `D` | `codeql-doctor` |
 
-Otherwise hidden features such as max path depths for path queries are unobtrusively surfaced to the user.
+It doesn't run anything. Queries are run with the commands of `codeql-command-map`, bound to `codeql-command-binding` (default `C-c C-q`, set it to `nil` to bind the commands yourself):
 
-`codeql-doctor` (`D` in the transient, or `M-x codeql-doctor` from any buffer) reports on the health of your setup, much like Neovim's `:checkhealth`: the tree-sitter and eglot support, the CodeQL CLI and its version, the gh codeql extension, configured search paths, the external tools (`unzip`, `zipinfo`, graphviz `dot`) on the host of the current buffer, and the query server, database and language server state of the current query buffer.
+| Key | Command |
+|-----|---------|
+| `r` | `codeql-query-server-run-query` |
+| `e` | `codeql-query-server-quick-eval` |
+| `p` | `codeql-query-server-quick-eval-predicate` |
+| `n` | `codeql-query-server-quick-eval-count` |
+| `c` | `codeql-query-server-cancel-query` |
+| `h` | `codeql-query-history` |
+| `C` | `codeql-query-history-compare` |
+| `t` | `codeql-query-performance` |
+| `T` | `codeql-query-performance-compare` |
+| `l` | `codeql-load-sarif` |
+| `v` | `codeql-mrva` |
+| `f` | `codeql-database-open-source-archive-file` |
+| `g` | `codeql-database-grep` |
+| `R` | `codeql-repl` |
+| `E` | `codeql-repl-send-region` |
+
+Commands that need a query server or a database fail with a message naming the command that sets it up.
+
+`codeql-doctor` (`D` on the control panel, or `M-x codeql-doctor` from any buffer) reports on the health of your setup, much like Neovim's `:checkhealth`: the tree-sitter and eglot support, the CodeQL CLI and its version, the gh codeql extension, configured search paths, the external tools (`unzip`, `zipinfo`, graphviz `dot`) on the host of the current buffer, and the query server, database and language server state of the current query buffer.
 
 ### Paginated results
 

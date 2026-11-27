@@ -1536,11 +1536,43 @@ an alist from argument lists to results."
     (nreverse keys)))
 
 (ert-deftest codeql-ported-test-transient-keys ()
-  "Each command of the query server menu has a key of its own."
+  "The control panel manages the server and database, it runs no queries."
   (let ((keys (codeql-ported-test--transient-keys
                'codeql-transient-query-server-interact)))
-    (should (member "p" keys))
+    (should (member "s" keys))
+    (should (member "d" keys))
+    (should-not (member "r" keys))
+    (should-not (member "e" keys))
     (should (equal (seq-uniq keys) keys))))
+
+(ert-deftest codeql-ported-test-command-map ()
+  "Queries run from `codeql-command-map'."
+  (should (eq (lookup-key codeql-command-map "r") #'codeql-query-server-run-query))
+  (should (eq (lookup-key codeql-command-map "p")
+              #'codeql-query-server-quick-eval-predicate)))
+
+(ert-deftest codeql-ported-test-run-without-server-or-database ()
+  "Running a query without a server or database fails with a user error."
+  (with-temp-buffer
+    (setq major-mode 'ql-tree-sitter-mode)
+    (let ((codeql--query-server nil)
+          (codeql--active-database nil))
+      (dolist (command '(codeql-query-server-run-query
+                         codeql-query-server-quick-eval
+                         codeql-query-server-quick-eval-predicate
+                         codeql-query-server-quick-eval-count
+                         codeql-database-open-source-archive-file))
+        (let ((err (should-error (call-interactively command) :type 'user-error)))
+          (should (string-match-p "No query server" (cadr err)))))
+      (should (string-match-p
+               "No query server"
+               (cadr (should-error (codeql-query-server-register-database "/tmp")
+                                   :type 'user-error))))
+      (setq codeql--query-server 'stub)
+      (let ((err (should-error (codeql-query-server-run-query) :type 'user-error)))
+        (should (string-match-p "No database registered" (cadr err))))))
+  (with-temp-buffer
+    (should-error (codeql-query-server-run-query) :type 'user-error)))
 
 (ert-deftest codeql-ported-test-lsp-single-server ()
   (require 'eglot)

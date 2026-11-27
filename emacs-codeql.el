@@ -270,13 +270,22 @@ See `codeql-ast-sync-highlighting' and `codeql-graph-follow-source'."
   "Query server compile/run timeout in seconds.
 
 Normally we do not timeout, since queries can be long running.
-Users may cancel queries instead through the transient UI."
+Users may cancel queries instead with `codeql-query-server-cancel-query'."
   :type 'integer
   :group 'emacs-codeql)
 
 (defcustom codeql-transient-binding "C-c C-d"
-  "The keybinding to start the emacs-codeql transient UI."
+  "The keybinding of the emacs-codeql control panel in QL buffers.
+
+The control panel, `codeql-transient-query-server-interact', manages the
+query server, database and settings of the buffer.  Queries are run with
+the commands of `codeql-command-map' instead."
   :type 'key-sequence
+  :group 'emacs-codeql)
+
+(defcustom codeql-command-binding "C-c C-q"
+  "The prefix key of `codeql-command-map' in QL buffers, or nil for none."
+  :type '(choice (const :tag "None" nil) key-sequence)
   :group 'emacs-codeql)
 
 (defcustom codeql-enable-xrefs t
@@ -2010,10 +2019,7 @@ and GVFS is running, otherwise the archive is extracted instead."
   (interactive (list (read-file-name "Database or database archive: " nil default-directory t)))
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
 
-  ;; if no server is running yet, offer to start one
-  (unless codeql--query-server
-    (transient-setup 'codeql-transient-query-server-init-start)
-    (error "No query server running, please start one and re-select database."))
+  (codeql--require-query-server)
 
   ;; the cli doesn't expand ~ and resolves relative paths against the query
   (setq database-path (expand-file-name database-path))
@@ -7852,7 +7858,7 @@ DEFERRED-SPEC is the key of its deferred action."
 (defun codeql-query-server-cancel-query ()
   "Cancel a currently active query."
   (interactive)
-  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (codeql--require-query-buffer)
   (if (and codeql--query-server-jsonrpc-current-id
            codeql--query-server-jsonrpc-current-deferred
            codeql--query-server-jsonrpc-current-connection)
@@ -8387,29 +8393,50 @@ outcome, see `codeql--query-result-handler'."
      provenance
      codeql--query-result-handler)))
 
+(defun codeql--require-query-buffer ()
+  "Signal a `user-error' unless the current buffer is a QL buffer."
+  (unless (eq major-mode 'ql-tree-sitter-mode)
+    (user-error "Not a QL buffer: %s" (buffer-name))))
+
+(defun codeql--require-query-server ()
+  "Signal a `user-error' unless the current QL buffer has a query server."
+  (codeql--require-query-buffer)
+  (unless codeql--query-server
+    (user-error "%s"
+                (substitute-command-keys
+                 "No query server for this buffer; start one with \\[codeql-query-server-start]"))))
+
+(defun codeql--require-database ()
+  "Signal a `user-error' unless the current QL buffer can run queries.
+
+That is, it has a query server and an active database."
+  (codeql--require-query-server)
+  (unless codeql--active-database
+    (user-error "%s"
+                (substitute-command-keys
+                 "No database registered for this buffer; register one with \\[codeql-query-server-register-database]"))))
+
 (defun codeql-query-server-run-query (&optional quick-eval)
   "Run a query or quick eval a query region.
 
 With QUICK-EVAL, quick evaluate the region or what is at point even when
 no region is active, see `codeql--query-target'."
   (interactive)
-  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (codeql--require-database)
   ;; init the query history if need be
   (unless codeql--completed-query-history
     (setq codeql--completed-query-history (make-hash-table :test #'equal)))
-  (if codeql--query-server
-      (let* ((query-path (buffer-file-name))
-             (quick-eval (or quick-eval (if (use-region-p) t nil))))
-        (when (and (eq quick-eval 'count)
-                   (string= codeql-query-server "query-server"))
-          (user-error "Quick evaluation counts need query-server2"))
-        ;; make sure we save the query before running it
-        (when (or codeql--run-query-always-save
-                  (and (buffer-modified-p)
-                       (y-or-n-p "Query was not saved prior to evaluation, save now?")))
-          (save-buffer))
-        (codeql--query-server-run-query-from-path query-path quick-eval))
-    (message "No query server started.")))
+  (let* ((query-path (buffer-file-name))
+         (quick-eval (or quick-eval (if (use-region-p) t nil))))
+    (when (and (eq quick-eval 'count)
+               (string= codeql-query-server "query-server"))
+      (user-error "Quick evaluation counts need query-server2"))
+    ;; make sure we save the query before running it
+    (when (or codeql--run-query-always-save
+              (and (buffer-modified-p)
+                   (y-or-n-p "Query was not saved prior to evaluation, save now?")))
+      (save-buffer))
+    (codeql--query-server-run-query-from-path query-path quick-eval)))
 
 (defun codeql-query-server-quick-eval ()
   "Quick evaluate the active region, or the predicate or expression at point.
@@ -8455,7 +8482,7 @@ Unlike `codeql-query-server-quick-eval', point can be anywhere in the
 predicate, not just on its name.  Outside of any predicate, e.g. in the
 select clause, the whole query runs."
   (interactive)
-  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (codeql--require-query-buffer)
   (cond ((use-region-p)
          (codeql-query-server-run-query t))
         ((codeql--enclosing-predicate-name-position)
@@ -10023,7 +10050,7 @@ When another buffer of the same project already has a query server, and
 (defun codeql-database-open-source-archive-file ()
   "Open a file from the active database source archive."
   (interactive)
-  (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  (codeql--require-database)
   (if (and codeql--database-source-archive-root
            codeql--database-source-archive-zip)
       (let* ((relative-file-path
@@ -10069,7 +10096,7 @@ them are set up like those of result locations, see
 the FILES wildcard to search, which defaults to all files."
   (interactive
    (progn
-     (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+     (codeql--require-database)
      (list (read-regexp "Search database source for regexp: " 'find-tag-default-as-regexp)
            (when current-prefix-arg
              (read-string "In files matching wildcard: " "*")))))
@@ -10089,60 +10116,89 @@ the FILES wildcard to search, which defaults to all files."
            (user-error "No matches for %s in the database source archive" regexp)))
      nil)))
 
-(transient-define-prefix codeql-transient-query-server-interact ()
-  "Interact with a CodeQL query server via transient menu."
-  [:class transient-columns
-          ["Server"
-           ("s" codeql-transient-query-server-init
-            :description
-            (lambda ()
-              (cond ((not codeql--query-server) "start")
-                    ((codeql--query-server-buffers codeql--query-server (current-buffer))
-                     "stop (shared)")
-                    (t "stop"))))
-           ("i" "inherit" codeql-query-server-inherit)
-           ("m" "manage" codeql-query-servers)]
-          ["Database"
-           ("d" codeql-query-server-register-database
-            :description
-            (lambda ()
-              (codeql-query-server-active-database)))
-           ("f" "file" codeql-database-open-source-archive-file)
-           ("g" "grep" codeql-database-grep)
-           ("k" "known" codeql-database-history)
-           ("u" "unlock" codeql-database-delete-lock)]
-          ["Query"
-           ("r" "run" codeql-query-server-run-query)
-           ("e" "quick eval" codeql-query-server-quick-eval)
-           ("p" "quick eval predicate" codeql-query-server-quick-eval-predicate)
-           ("n" "quick eval count" codeql-query-server-quick-eval-count)
-           ("h" "history" codeql-query-history)
-           ("C" "compare" codeql-query-history-compare)
-           ("l" "load sarif" codeql-load-sarif)
-           ("v" "variant analysis" codeql-mrva)
-           ("t" "performance" codeql-query-performance)
-           ("T" "compare performance" codeql-query-performance-compare)
-           ("c" "cancel" codeql-query-server-cancel-query)
-           ("R" "REPL" codeql-repl)
-           ("E" "eval in REPL" codeql-repl-send-region)]
-          ["Config"
-           ("P" codeql-set-max-paths
-            :description
-            (lambda ()
-              (format "--max-paths=%s"
-                      codeql--path-problem-max-paths)))
-           ("D" "doctor" codeql-doctor)]]
-  (interactive)
-  (when (eq major-mode 'ql-tree-sitter-mode)
-    (with-current-buffer (current-buffer)
-      (transient-setup 'codeql-transient-query-server-interact))))
+(defun codeql--control-panel-status ()
+  "Return the status lines of the control panel of the current QL buffer."
+  (let ((server codeql--query-server))
+    (list
+     (format "Server:   %s"
+             (cond ((not server) (propertize "not running" 'face 'warning))
+                   ((codeql--query-server-buffers server (current-buffer))
+                    (format "%s (shared)" codeql-query-server))
+                   (t codeql-query-server)))
+     (format "Database: %s"
+             (if codeql--active-database
+                 (format "%s (%s)"
+                         (abbreviate-file-name codeql--active-database)
+                         (or codeql--active-database-language "?"))
+               (propertize "none" 'face 'warning))))))
 
-;; make this prefix  available in our ql mode
-(add-hook 'ql-tree-sitter-mode-hook
-          (lambda ()
-            (local-set-key
-             (kbd codeql-transient-binding)
-             #'codeql-transient-query-server-interact)))
+(transient-define-prefix codeql-transient-query-server-interact ()
+  "Control panel of the query server, database and settings of a QL buffer.
+
+Queries are run with the commands of `codeql-command-map', which fail
+with a message saying what to set up here when a query server or
+database is missing."
+  [:description
+   (lambda () (string-join (codeql--control-panel-status) "\n"))
+   :class transient-columns
+   ["Server"
+    ("s" codeql-transient-query-server-init
+     :description
+     (lambda ()
+       (cond ((not codeql--query-server) "start")
+             ((codeql--query-server-buffers codeql--query-server (current-buffer))
+              "stop (shared)")
+             (t "stop"))))
+    ("i" "inherit" codeql-query-server-inherit)
+    ("m" "manage" codeql-query-servers)]
+   ["Database"
+    ("d" codeql-query-server-register-database
+     :description
+     (lambda ()
+       (if codeql--active-database "change" "register")))
+    ("k" "known" codeql-database-history)
+    ("u" "unlock" codeql-database-delete-lock)]
+   ["Config"
+    ("P" codeql-set-max-paths
+     :description
+     (lambda ()
+       (format "--max-paths=%s"
+               codeql--path-problem-max-paths)))
+    ("D" "doctor" codeql-doctor)]]
+  (interactive)
+  (codeql--require-query-buffer)
+  (transient-setup 'codeql-transient-query-server-interact))
+
+(defvar codeql-command-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map "r" #'codeql-query-server-run-query)
+    (define-key map "e" #'codeql-query-server-quick-eval)
+    (define-key map "p" #'codeql-query-server-quick-eval-predicate)
+    (define-key map "n" #'codeql-query-server-quick-eval-count)
+    (define-key map "c" #'codeql-query-server-cancel-query)
+    (define-key map "h" #'codeql-query-history)
+    (define-key map "C" #'codeql-query-history-compare)
+    (define-key map "t" #'codeql-query-performance)
+    (define-key map "T" #'codeql-query-performance-compare)
+    (define-key map "l" #'codeql-load-sarif)
+    (define-key map "v" #'codeql-mrva)
+    (define-key map "f" #'codeql-database-open-source-archive-file)
+    (define-key map "g" #'codeql-database-grep)
+    (define-key map "R" #'codeql-repl)
+    (define-key map "E" #'codeql-repl-send-region)
+    map)
+  "Keymap of the commands that run queries in QL buffers.
+
+It is bound to `codeql-command-binding' in QL buffers.")
+
+(defun codeql--install-bindings ()
+  "Bind the control panel and `codeql-command-map' in the QL buffer."
+  (local-set-key (kbd codeql-transient-binding)
+                 #'codeql-transient-query-server-interact)
+  (when codeql-command-binding
+    (local-set-key (kbd codeql-command-binding) codeql-command-map)))
+
+(add-hook 'ql-tree-sitter-mode-hook #'codeql--install-bindings)
 
 ;;; Sessions
 
