@@ -10586,9 +10586,16 @@ When another buffer of the same project already has a query server, and
   (setq codeql--path-problem-max-paths max-paths))
 
 (defun codeql--database-open-file (filename)
+  "Visit FILENAME of the active database source archive.
+
+The file is associated with the current query buffer, so that e.g.
+`codeql-view-ast' and `codeql-view-cfg' work in it."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
-  (when-let ((src-buffer (find-file filename)))
+  (when-let ((query-buffer (current-buffer))
+             (src-buffer (find-file filename)))
     (with-current-buffer src-buffer
+      (setq codeql--org-query-buffer query-buffer)
+      (setq buffer-read-only t)
       ;; enable our xref backend, this kicks in templated queries for refs and defs
       (codeql-xref-backend))))
 
