@@ -1212,6 +1212,86 @@ OUTPUT is called with the arguments when it is a function."
         (should (eq (get-text-property (+ (point) 2) 'face) 'codeql-graph-node-face))
         (should (eq (get-text-property (+ (point) 5) 'face) 'codeql-graph-selected-face))))))
 
+;; collapsing
+(ert-deftest codeql-ported-test-graph-visible ()
+  "Nodes only reached through collapsed nodes are hidden."
+  (let ((successors [(1 2) (3 4) nil nil nil])
+        (predecessors [nil (0) (0) (1) (1)]))
+    (should (equal (codeql--graph-visible successors predecessors nil)
+                   (bool-vector t t t t t)))
+    (should (equal (codeql--graph-visible successors predecessors '(1))
+                   (bool-vector t t t nil nil)))
+    (should (equal (codeql--graph-visible successors predecessors '(0 1))
+                   (bool-vector t nil nil nil nil))))
+  ;; a node joined from outside stays, and cycles start from their lowest id
+  (should (equal (codeql--graph-visible [(1 2) (3) (3) nil] [nil (0) (0) (1 2)] '(1))
+                 (bool-vector t t t t)))
+  (should (equal (codeql--graph-visible [(1) (0 2) nil] [(1) (0) (1)] '(1))
+                 (bool-vector t t nil))))
+
+(ert-deftest codeql-ported-test-graph-collapse ()
+  "Subtrees collapse into their root and expand again."
+  (codeql-ported-test--with-temp-dir dir
+    (let ((dot (codeql-ported-test--write
+                (concat dir "g.dot")
+                (concat "digraph {\n"
+                        "  0[\"label\"=\"root\"; ];\n  1[\"label\"=\"left\"; ];\n"
+                        "  2[\"label\"=\"right\"; ];\n  3[\"label\"=\"leaf one\"; ];\n"
+                        "  4[\"label\"=\"leaf two\"; ];\n"
+                        "  0 -> 1[];\n  0 -> 2[];\n  1 -> 3[];\n  1 -> 4[];\n}\n")))
+          (codeql-graph-format "text")
+          (codeql-graph-follow-source nil))
+      (codeql-ported-test--with-graph-buffer dot nil
+        (codeql-graph-next)
+        (should (eql codeql--graph-selected 1))
+        (codeql-graph-toggle-collapse)
+        (should (equal codeql--graph-collapsed '(1)))
+        (should (eql codeql--graph-selected 1))
+        (should (string-match-p "left \\[\\+2\\]" (buffer-string)))
+        (should-not (string-match-p "leaf" (buffer-string)))
+        (should (equal (codeql--graph-search-order) '(0 1 2)))
+        (should-not (codeql--graph-search-find "leaf" 0 0))
+        ;; the collapsed node is drawn as a +
+        (codeql--graph-select 0)
+        (goto-char (point-min))
+        (should (search-forward "+" nil t))
+        (should (eql (get-text-property (1- (point)) 'codeql-graph-node) 1))
+        ;; selecting a hidden node selects the node it's collapsed into
+        (codeql--graph-select 4 '(3 0))
+        (should (equal (list codeql--graph-selected codeql--graph-trail) '(1 (0))))
+        ;; leaves have nothing to collapse
+        (codeql--graph-select 2)
+        (should-error (codeql-graph-toggle-collapse) :type 'user-error)
+        (should (equal codeql--graph-collapsed '(1)))
+        ;; expanding shows the subtree again
+        (codeql--graph-select 1)
+        (codeql-graph-toggle-collapse)
+        (should-not codeql--graph-collapsed)
+        (should (string-match-p "leaf one" (buffer-string)))
+        (codeql--graph-select 0)
+        (codeql-graph-toggle-collapse)
+        (should (string-match-p "root \\[\\+4\\]" (buffer-string)))
+        (should (equal (codeql--graph-search-order) '(0)))
+        (codeql-graph-expand-all)
+        (should-not codeql--graph-collapsed)
+        (should (equal (codeql--graph-search-order) '(0 1 2 3 4)))
+        (should-error (codeql-graph-expand-all) :type 'user-error)))))
+
+(ert-deftest codeql-ported-test-graph-collapse-join ()
+  "Collapsing a branch keeps the nodes the other branch reaches."
+  (codeql-ported-test--with-temp-dir dir
+    (let ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--diamond-dot))
+          (codeql-graph-format "text")
+          (codeql-graph-follow-source nil))
+      (codeql-ported-test--with-graph-buffer dot codeql-ported-test--diamond-nodes
+        (codeql-graph-next)
+        (should (eql codeql--graph-selected 1))
+        (should-error (codeql-graph-toggle-collapse) :type 'user-error)
+        (codeql--graph-select 0)
+        (codeql-graph-toggle-collapse)
+        (should (equal (codeql--graph-search-order) '(0)))
+        (should (equal (plist-get codeql--graph-text :collapsed) '((0 . 3))))))))
+
 (ert-deftest codeql-ported-test-graph-short-labels ()
   "Short labels are the types of AST node labels."
   (let ((codeql--graph-text
