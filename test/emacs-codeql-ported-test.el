@@ -1044,6 +1044,47 @@ OUTPUT is called with the arguments when it is a function."
           (push-button)
           (should (= codeql--graph-selected 1)))))))
 
+(ert-deftest codeql-ported-test-ast-follow-source ()
+  "Moving point in the AST viewer highlights the source of its node."
+  (codeql-ported-test--with-temp-dir dir
+    (let* ((source (codeql-ported-test--write (concat dir "a.js") "let x = f(1);\n"))
+           (src-buffer (find-file-noselect source))
+           (ast-buffer (generate-new-buffer " *codeql-ported-test-ast*"))
+           (codeql--ast-backwards-definitions (make-hash-table :test #'equal))
+           (codeql--ast-to-src-buffer (make-hash-table :test #'equal)))
+      (unwind-protect
+          (with-current-buffer ast-buffer
+            ;; start line, end line, start column, end column, AST line
+            (puthash source [[1 1 9 12 4] [1 1 1 13 3]] codeql--ast-backwards-definitions)
+            (puthash ast-buffer src-buffer codeql--ast-to-src-buffer)
+            (insert "#+AST_VIEWER: a.js\n\n* LetStmt\n** CallExpr\n** other\n")
+            (codeql--follow-source-setup)
+            (let ((highlighted
+                   (lambda ()
+                     (when-let ((overlay codeql--follow-overlay)
+                                ((overlay-buffer overlay)))
+                       (with-current-buffer (overlay-buffer overlay)
+                         (buffer-substring-no-properties (overlay-start overlay)
+                                                         (overlay-end overlay)))))))
+              (goto-char (point-min))
+              (forward-line 2)
+              (codeql--sync-ast-to-src-overlay)
+              (should (equal (funcall highlighted) "let x = f(1);"))
+              (should (eq (overlay-buffer codeql--follow-overlay) src-buffer))
+              (forward-line 1)
+              (codeql--sync-ast-to-src-overlay)
+              (should (equal (funcall highlighted) "f(1)"))
+              (forward-line 1)
+              (codeql--sync-ast-to-src-overlay)
+              (should-not (funcall highlighted))
+              (forward-line -1)
+              (codeql--sync-ast-to-src-overlay)
+              (let ((overlay codeql--follow-overlay))
+                (kill-buffer ast-buffer)
+                (should-not (overlay-buffer overlay)))))
+        (when (buffer-live-p ast-buffer) (kill-buffer ast-buffer))
+        (kill-buffer src-buffer)))))
+
 (ert-deftest codeql-ported-test-graph-follow-source ()
   "The source of the selected node of a text diagram is shown highlighted."
   (codeql-ported-test--with-temp-dir dir
@@ -1059,7 +1100,7 @@ OUTPUT is called with the arguments when it is a function."
       (codeql-ported-test--with-graph-buffer dot nodes
         (let ((highlighted
                (lambda ()
-                 (when-let ((overlay codeql--graph-source-overlay)
+                 (when-let ((overlay codeql--follow-overlay)
                             ((overlay-buffer overlay)))
                    (with-current-buffer (overlay-buffer overlay)
                      (buffer-substring-no-properties (overlay-start overlay)
@@ -1068,8 +1109,8 @@ OUTPUT is called with the arguments when it is a function."
               (let ((window (selected-window)))
                 (codeql--graph-follow)
                 (should (equal (funcall highlighted) "if (x)"))
-                (should (eq (overlay-get codeql--graph-source-overlay 'face)
-                            'codeql-graph-source-face))
+                (should (eq (overlay-get codeql--follow-overlay 'face)
+                            'codeql-follow-source-face))
                 (should (get-buffer-window (get-file-buffer source)))
                 ;; the graph keeps the focus
                 (should (eq (selected-window) window))
@@ -1093,7 +1134,7 @@ OUTPUT is called with the arguments when it is a function."
                   (should-not (funcall highlighted)))
                 (codeql--graph-select 1)
                 (should (funcall highlighted))
-                (let ((overlay codeql--graph-source-overlay))
+                (let ((overlay codeql--follow-overlay))
                   (kill-buffer (current-buffer))
                   (should-not (overlay-buffer overlay))))
             (when (get-file-buffer source)
