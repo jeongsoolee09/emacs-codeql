@@ -862,6 +862,13 @@ OUTPUT is called with the arguments when it is a function."
           (should (equal codeql--graph-format "text"))
           (should (string-prefix-p "  x  a b" (buffer-string))))))))
 
+(ert-deftest codeql-ported-test-graph-mode-image-winprops ()
+  "Graph buffers keep the window state image scrolling needs."
+  (with-temp-buffer
+    (codeql-graph-mode)
+    (should (listp image-mode-winprops-alist))
+    (should (listp (image-mode-winprops)))))
+
 (ert-deftest codeql-ported-test-graph-insert-image ()
   "Rendered graphs are shown as images with a clickable map of their nodes."
   (skip-unless (and (executable-find "dot") (display-graphic-p)

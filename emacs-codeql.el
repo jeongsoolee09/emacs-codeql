@@ -7157,6 +7157,7 @@ Image formats are skipped when they can't be rendered or shown."
 (declare-function image-scroll-down "image-mode")
 (declare-function image-bob "image-mode")
 (declare-function image-eob "image-mode")
+(declare-function image-mode-setup-winprops "image-mode")
 
 (defvar codeql-graph-image-map
   (let ((map (make-sparse-keymap)))
@@ -7235,6 +7236,8 @@ see `codeql-graph-follow-source'.
 
 \\{codeql-graph-mode-map}"
   (require 'image-mode)
+  ;; image scrolling keeps per window state, see `image-mode-winprops'
+  (image-mode-setup-winprops)
   (setq truncate-lines t)
   (setq-local revert-buffer-function #'codeql--graph-revert)
   (codeql--follow-source-setup))
