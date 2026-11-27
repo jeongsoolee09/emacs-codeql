@@ -1144,6 +1144,62 @@ OUTPUT is called with the arguments when it is a function."
               (kill-buffer "*codeql-graph: ast-a.js*"))
             (delete-directory codeql--ast-graph-directory t)))))))
 
+(ert-deftest codeql-ported-test-graph-search ()
+  "Node labels are searched incrementally, down the diagram."
+  (codeql-ported-test--with-temp-dir dir
+    (let ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--diamond-dot))
+          (codeql-graph-format "text")
+          (codeql-graph-follow-source nil))
+      (codeql-ported-test--with-graph-buffer dot codeql-ported-test--diamond-nodes
+        (should (equal (codeql--graph-search-order) '(0 1 2 3)))
+        (should (eql (codeql--graph-search-find "e" 0 0) 1))
+        (should (eql (codeql--graph-search-find "e" 1 0) 1))
+        (should (eql (codeql--graph-search-find "e" 1 1) 2))
+        ;; wrapping around, and up
+        (should (eql (codeql--graph-search-find "e" 2 1) 1))
+        (should (eql (codeql--graph-search-find "e" 1 -1) 2))
+        ;; upper case input is case sensitive
+        (should (eql (codeql--graph-search-find "JOIN" 0 0) nil))
+        (should (eql (codeql--graph-search-find "Join" 0 0) nil))
+        (should (eql (codeql--graph-search-find "join" 0 0) 3))
+        (should-not (codeql--graph-search-find "" 0 0))
+        ;; typing selects the first match, C-s the next one
+        (let ((codeql--graph-search-buffer (current-buffer))
+              (input "e"))
+          (cl-letf (((symbol-function 'minibuffer-contents-no-properties)
+                     (lambda () input))
+                    ((symbol-function 'minibuffer-message) #'ignore))
+            (with-temp-buffer
+              (codeql--graph-search-update 0)
+              (should (eql (buffer-local-value 'codeql--graph-selected
+                                               codeql--graph-search-buffer)
+                           1))
+              (codeql-graph-search-forward)
+              (should (eql (buffer-local-value 'codeql--graph-selected
+                                               codeql--graph-search-buffer)
+                           2)))))
+        ;; the search ends on the match, and p goes back to where it started
+        (codeql--graph-select 0)
+        (cl-letf (((symbol-function 'read-from-minibuffer)
+                   (lambda (&rest _) (codeql--graph-select 3) "join")))
+          (codeql-graph-search))
+        (should (equal (list codeql--graph-selected codeql--graph-trail) '(3 (0))))
+        (should (equal codeql--graph-search-string "join"))
+        ;; quitting goes back to where the search started
+        (cl-letf (((symbol-function 'read-from-minibuffer)
+                   (lambda (&rest _) (codeql--graph-select 1) (signal 'quit nil))))
+          (should (eq (condition-case nil (progn (codeql-graph-search) 'done)
+                        (quit 'quit))
+                      'quit)))
+        (should (equal (list codeql--graph-selected codeql--graph-trail) '(3 (0))))
+        ;; an empty input repeats the last search
+        (setq codeql--graph-search-string "e")
+        (cl-letf (((symbol-function 'read-from-minibuffer) (lambda (&rest _) "")))
+          (codeql-graph-search)
+          (should (eql codeql--graph-selected 1))
+          (setq codeql--graph-search-string "nothing")
+          (should-error (codeql-graph-search) :type 'user-error))))))
+
 (ert-deftest codeql-ported-test-graph-text-faces ()
   "Nodes are bold, and the selected node and its label stand out."
   (codeql-ported-test--with-temp-dir dir
