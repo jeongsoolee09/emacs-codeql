@@ -5831,10 +5831,10 @@ from top to bottom.  It is nil until the graph is first shown as text.")
 (defvar-local codeql--graph-compact nil
   "Non-nil when the rows of a text graph diagram show short node labels.
 
-Dense graphs like ASTs are drawn with the node types, like [IfStmt], in
-place of their nodes, without locations, while the header line and the
-description below the diagram show the full label and location of the
-selected node, see `codeql--graph-text-short-label'.")
+Dense graphs like ASTs list the node types of their rows, like
+[IfStmt], without locations, while the header line and the description
+below the diagram show the full label and location of the selected node,
+see `codeql--graph-text-short-label'.")
 
 (defvar-local codeql--graph-selected nil
   "The dot node id of the selected node of a text graph diagram.")
@@ -6361,102 +6361,6 @@ This is the [TYPE] of AST node labels like \"[TYPE] text\", after the
                         'face 'shadow)
             "\n")))
 
-(defun codeql--graph-text-parts (rows)
-  "Return ROWS of a text diagram split into the lists of rows of its parts.
-
-An empty link line ends a part, see `codeql--graph-text-ranks'."
-  (let (parts part)
-    (dolist (row rows)
-      (push row part)
-      (when (or (null (nth 2 row)) (string-empty-p (nth 2 row)))
-        (push (nreverse part) parts)
-        (setq part nil)))
-    (when part
-      (push (nreverse part) parts))
-    (nreverse parts)))
-
-(defun codeql--graph-text-widen (line widths &optional labels)
-  "Return LINE of a text diagram with each lane K as wide as WIDTHS says.
-
-The lanes of LINE are drawn at twice their index, see
-`codeql--graph-text-layout'.  LABELS is an alist of (LANE . LABEL), drawn
-instead of the `o' of their lane."
-  (let ((char (lambda (index) (if (< index (length line)) (aref line index) ?\s))))
-    (string-trim-right
-     (mapconcat
-      (lambda (k)
-        (let ((gap (funcall char (1+ (* 2 k))))
-              (label (cdr (assq k labels))))
-          (if label
-              (concat label (make-string (- (aref widths k) (length label)) gap))
-            (concat (string (funcall char (* 2 k)))
-                    (make-string (1- (aref widths k)) gap)))))
-      (number-sequence 0 (1- (length widths)))
-      ""))))
-
-(defun codeql--graph-insert-inline-rows ()
-  "Insert the rows of a text diagram with the short node labels inline.
-
-The labels of `codeql--graph-compact' graphs are drawn in place of their
-nodes, with each lane of a part as wide as its labels.  Return the
-position of the selected node."
-  (let (target)
-    (dolist (part (codeql--graph-text-parts (plist-get codeql--graph-text :rows)))
-      (let* ((count (apply #'max 1 (mapcar (lambda (row)
-                                             (/ (1+ (max (length (nth 1 row))
-                                                         (length (or (nth 2 row) ""))))
-                                                2))
-                                           part)))
-             (widths (make-vector count 2)))
-        (pcase-dolist (`(,nodes . ,_) part)
-          (pcase-dolist (`(,id ,lane . ,_) nodes)
-            (aset widths lane (max (aref widths lane)
-                                   (+ 2 (length (codeql--graph-text-short-label id)))))))
-        (let ((starts (make-vector count 0)))
-          (cl-loop for k from 1 below count
-                   do (aset starts k (+ (aref starts (1- k)) (aref widths (1- k)))))
-          (pcase-dolist (`(,nodes ,node-line ,link-line) part)
-            (let ((start (+ (point) 2)))
-              (insert "  " (codeql--graph-text-widen
-                            node-line widths
-                            (mapcar (lambda (node)
-                                      (cons (nth 1 node)
-                                            (codeql--graph-text-short-label (car node))))
-                                    nodes)))
-              ;; the diagram belongs to the node of the nearest lane
-              (cl-loop for pos from start below (point)
-                       for lane = (cl-position-if (lambda (lane-start) (<= lane-start (- pos start)))
-                                                  starts :from-end t)
-                       do (put-text-property
-                           pos (1+ pos) 'codeql-graph-node
-                           (car (cl-reduce (lambda (a b)
-                                             (if (<= (abs (- (nth 1 a) lane))
-                                                     (abs (- (nth 1 b) lane)))
-                                                 a b))
-                                           nodes))))
-              (pcase-dolist (`(,id ,lane ,back) nodes)
-                (let* ((label-start (+ start (aref starts lane)))
-                       (label-end (+ label-start (length (codeql--graph-text-short-label id))))
-                       (selected (eql id codeql--graph-selected)))
-                  (add-text-properties
-                   label-start label-end
-                   `(face ,(if selected '(:inverse-video t) 'default)
-                          mouse-face highlight
-                          help-echo ,(format "%s\n%s" (codeql--graph-text-label id)
-                                             (or (codeql--graph-text-location id) "No location"))))
-                  (when selected
-                    (setq target label-start))
-                  (when back
-                    (insert (propertize
-                             (mapconcat (lambda (other)
-                                          (format "  ^ %s" (codeql--graph-text-short-label other)))
-                                        back "")
-                             'face 'shadow 'codeql-graph-node id)))))
-              (insert "\n")
-              (when link-line
-                (insert "  " (codeql--graph-text-widen link-line widths) "\n")))))))
-    target))
-
 (defun codeql--graph-insert-text ()
   "Insert the text diagram of the graph of the current buffer.
 
@@ -6477,9 +6381,6 @@ labels of the nodes of a row follow the diagram from left to right."
          target)
     (unless codeql--graph-selected
       (setq codeql--graph-selected (car (car (car (car rows))))))
-    (when codeql--graph-compact
-      (setq target (codeql--graph-insert-inline-rows)
-            rows nil))
     (pcase-dolist (`(,nodes ,node-line ,link-line) rows)
       (let ((start (point))
             (width (pop widths))
