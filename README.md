@@ -545,6 +545,8 @@ The nodes are drawn with `codeql-graph-node-face` (bold) and the selected one, a
 
 `M-x RET codeql-view-cfg RET` shows the control flow graph of the function at point in a database source archive file, like the vscode extension's CFG viewer. It runs the printCfg query of the database language's library pack, which is available for e.g. C/C++, C#, Java, Python, Ruby and Swift. For JavaScript, which ships no printCfg query, `emacs-codeql` uses its own bundled query from the `queries` directory, so make sure your package recipe includes it (e.g. `:files (:defaults "bin" "queries")`).
 
+`M-x codeql-results-path-graph` in a results buffer shows the paths of the path-problem result at point as a graph, with its sources at the top and its sink at the bottom. Steps at the same location are a single node, so you can see where the paths of a result part ways and join again. With point on a step of a path, its node is selected.
+
 ![screenshot](img/codeql-ast-viewer.png?raw=true "emacs-codeql")
 
 There is AST xref support bound to `M->` in any database source file that also has an active AST viewer buffer open.

@@ -554,6 +554,72 @@ sent, and `codeql-load-bqrs' pushes (:loaded BQRS-PATH PROVENANCE)."
       (should (= (length alerts) 2))
       (should (= (length (codeql--alert-locations (aref alerts 0))) 2)))))
 
+;;; Path graphs
+
+(defconst codeql-test--paths-results
+  (concat "* Results\n:PROPERTIES:\n:CODEQL_KIND: results\n:END:\n"
+          "** ≔ [js/xss] XSS ... [[codeql:/a/src/app.js::3:5][app.js]]:3:5\n"
+          ":PROPERTIES:\n:CODEQL_KIND: result\n:CODEQL_QUERY_KIND: path-problem\n:END:\n"
+          "*** Path #0\n"
+          "   1. src [[codeql:/a/src/db.js::7:1][req.query]]      [[codeql:/a/src/db.js::7:1][db.js]]:7:1\n"
+          "   2. ... [[codeql:/a/src/db.js::8:3][name]]           [[codeql:/a/src/db.js::8:3][db.js]]:8:3\n"
+          "   3. snk [[codeql:/a/src/app.js::3:5][html]]          [[codeql:/a/src/app.js::3:5][app.js]]:3:5\n"
+          "*** Path #1\n"
+          "   1. src [[codeql:/a/src/db.js::9:1][req.body]]       [[codeql:/a/src/db.js::9:1][db.js]]:9:1\n"
+          "   2. ... [[codeql:/a/src/db.js::8:3][name]]           [[codeql:/a/src/db.js::8:3][db.js]]:8:3\n"
+          "   3. ... [[codeql:/a/src/db.js::8:3][name]]           [[codeql:/a/src/db.js::8:3][db.js]]:8:3\n"
+          "   4. snk [[codeql:/a/src/app.js::3:5][html]]          [[codeql:/a/src/app.js::3:5][app.js]]:3:5\n"
+          "** ≔ [js/sql] SQL ... [[codeql:/a/src/db.js::10:2][db.js]]:10:2\n"
+          ":PROPERTIES:\n:CODEQL_KIND: result\n:CODEQL_QUERY_KIND: problem\n:END:\n"
+          "* Results Footer\n#+QUERY_KIND: path-problem\n")
+  "A results buffer with a path-problem result whose two paths join.")
+
+(ert-deftest codeql-test-results-paths ()
+  "The paths of a result are read from its Path headings."
+  (with-temp-buffer
+    (insert codeql-test--paths-results)
+    (codeql-results-mode)
+    (let* ((alert (aref (codeql--results-alerts) 0))
+           (paths (codeql--results-paths (codeql--alert-start alert)
+                                         (codeql--alert-end alert))))
+      (should (equal (mapcar (lambda (path) (mapcar #'cdr path)) paths)
+                     '(("req.query" "name" "html") ("req.body" "name" "name" "html"))))
+      (should (equal (car (car (car paths))) "/a/src/db.js::7:1"))
+      (pcase-let ((`(,nodes . ,edges) (codeql--paths-to-graph paths)))
+        ;; shared steps are one node, and repeated steps no loop
+        (should (equal (mapcar #'car nodes) '("req.query" "name" "html" "req.body")))
+        (should (equal (mapcar #'cdr nodes)
+                       '("/a/src/db.js::7:1" "/a/src/db.js::8:3"
+                         "/a/src/app.js::3:5" "/a/src/db.js::9:1")))
+        (should (equal edges '((0 . 1) (1 . 2) (3 . 1))))))))
+
+(ert-deftest codeql-test-results-path-graph ()
+  "The paths of the result at point are shown as a graph."
+  (with-temp-buffer
+    (insert codeql-test--paths-results)
+    (codeql-results-mode)
+    (let (shown selected)
+      (cl-letf (((symbol-function 'codeql--show-graph)
+                 (lambda (dot-path nodes &rest _)
+                   (setq shown (list (with-temp-buffer
+                                       (insert-file-contents dot-path)
+                                       (buffer-string))
+                                     nodes))))
+                ((symbol-function 'get-buffer) (lambda (_) (current-buffer)))
+                ((symbol-function 'codeql--graph-text-p) (lambda () t))
+                ((symbol-function 'codeql--graph-select) (lambda (id) (setq selected id))))
+        ;; on the second path's step shared with the first one
+        (goto-char (point-min))
+        (re-search-forward "req\\.body")
+        (forward-line 1)
+        (codeql-results-path-graph)
+        (should (string-match-p "3 -> 1;" (car shown)))
+        (should (= (length (nth 1 shown)) 4))
+        (should (eql selected 1))
+        ;; a result without paths
+        (re-search-forward "js/sql")
+        (should-error (codeql-results-path-graph) :type 'user-error)))))
+
 ;;; Escaping
 
 (ert-deftest codeql-test-escaping ()

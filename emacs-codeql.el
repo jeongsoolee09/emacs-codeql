@@ -6885,6 +6885,129 @@ graph is shown as set by `codeql-graph-format', with the short labels of
       (switch-to-buffer-other-window (current-buffer))
       (codeql--graph-follow))))
 
+(defvar codeql--path-graph-directory nil
+  "The directory of the dot files of `codeql-results-path-graph'.")
+
+(defun codeql--results-paths (start end)
+  "Return the paths of the path-problem result from START to END.
+
+Each path is a list of its steps, (LINK . LABEL) conses, from source to
+sink.  LINK is the codeql: link path of the location of the step, or nil
+when it has none, and LABEL its message.  POSITION, the start of the
+line of the step, is kept as the `codeql-path-step' text property of
+LABEL."
+  (let (paths path in-path)
+    (save-excursion
+      (goto-char start)
+      (while (< (point) end)
+        (cond
+         ((looking-at-p "\\*+ +Path #")
+          (when path (push (nreverse path) paths))
+          (setq path nil in-path t))
+         ((and in-path (looking-at "[ \t]*[0-9]+\\. +\\S-+ +\\(.*\\)$"))
+          (let* ((links (codeql--line-links))
+                 (label (if links
+                            (nth 1 (car links))
+                          (codeql--diagnostics-text (match-string-no-properties 1)))))
+            (push (cons (car (car links))
+                        (propertize (string-trim label)
+                                    'codeql-path-step (line-beginning-position)))
+                  path))))
+        (forward-line 1))
+      (when path (push (nreverse path) paths)))
+    (nreverse paths)))
+
+(defun codeql--paths-to-graph (paths)
+  "Return the graph of PATHS, as (NODES . EDGES).
+
+PATHS are as returned by `codeql--results-paths'.  Steps at the same
+location are the same node, so the paths share their common steps.
+NODES is a list of (LABEL . LINK) conses, numbered from 0 in the order
+they first appear, and EDGES a list of (FROM . TO) node numbers."
+  (let ((ids (make-hash-table :test #'equal))
+        (count 0)
+        nodes edges)
+    (dolist (path paths)
+      (let (previous)
+        (pcase-dolist (`(,link . ,label) path)
+          (let ((id (or (and link (gethash link ids))
+                        (prog1 count
+                          (when link (puthash link count ids))
+                          (push (cons label link) nodes)
+                          (setq count (1+ count))))))
+            (when (and previous (/= previous id)
+                       (not (member (cons previous id) edges)))
+              (push (cons previous id) edges))
+            (setq previous id)))))
+    (cons (nreverse nodes) (nreverse edges))))
+
+(defun codeql--write-dot (dot-path nodes edges)
+  "Write the graph of NODES and EDGES to the dot file at DOT-PATH.
+
+NODES are (LABEL . LINK) conses numbered from 0, and EDGES (FROM . TO)
+node numbers."
+  (with-temp-file dot-path
+    (insert "digraph {\n")
+    (cl-loop for (label . _) in nodes for id from 0 do
+             (insert (format "%d[\"label\"=\"%s\"];\n" id
+                             (replace-regexp-in-string
+                              "[\"\\]" "\\\\\\&"
+                              (replace-regexp-in-string "[ \t\n]+" " " label)))))
+    (pcase-dolist (`(,from . ,to) edges)
+      (insert (format "%d -> %d;\n" from to)))
+    (insert "}\n")))
+
+(defun codeql-results-path-graph ()
+  "Show the paths of the path-problem result at point as a graph.
+
+Each step is a node, from the sources at the top to the sink at the
+bottom.  Steps at the same location are the same node, so where the
+paths of the result part ways and join again shows in the graph.  When
+point is on a step, its node is selected."
+  (interactive)
+  (unless (derived-mode-p 'codeql-results-mode)
+    (user-error "Not a CodeQL results buffer"))
+  (let* ((alerts (codeql--results-alerts))
+         (index (codeql--alert-at alerts (point)))
+         (alert (and (>= index 0) (aref alerts index)))
+         (paths (and alert (codeql--results-paths (codeql--alert-start alert)
+                                                  (codeql--alert-end alert))))
+         (step (save-excursion (beginning-of-line) (point)))
+         (query-buffer codeql--org-query-buffer))
+    (unless paths
+      (user-error "No path-problem result with paths at point"))
+    (unless (and codeql--path-graph-directory
+                 (file-directory-p codeql--path-graph-directory))
+      (setq codeql--path-graph-directory (make-temp-file "codeql-path-graphs-" t)))
+    (pcase-let* ((`(,nodes . ,edges) (codeql--paths-to-graph paths))
+                 (selected (cl-position step nodes
+                                        :key (lambda (node)
+                                               (get-text-property 0 'codeql-path-step
+                                                                  (car node)))))
+                 (selected
+                  (or selected
+                      ;; a step shared with an earlier path is the node of its location
+                      (when-let ((link (car (cl-find step (apply #'append paths)
+                                                     :key (lambda (s)
+                                                            (get-text-property
+                                                             0 'codeql-path-step (cdr s)))))))
+                        (cl-position link nodes :key #'cdr :test #'equal))))
+                 (name (format "paths-%s-%d"
+                               (replace-regexp-in-string
+                                "[^[:alnum:].]+" "-"
+                                (string-remove-prefix
+                                 "codeql-org-results:"
+                                 (string-trim (buffer-name) "[* ]+" "[* ]+")))
+                               (1+ index)))
+                 (dot-path (expand-file-name (concat name ".dot")
+                                             codeql--path-graph-directory)))
+      (codeql--write-dot dot-path nodes edges)
+      (codeql--show-graph dot-path nodes query-buffer)
+      (when-let ((buffer (get-buffer (format "*codeql-graph: %s*" name))))
+        (with-current-buffer buffer
+          (when (and selected (codeql--graph-text-p))
+            (codeql--graph-select selected)))))))
+
 (defun codeql--process-ast (json src-filename src-root src-buffer)
   ;; only allow this to be called as part of a templated flow
   (puthash src-filename (list json src-root) codeql--ast-cache)
