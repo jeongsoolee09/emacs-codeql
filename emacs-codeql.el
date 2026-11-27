@@ -250,15 +250,6 @@ with `codeql-follow-source-face'."
   :type 'boolean
   :group 'emacs-codeql)
 
-(defcustom codeql-follow-source-pulse t
-  "Whether the source of the node selected in a viewer flashes when shown.
-
-The source is flashed with `pulse-momentary-highlight-region' as the
-selection moves, like the AST viewer flashes the node at point, see
-`codeql-ast-sync-highlighting' and `codeql-graph-follow-source'."
-  :type 'boolean
-  :group 'emacs-codeql)
-
 (defface codeql-follow-source-face
   '((t :inherit highlight :extend nil))
   "Face of the source of the node selected in a viewer.
@@ -3935,17 +3926,14 @@ highlighted for a missing file or location."
                  (window (display-buffer buffer '(nil (inhibit-same-window . t)))))
             (move-overlay overlay beg (max beg end) buffer)
             (overlay-put overlay 'face 'codeql-follow-source-face)
-            ;; under the flash of `pulse', whose overlay has priority 1
-            (overlay-put overlay 'priority 0)
+            (overlay-put overlay 'priority 100)
             (when window
               (unless (and (pos-visible-in-window-p beg window)
                            (pos-visible-in-window-p end window))
                 (with-selected-window window
                   (goto-char beg)
                   (recenter)))
-              (set-window-point window beg)
-              (when codeql-follow-source-pulse
-                (pulse-momentary-highlight-region beg (max (1+ beg) end))))
+              (set-window-point window beg))
             overlay))))))
 
 ;; mutual highlighting at point for src/ast buffers
@@ -5842,6 +5830,17 @@ Dense graphs like ASTs list the node types of their rows, like
 below the diagram show the full label and location of the selected node,
 see `codeql--graph-text-short-label'.")
 
+(defface codeql-graph-node-face '((t :weight bold))
+  "Face of the nodes of a text graph diagram."
+  :group 'emacs-codeql)
+
+(defface codeql-graph-selected-face
+  '((((class color) (background dark)) :foreground "#ff5f5f" :weight bold)
+    (((class color) (background light)) :foreground "red2" :weight bold)
+    (t :inverse-video t :weight bold))
+  "Face of the selected node of a text graph diagram, and of its label."
+  :group 'emacs-codeql)
+
 (defvar-local codeql--graph-selected nil
   "The dot node id of the selected node of a text graph diagram.")
 
@@ -6418,7 +6417,7 @@ labels of the nodes of a row follow the diagram from left to right."
                    (insert (propertize (if codeql--graph-compact
                                            (codeql--graph-text-short-label id)
                                          (codeql--graph-text-label id label-width))
-                                       'face (and selected 'bold)
+                                       'face (and selected 'codeql-graph-selected-face)
                                        'mouse-face 'highlight
                                        'help-echo help)
                            (if shown-location
@@ -6434,12 +6433,13 @@ labels of the nodes of a row follow the diagram from left to right."
                    (put-text-property label-start (point) 'codeql-graph-node id))
                  (let ((mark (+ start 2 (* 2 lane))))
                    (put-text-property mark (1+ mark) 'help-echo help)
+                   (put-text-property mark (1+ mark) 'face 'codeql-graph-node-face)
                    (when selected
                      (setq target mark)
                      (save-excursion
                        (goto-char mark)
                        (delete-char 1)
-                       (insert (propertize "x" 'face '(:inverse-video t)
+                       (insert (propertize "x" 'face 'codeql-graph-selected-face
                                            'codeql-graph-node id 'help-echo help))))))
         (insert "\n")
         (when link-line

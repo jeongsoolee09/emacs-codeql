@@ -1094,6 +1094,18 @@ OUTPUT is called with the arguments when it is a function."
             (kill-buffer "*codeql-graph: ast-a.js*"))
           (delete-directory codeql--ast-graph-directory t))))))
 
+(ert-deftest codeql-ported-test-graph-text-faces ()
+  "Nodes are bold, and the selected node and its label stand out."
+  (codeql-ported-test--with-temp-dir dir
+    (let ((dot (codeql-ported-test--write (concat dir "g.dot") codeql-ported-test--diamond-dot))
+          (codeql-graph-format "text"))
+      (codeql-ported-test--with-graph-buffer dot codeql-ported-test--diamond-nodes
+        (codeql-graph-next)
+        (should (looking-at "x o  then"))
+        (should (eq (get-text-property (point) 'face) 'codeql-graph-selected-face))
+        (should (eq (get-text-property (+ (point) 2) 'face) 'codeql-graph-node-face))
+        (should (eq (get-text-property (+ (point) 5) 'face) 'codeql-graph-selected-face))))))
+
 (ert-deftest codeql-ported-test-graph-short-labels ()
   "Short labels are the types of AST node labels."
   (let ((codeql--graph-text
@@ -1127,26 +1139,6 @@ OUTPUT is called with the arguments when it is a function."
               (codeql--org-open-file-link (concat source "::1:5:1:5")))
             (should (eq (buffer-local-value 'codeql--org-query-buffer src-buffer)
                         query-buffer))))))))
-
-(ert-deftest codeql-ported-test-follow-source-pulse ()
-  "The source shown for the selected node of a viewer flashes."
-  (codeql-ported-test--with-temp-dir dir
-    (let* ((source (codeql-ported-test--write (concat dir "a.js") "let x = f(1);\n"))
-           (pulses nil))
-      (cl-letf (((symbol-function 'pulse-momentary-highlight-region)
-                 (lambda (beg end &rest _)
-                   (push (buffer-substring-no-properties beg end) pulses))))
-        (with-temp-buffer
-          (unwind-protect
-              (progn
-                (codeql--follow-source (list source 1 9 1 12))
-                (should (equal pulses '("f(1)")))
-                (let ((codeql-follow-source-pulse nil))
-                  (codeql--follow-source (list source 1 1 1 3)))
-                (should (equal pulses '("f(1)")))
-                (should (< (overlay-get codeql--follow-overlay 'priority) 1)))
-            (codeql--unfollow-source)
-            (kill-buffer (get-file-buffer source))))))))
 
 (ert-deftest codeql-ported-test-ast-follow-source ()
   "Moving point in the AST viewer highlights the source of its node."
