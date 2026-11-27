@@ -11111,6 +11111,7 @@ database is missing."
     (define-key map "g" #'codeql-database-grep)
     (define-key map "R" #'codeql-repl)
     (define-key map "E" #'codeql-repl-send-region)
+    (define-key map "x" #'codeql-xray)
     map)
   "Keymap of the commands that run queries in QL buffers.
 
@@ -11124,6 +11125,1572 @@ It is bound to `codeql-command-binding' in QL buffers.")
     (local-set-key (kbd codeql-command-binding) codeql-command-map)))
 
 (add-hook 'ql-tree-sitter-mode-hook #'codeql--install-bindings)
+
+;;; Query x-ray
+
+;; An x-ray of a query, like Compiler Explorer: the DIL and RA the
+;; definitions of the query compile to, beside it, each definition and its
+;; code in the same color.  The relations of the dumps are matched to the
+;; definitions by their names, so only the query is outlined, by a small
+;; tokenizer, and not the libraries it imports.
+
+(defcustom codeql-xray-layout 'columns
+  "How `codeql-xray' shows the dumps of a query.
+
+`columns' shows the query, its DIL and its RA side by side, `single'
+one dump beside the query, see `codeql-xray-kind'."
+  :type '(choice (const :tag "The query, its DIL and its RA" columns)
+                 (const :tag "One dump beside the query" single))
+  :group 'emacs-codeql)
+
+(defcustom codeql-xray-kind "DIL"
+  "The dump beside the query, or the one shown first in the single layout."
+  :type '(choice (const "DIL") (const "RA"))
+  :group 'emacs-codeql)
+
+(defface codeql-xray-1
+  '((((background light)) :background "#dbe8f6" :extend t)
+    (t :background "#1f3548" :extend t))
+  "The first color of the definitions of a query and their code."
+  :group 'emacs-codeql)
+
+(defface codeql-xray-2
+  '((((background light)) :background "#ecdff6" :extend t)
+    (t :background "#3d2a48" :extend t))
+  "The second color of the definitions of a query and their code."
+  :group 'emacs-codeql)
+
+(defface codeql-xray-3
+  '((((background light)) :background "#dcf3e4" :extend t)
+    (t :background "#21402f" :extend t))
+  "The third color of the definitions of a query and their code."
+  :group 'emacs-codeql)
+
+(defface codeql-xray-4
+  '((((background light)) :background "#f6ecd8" :extend t)
+    (t :background "#463a22" :extend t))
+  "The fourth color of the definitions of a query and their code."
+  :group 'emacs-codeql)
+
+(defface codeql-xray-5
+  '((((background light)) :background "#f7dde4" :extend t)
+    (t :background "#48262f" :extend t))
+  "The fifth color of the definitions of a query and their code."
+  :group 'emacs-codeql)
+
+(defface codeql-xray-6
+  '((((background light)) :background "#e8f3d6" :extend t)
+    (t :background "#2f3f1f" :extend t))
+  "The sixth color of the definitions of a query and their code."
+  :group 'emacs-codeql)
+
+(defconst codeql-xray--colors 6
+  "The number of colors of the definitions, `codeql-xray-1' and on.")
+
+(defface codeql-xray-active
+  '((t :inherit region :weight bold :extend t))
+  "The definition at point and its code in the x-ray."
+  :group 'emacs-codeql)
+
+(defface codeql-xray-none
+  '((t :inherit font-lock-comment-face))
+  "The notes of the definitions without code in the x-ray."
+  :group 'emacs-codeql)
+
+(cl-defstruct (codeql-xray--token (:constructor codeql-xray--token-create (v row &optional id))
+                                  (:copier nil))
+  "A token of a query: its text V, its 0-based ROW, and whether it is an ID."
+  v row id)
+
+(cl-defstruct (codeql-xray-def (:constructor codeql-xray-def-create)
+                               (:copier nil))
+  "A definition of a query.
+
+KEYS name its compiled relations, like \"M::C.p/1\", KIND is one of
+`predicate', `class', `newtype', `select' and `instance', SROW and EROW
+are its 0-based rows, and the instantiation of a parameterized module has
+its EXPR, like \"TaintTracking::Global<Config>\", and SHAPE, like
+\"Global<Config>\"."
+  keys kind name srow erow expr shape)
+
+(cl-defstruct (codeql-xray-block (:constructor codeql-xray-block-create)
+                                 (:copier nil))
+  "The 0-based lines FIRST to LAST of a dump, defining the relations NAMES."
+  first last names)
+
+(cl-defstruct (codeql-xray--span (:constructor codeql-xray--span-create)
+                                 (:copier nil))
+  "The 0-based lines FIRST to LAST of a view, showing BLOCK of DEF."
+  first last def block)
+
+(cl-defstruct (codeql-xray--fold (:constructor codeql-xray--fold-create)
+                                 (:copier nil))
+  "The COUNT blocks of the instance DEF, lines FIRST to LAST of a view."
+  def first last count overlay)
+
+(cl-defstruct (codeql-xray--view (:constructor codeql-xray--view-create)
+                                 (:copier nil))
+  "A buffer BUF showing the dump of KIND, as its LINES, SPANS and FOLDS."
+  kind buf spans lines starts comments folds)
+
+(cl-defstruct (codeql-xray (:constructor codeql-xray--create)
+                           (:copier nil))
+  "The x-ray of the query in buffer SRC."
+  src path module views defs users coded mapped blocks result error unused
+  index peeks active compiling elapsed proc map-cache timer)
+
+(defvar-local codeql-xray--state nil
+  "The x-ray of the query of this buffer, or of the one it is a view of.")
+
+(defvar-local codeql-xray--this-view nil
+  "The view of the x-ray this buffer is.")
+
+(defconst codeql-xray--not-types
+  '("and" "or" "not" "exists" "forall" "forex" "if" "then" "else" "implies"
+    "in" "instanceof" "any" "none" "count" "sum" "min" "max" "avg"
+    "strictcount" "strictsum" "rank" "concat" "strictconcat" "unique"
+    "result" "this" "super" "as" "from" "where" "select" "order" "by" "asc"
+    "desc" "import" "module" "class" "newtype" "extends" "private" "cached"
+    "pragma" "bindingset" "language" "deprecated" "abstract" "final"
+    "override" "external" "transient" "library" "query" "additional"
+    "signature" "default" "implements" "overlay" "true" "false")
+  "The words that can't be the type of a predicate.")
+
+(defconst codeql-xray--annotations
+  '("private" "cached" "deprecated" "abstract" "final" "override" "external"
+    "transient" "library" "query" "additional" "signature" "default"
+    "extensible")
+  "The annotations of definitions.")
+
+(defconst codeql-xray--bracketed-annotations
+  '("pragma" "bindingset" "language" "overlay")
+  "The annotations of definitions with arguments in brackets.")
+
+(defconst codeql-xray--clause-end
+  '("class" "module" "predicate" "import" "newtype" "private" "cached" "pragma"
+    "bindingset" "query" "deprecated" "abstract" "final" "additional"
+    "signature" "overlay" "language")
+  "The words ending the select clause of a query.")
+
+(defun codeql-xray--word-char-p (c)
+  "Return non-nil if C can be part of a QL word."
+  (or (<= ?a c ?z) (<= ?A c ?Z) (<= ?0 c ?9) (eq c ?_) (eq c ?@)))
+
+(defun codeql-xray--tokenize (lines)
+  "Return a vector of the tokens of the QL source LINES, without comments."
+  (let ((tokens nil)
+        (in-comment nil)
+        (row 0))
+    (seq-doseq (line lines)
+      (let ((i 0)
+            (n (length line)))
+        (while (< i n)
+          (if in-comment
+              (let ((e (string-search "*/" line i)))
+                (setq in-comment (not e)
+                      i (if e (+ e 2) n)))
+            (let ((c (aref line i))
+                  (two (substring line i (min n (+ i 2)))))
+              (cond
+               ((memq c '(?\s ?\t ?\n ?\r ?\f ?\v))
+                (setq i (1+ i)))
+               ((equal two "//")
+                (setq i n))
+               ((equal two "/*")
+                (setq in-comment t
+                      i (+ i 2)))
+               ((eq c ?\")
+                (let ((j (1+ i)))
+                  (while (and (< j n) (/= (aref line j) ?\"))
+                    (setq j (+ j (if (eq (aref line j) ?\\) 2 1))))
+                  (push (codeql-xray--token-create "\"\"" row) tokens)
+                  (setq i (1+ j))))
+               ((codeql-xray--word-char-p c)
+                (let ((j i))
+                  (while (and (< j n) (codeql-xray--word-char-p (aref line j)))
+                    (setq j (1+ j)))
+                  (push (codeql-xray--token-create
+                         (substring line i j) row (not (<= ?0 c ?9)))
+                        tokens)
+                  (setq i j)))
+               ((equal two "::")
+                (push (codeql-xray--token-create "::" row) tokens)
+                (setq i (+ i 2)))
+               (t
+                (push (codeql-xray--token-create (string c) row) tokens)
+                (setq i (1+ i)))))))
+        (setq row (1+ row))))
+    (vconcat (nreverse tokens))))
+
+(defun codeql-xray--closing (tokens i)
+  "Return the index of the bracket of TOKENS closing the one at index I."
+  (let* ((open (codeql-xray--token-v (aref tokens i)))
+         (close (cdr (assoc open '(("(" . ")") ("[" . "]") ("{" . "}") ("<" . ">")))))
+         (n (length tokens))
+         (depth 0)
+         (j i)
+         found)
+    (while (and (not found) (< j n))
+      (let ((v (codeql-xray--token-v (aref tokens j))))
+        (cond ((equal v open) (setq depth (1+ depth)))
+              ((equal v close)
+               (setq depth (1- depth))
+               (when (= depth 0) (setq found j)))))
+      (setq j (1+ j)))
+    (or found (1- n))))
+
+(defun codeql-xray--shapes (s)
+  "Return the shapes of the parameterized modules instantiated along S.
+
+S is a module path, like \"TaintTracking::Global<Lib::Config>::Flow::p/0\",
+and a shape is the last name of an instantiated module with the shapes of
+its arguments, like \"Global<Config>\".  Return a cons of all the shapes,
+those along S first and then those within the arguments, and the ones
+along S."
+  (let ((case-fold-search nil)
+        (i 0)
+        (n (length s))
+        (nested nil))
+    (cl-labels
+        ((path ()
+           (let ((found nil) (last nil) (result nil))
+             (while (not result)
+               (string-match "[^:<>,]*" s i)
+               (let ((name (match-string 0 s)))
+                 (setq i (match-end 0)
+                       last name)
+                 (when (and (< i n) (eq (aref s i) ?<))
+                   (setq i (1+ i))
+                   (let ((args nil) (more t))
+                     (while more
+                       (let ((inner (path)))
+                         (push (cdr inner) args)
+                         (setq nested (append nested (car inner))))
+                       (setq more (and (< i n) (eq (aref s i) ?,))
+                             i (1+ i)))
+                     (setq last (concat name "<" (string-join (nreverse args) ",") ">")
+                           found (append found (list last)))))
+                 (if (and (<= (+ i 2) n) (string= (substring s i (+ i 2)) "::"))
+                     (setq i (+ i 2))
+                   (setq result (cons found last)))))
+             result)))
+      (let ((found (car (path))))
+        (cons (append found nested) found)))))
+
+(defun codeql-xray--shape (expr)
+  "Return the shape of the instantiation of a parameterized module EXPR.
+
+Like \"Global<Config>\" for \"TaintTracking::Global<Config>\"."
+  (car (last (cdr (codeql-xray--shapes
+                   (replace-regexp-in-string "[ \t\n\r\f\v]" "" expr))))))
+
+(defun codeql-xray--outline (lines)
+  "Return the definitions of the QL source LINES, see `codeql-xray-def'."
+  (let* ((tokens (codeql-xray--tokenize lines))
+         (n (length tokens))
+         (defs nil)
+         (scopes (list (list :prefix "")))
+         (start nil)
+         (query nil)
+         (i 0))
+    (cl-labels ((tok (k) (and (<= 0 k) (< k n) (aref tokens k)))
+                (v (k) (and (tok k) (codeql-xray--token-v (aref tokens k))))
+                (row (k) (codeql-xray--token-row (aref tokens k)))
+                (add (def)
+                  (setf (codeql-xray-def-srow def) (or start (codeql-xray-def-srow def)))
+                  (push def defs)
+                  (setq start nil query nil)))
+      (while (< i n)
+        (let* ((token (aref tokens i))
+               (tv (codeql-xray--token-v token))
+               (scope (car scopes))
+               (prefix (plist-get scope :prefix))
+               (nxt (tok (1+ i))))
+          (cond
+           ((equal tv "}")
+            (when (cdr scopes) (pop scopes))
+            (setq start nil query nil i (1+ i)))
+           ((equal tv ";")
+            (setq start nil query nil i (1+ i)))
+           ((and (member tv codeql-xray--bracketed-annotations) (equal (v (1+ i)) "["))
+            (setq start (or start (row i))
+                  i (1+ (codeql-xray--closing tokens (1+ i)))))
+           ((member tv codeql-xray--annotations)
+            (setq start (or start (row i))
+                  query (or query (equal tv "query"))
+                  i (1+ i)))
+           ((equal tv "import")
+            (let ((j (1+ i)))
+              (while (and (tok j) (= (row j) (row i)))
+                (setq j (1+ j)))
+              (setq start nil query nil i j)))
+           ((and (member tv '("module" "class")) nxt (codeql-xray--token-id nxt))
+            (let ((name (codeql-xray--token-v nxt))
+                  (j (+ i 2)))
+              (while (and (tok j) (not (member (v j) '("{" ";" "="))))
+                (setq j (if (equal (v j) "<") (1+ (codeql-xray--closing tokens j)) (1+ j))))
+              (if (equal (v j) "{")
+                  (let ((key (concat prefix name))
+                        (class (equal tv "class")))
+                    (when class
+                      (add (codeql-xray-def-create
+                            :keys (list key) :kind 'class :name name :srow (row i)
+                            :erow (row (codeql-xray--closing tokens j)))))
+                    (setq start nil query nil)
+                    (push (list :prefix (concat key (if class "." "::"))
+                                :class (and class name))
+                          scopes)
+                    (setq i (1+ j)))
+                ;; an alias, like `module M = N;', or an instantiation, like
+                ;; `module F = TaintTracking::Global<Config>;'
+                (let ((from (1+ j)))
+                  (while (and (tok j) (not (equal (v j) ";")))
+                    (setq j (1+ j)))
+                  (let ((expr (mapconcat #'v (number-sequence from (1- j)) "")))
+                    (when (and (equal tv "module") (string-search "<" expr))
+                      ;; its relations are named after the instantiation
+                      ;; in the libraries, but after NAME in the query
+                      (add (codeql-xray-def-create
+                            :keys (list (concat prefix name))
+                            :kind 'instance :name name :expr expr
+                            :shape (codeql-xray--shape expr) :srow (row i)
+                            :erow (row (min j (1- n)))))))
+                  (setq start nil query nil i (1+ j))))))
+           ((and (equal tv "newtype") nxt (codeql-xray--token-id nxt))
+            (let ((def (codeql-xray-def-create
+                        :keys (list (concat prefix (codeql-xray--token-v nxt)))
+                        :kind 'newtype :name (codeql-xray--token-v nxt)
+                        :srow (row i) :erow (row i)))
+                  (j (+ i 2)))
+              (while (and (tok j)
+                          (not (member (v j) codeql-xray--clause-end))
+                          (not (member (v j) '("}" "from"))))
+                (when (and (codeql-xray--token-id (tok j))
+                           (equal (v (1+ j)) "(")
+                           (member (v (1- j)) '("=" "or")))
+                  (setf (codeql-xray-def-keys def)
+                        (append (codeql-xray-def-keys def) (list (concat prefix (v j))))))
+                (let ((last (if (member (v j) '("(" "{" "["))
+                                (codeql-xray--closing tokens j)
+                              j)))
+                  (setf (codeql-xray-def-erow def) (row last))
+                  (setq j (1+ last))))
+              (add def)
+              (setq i j)))
+           ((and (member tv '("from" "where" "select")) (null (cdr scopes)))
+            (let ((def (codeql-xray-def-create
+                        :keys (list "#select") :kind 'select :name "select"
+                        :srow (row i) :erow (row i)))
+                  (j (1+ i)))
+              (while (and (tok j) (not (member (v j) codeql-xray--clause-end)))
+                (let ((last (if (member (v j) '("(" "{" "["))
+                                (codeql-xray--closing tokens j)
+                              j)))
+                  (setf (codeql-xray-def-erow def) (row last))
+                  (setq j (1+ last))))
+              (add def)
+              (setq i j)))
+           ((and (codeql-xray--token-id token) (equal (v (1+ i)) "(") (> i 0))
+            (let* ((prev (aref tokens (1- i)))
+                   (charpred (equal (plist-get scope :class) tv))
+                   (typed (or (and (codeql-xray--token-id prev)
+                                   (not (member (codeql-xray--token-v prev)
+                                                codeql-xray--not-types)))
+                              (member (codeql-xray--token-v prev) '(">" "predicate"))))
+                   (close (codeql-xray--closing tokens (1+ i)))
+                   (after (v (1+ close))))
+              (if (and (or charpred typed) (member after '("{" ";")))
+                  (let ((arity 0) (depth 0)
+                        (end (if (equal after "{")
+                                 (codeql-xray--closing tokens (1+ close))
+                               (1+ close))))
+                    (cl-loop for j from (+ i 2) below close
+                             for t-v = (v j)
+                             do (when (= arity 0) (setq arity 1))
+                             (cond ((member t-v '("(" "<" "[")) (setq depth (1+ depth)))
+                                   ((member t-v '(")" ">" "]")) (setq depth (1- depth)))
+                                   ((and (equal t-v ",") (= depth 0)) (setq arity (1+ arity)))))
+                    (if charpred
+                        ;; a class compiles to one relation with its characteristic
+                        ;; predicate and its supertypes, so that belongs to the class
+                        (setq start nil query nil)
+                      (add (codeql-xray-def-create
+                            :keys (append (list (format "%s%s/%d" prefix tv arity))
+                                          (and query (list (concat "query:" tv))))
+                            :kind 'predicate :name tv :srow (row i) :erow (row end))))
+                    (setq i (1+ end)))
+                (setq i (1+ i)))))
+           (t (setq i (1+ i)))))))
+    (nreverse defs)))
+
+(defun codeql-xray--key (name module)
+  "Return the key of the compiled relation NAME if it comes from MODULE.
+
+Like \"C.p/1\" for \"#M::C.p/1#dispred#1234Merge\" of the query module M,
+nil for a relation of the libraries."
+  (let ((case-fold-search nil)
+        (name (string-replace "`" "" name))
+        (re (concat (regexp-quote module) "#?[[:xdigit:]]*::"))
+        (from 0)
+        (done nil)
+        (key nil))
+    (while (and (not done) (string-match re name from))
+      (let ((s (match-beginning 0))
+            (e (match-end 0)))
+        ;; the query module starts the name, but for prefixes like
+        ;; "project#", and is not a library module of the same name, like
+        ;; "Lib::Query::p"
+        (if (or (= s 0) (eq (aref name (1- s)) ?#))
+            (let ((rest (substring name e)))
+              ;; instantiations of parameterized modules
+              (while (string-match "<[^<>]*>" rest)
+                (setq rest (replace-match "" t t rest)))
+              (setq done t
+                    key (and (string-match "\\`[^#]+" rest) (match-string 0 rest))))
+          (setq from e))))
+    (cond (done key)
+          ((string-prefix-p "#select" name) "#select")
+          ((or (string-match "\\`\\([[:alnum:]_]+\\)#query" name)
+               (string-match "\\`\\([[:alnum:]_]+\\)\\'" name))
+           (concat "query:" (match-string 1 name))))))
+
+(defun codeql-xray--relation-name (line)
+  "Return the name of the relation defined by the head LINE of a dump."
+  (let ((case-fold-search nil)
+        (tick (string-search "`" line))
+        (paren (string-search "(" line)))
+    (if (and tick (or (not paren) (< tick paren)))
+        (and (string-match "`\\([^`]+\\)`" line tick) (match-string 1 line))
+      (and (string-match "\\([^ \t\n\r\f\v(]+\\)(" line) (match-string 1 line)))))
+
+(defun codeql-xray--blocks (lines kind)
+  "Return the blocks of the DIL or RA dump LINES, of KIND \"DIL\" or \"RA\".
+
+A block of the DIL is a definition, separated from the others by blank
+lines, and one of the RA a step of the plan, with all the relations of a
+recursive layer."
+  (let ((case-fold-search nil)
+        (blocks nil)
+        (current nil)
+        (i 0))
+    (seq-doseq (line lines)
+      (if (equal kind "RA")
+          (cond ((and (not (string-empty-p line))
+                      (not (string-match-p "\\`[ \t\r\f\v]" line)))
+                 (setq current (codeql-xray-block-create :first i :last i))
+                 (push current blocks))
+                ((and current (not (string-empty-p line)))
+                 (setf (codeql-xray-block-last current) i)
+                 (when (and (string-match-p "\\`  [^ \t]" line)
+                            (string-match-p ":-[ \t]*\\'" line))
+                   (setf (codeql-xray-block-names current)
+                         (append (codeql-xray-block-names current)
+                                 (list (codeql-xray--relation-name line)))))))
+        (if (string-empty-p line)
+            (setq current nil)
+          (unless current
+            (setq current (codeql-xray-block-create :first i :last i))
+            (push current blocks))
+          (setf (codeql-xray-block-last current) i)
+          (when (and (null (codeql-xray-block-names current))
+                     (not (string-match-p "\\`[ \t\r\f\v]" line))
+                     (string-search "(" line))
+            (setf (codeql-xray-block-names current)
+                  (list (codeql-xray--relation-name line))))))
+      (setq i (1+ i)))
+    (nreverse blocks)))
+
+(defun codeql-xray--lookup (by-key key)
+  "Return the definition of BY-KEY of KEY, or of the longest prefix of it."
+  (let ((case-fold-search nil)
+        (found nil))
+    (while (and (not found) key (not (string-empty-p key)))
+      (setq found (gethash key by-key))
+      (unless found
+        (setq key (cond ((string-match "\\`\\(.*\\)\\.[^.]*\\'" key) (match-string 1 key))
+                        ((string-match "\\`\\(.*\\)::[^:]*\\'" key) (match-string 1 key))))))
+    found))
+
+(defun codeql-xray--map (blocks module defs)
+  "Return the BLOCKS of a dump defining the relations of the query MODULE.
+
+Each is a cons of a block and the definition of DEFS it comes from."
+  (let ((case-fold-search nil)
+        (by-key (make-hash-table :test #'equal))
+        (by-shape (make-hash-table :test #'equal))
+        (mapped nil))
+    (dolist (def defs)
+      (dolist (key (codeql-xray-def-keys def))
+        (unless (gethash key by-key) (puthash key def by-key)))
+      (when-let* ((shape (codeql-xray-def-shape def)))
+        (unless (gethash shape by-shape) (puthash shape def by-shape))))
+    (dolist (block blocks)
+      (let ((names (codeql-xray-block-names block))
+            (def nil))
+        (while (and names (not def))
+          (let* ((name (pop names))
+                 (key (codeql-xray--key name module)))
+            (setq def (and key (codeql-xray--lookup by-key key)))
+            (when (and (not def) (> (hash-table-count by-shape) 0) (string-search "<" name))
+              ;; the relations of a module the query instantiates, named
+              ;; after the module and its fully qualified arguments
+              (dolist (shape (car (codeql-xray--shapes
+                                   (replace-regexp-in-string
+                                    "\\`[a-z_]*#" "" (string-replace "`" "" name)))))
+                (setq def (or def (gethash shape by-shape)))))))
+        (when def
+          (push (cons block def) mapped))))
+    (nreverse mapped)))
+
+(defun codeql-xray--def-at (defs row)
+  "Return the innermost definition of DEFS at the 0-based ROW."
+  (let ((best nil))
+    (dolist (def defs)
+      (when (and (<= (codeql-xray-def-srow def) row (codeql-xray-def-erow def))
+                 (or (not best)
+                     (<= (- (codeql-xray-def-erow def) (codeql-xray-def-srow def))
+                         (- (codeql-xray-def-erow best) (codeql-xray-def-srow best)))))
+        (setq best def)))
+    best))
+
+(defun codeql-xray--users (lines defs)
+  "Return the definitions of DEFS using each by name in the QL source LINES.
+
+A hash table of each definition to the innermost definitions around its
+uses, but itself."
+  (let ((by-name (make-hash-table :test #'equal))
+        (users (make-hash-table :test #'eq)))
+    (dolist (def defs)
+      (let ((name (codeql-xray-def-name def)))
+        (puthash name (append (gethash name by-name) (list def)) by-name)))
+    (seq-doseq (token (codeql-xray--tokenize lines))
+      (let* ((named (and (codeql-xray--token-id token)
+                         (gethash (codeql-xray--token-v token) by-name)))
+             (user (and named (codeql-xray--def-at defs (codeql-xray--token-row token)))))
+        (when user
+          (dolist (def named)
+            (when (or (< (codeql-xray-def-srow user) (codeql-xray-def-srow def))
+                      (> (codeql-xray-def-erow user) (codeql-xray-def-erow def)))
+              (unless (memq user (gethash def users))
+                (puthash def (append (gethash def users) (list user)) users)))))))
+    users))
+
+(defun codeql-xray--bare (name)
+  "Return the relation NAME without the prefixes, hashes and suffixes.
+
+The DIL and the RA name a relation differently by those, like \"M::p/1\"
+for \"num#M::p/1#dom#1234\"."
+  (let ((case-fold-search nil)
+        (depth 0)
+        (end nil))
+    (setq name (replace-regexp-in-string "\\`#" "" name))
+    (setq name (replace-regexp-in-string "\\`[a-z_]+#" "" name))
+    (dotimes (i (length name))
+      (let ((c (aref name i)))
+        (setq depth (+ depth (cond ((eq c ?<) 1) ((eq c ?>) -1) (t 0))))
+        (when (and (not end) (eq c ?#) (= depth 0))
+          (setq end i))))
+    (if end (substring name 0 end) name)))
+
+(defun codeql-xray--other-kind (kind)
+  "Return the kind of the dump other than KIND."
+  (if (equal kind "DIL") "RA" "DIL"))
+
+(defun codeql-xray--kinds-alist (&optional value)
+  "Return an alist of the kinds of dumps to VALUE, or to fresh hash tables."
+  (mapcar (lambda (kind)
+            (cons kind (if (eq value 'hash) (make-hash-table :test #'eq) value)))
+          '("DIL" "RA")))
+
+(defmacro codeql-xray--of (place kind)
+  "The value of KIND in the alist of kinds PLACE."
+  `(alist-get ,kind ,place nil nil #'equal))
+
+;;;; Showing the x-ray
+
+(defun codeql-xray--window (buffer)
+  "Return a window showing BUFFER, if any."
+  (and (buffer-live-p buffer) (get-buffer-window buffer t)))
+
+(defun codeql-xray--row-pos (row &optional starts)
+  "Return the position of the 0-based ROW of the current buffer.
+
+STARTS is a vector of the positions of the lines, when they're known."
+  (if (and starts (< row (length starts)))
+      (aref starts row)
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line row)
+      (point))))
+
+(defun codeql-xray--mark (buffer kind first last face priority &optional starts)
+  "Color the 0-based lines FIRST to LAST of BUFFER with FACE.
+
+The overlay is of KIND, `base' or `active', and has PRIORITY.  STARTS
+are the positions of the lines of BUFFER, when they're known."
+  (with-current-buffer buffer
+    (let ((ov (make-overlay (codeql-xray--row-pos first starts)
+                            (codeql-xray--row-pos (1+ last) starts))))
+      (overlay-put ov 'codeql-xray kind)
+      (overlay-put ov 'face face)
+      (overlay-put ov 'priority priority)
+      ov)))
+
+(defun codeql-xray--reveal (buffer row &optional starts)
+  "Scroll a window of BUFFER to the 0-based ROW when it's out of view."
+  (when-let* ((win (codeql-xray--window buffer)))
+    (with-current-buffer buffer
+      (let ((pos (codeql-xray--row-pos row starts)))
+        (unless (pos-visible-in-window-p pos win)
+          (set-window-point win pos)
+          (set-window-start win pos))))))
+
+(defun codeql-xray--comments (view)
+  "Return the comments of the code of VIEW naming instantiated modules.
+
+Each is a plist of the 0-based :row, the columns :first and :last, the
+:def of its code and the :shapes of the modules instantiated along it."
+  (or (codeql-xray--view-comments view)
+      (setf (codeql-xray--view-comments view)
+            (let ((lines (codeql-xray--view-lines view))
+                  (found nil))
+              (dolist (span (codeql-xray--view-spans view))
+                (cl-loop for row from (codeql-xray--span-first span)
+                         to (codeql-xray--span-last span)
+                         for line = (if (< row (length lines)) (aref lines row) "")
+                         do (let ((from 0))
+                              (while (string-match "/\\*\\(.*?\\)\\*/" line from)
+                                (let ((body (match-string 1 line))
+                                      (first (match-beginning 0))
+                                      (last (match-end 0)))
+                                  (when (string-search "<" body)
+                                    (push (list :row row :first first :last last
+                                                :def (codeql-xray--span-def span)
+                                                :shapes (cdr (codeql-xray--shapes
+                                                              (replace-regexp-in-string
+                                                               "[ \t]" "" body))))
+                                          found))
+                                  (setq from last))))))
+              (or (nreverse found) (list nil))))))
+
+(defun codeql-xray--clear (buffer kind)
+  "Delete the overlays of KIND of the x-ray in BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (remove-overlays nil nil 'codeql-xray kind))))
+
+(defun codeql-xray--mark-text (view row first last)
+  "Highlight the columns FIRST to LAST of the 0-based ROW of VIEW."
+  (with-current-buffer (codeql-xray--view-buf view)
+    (let* ((bol (codeql-xray--row-pos row (codeql-xray--view-starts view)))
+           (ov (make-overlay (+ bol first) (+ bol last))))
+      (overlay-put ov 'codeql-xray 'active)
+      (overlay-put ov 'face 'codeql-xray-active)
+      (overlay-put ov 'priority 5000))))
+
+(defun codeql-xray--activate (state def origin)
+  "Highlight DEF of STATE in the query and its code in every view.
+
+Reveal them in the windows but the one of ORIGIN, `source' or the view
+DEF was picked in."
+  (codeql-xray--clear (codeql-xray-src state) 'active)
+  (dolist (view (codeql-xray-views state))
+    (codeql-xray--clear (codeql-xray--view-buf view) 'active))
+  (setf (codeql-xray-active state) def)
+  (when def
+    (codeql-xray--mark (codeql-xray-src state) 'active
+                       (codeql-xray-def-srow def) (codeql-xray-def-erow def)
+                       'codeql-xray-active 5000)
+    (unless (eq origin 'source)
+      (codeql-xray--reveal (codeql-xray-src state) (codeql-xray-def-srow def)))
+    (dolist (view (codeql-xray-views state))
+      (let ((starts (codeql-xray--view-starts view))
+            (first nil))
+        (dolist (span (codeql-xray--view-spans view))
+          (when (eq (codeql-xray--span-def span) def)
+            (codeql-xray--mark (codeql-xray--view-buf view) 'active
+                               (codeql-xray--span-first span) (codeql-xray--span-last span)
+                               'codeql-xray-active 5000 starts)
+            (setq first (or first (codeql-xray--span-first span)))))
+        ;; the DIL names a class inlined into its users in the types of
+        ;; their variables
+        (let ((mentions (mapcar (lambda (key)
+                                  (format "/* %s::%s */" (codeql-xray-module state) key))
+                                (codeql-xray-def-keys def)))
+              (row 0))
+          (when mentions
+            (seq-doseq (line (codeql-xray--view-lines view))
+              (dolist (mention mentions)
+                (when-let* ((col (string-search mention line)))
+                  (codeql-xray--mark-text view row col (+ col (length mention)))
+                  (setq first (or first row))))
+              (setq row (1+ row)))))
+        ;; and the types of the modules the query instantiates, in other code
+        (when-let* ((shape (codeql-xray-def-shape def)))
+          (dolist (c (codeql-xray--comments view))
+            (when (and c (not (eq (plist-get c :def) def))
+                       (member shape (plist-get c :shapes)))
+              (codeql-xray--mark-text view (plist-get c :row)
+                                      (plist-get c :first) (plist-get c :last))
+              (setq first (or first (plist-get c :row))))))
+        (when (and first (not (eq origin view)))
+          (codeql-xray--reveal (codeql-xray--view-buf view) first starts)))))
+  (codeql-xray--refresh-folds state))
+
+(defun codeql-xray--uncoded (state def)
+  "Return the kinds of the views of STATE DEF has no code in, nor its inner ones."
+  (let ((kinds nil))
+    (dolist (view (codeql-xray-views state))
+      (let ((coded (codeql-xray--of (codeql-xray-coded state) (codeql-xray--view-kind view))))
+        (unless (cl-some (lambda (other)
+                           (and (gethash other coded)
+                                (>= (codeql-xray-def-srow other) (codeql-xray-def-srow def))
+                                (<= (codeql-xray-def-erow other) (codeql-xray-def-erow def))))
+                         (codeql-xray-defs state))
+          (push (codeql-xray--view-kind view) kinds))))
+    (nreverse kinds)))
+
+(defun codeql-xray--inlined-into (state def kinds)
+  "Return the names of the definitions of STATE DEF was inlined into.
+
+Those with code in any of KINDS, through the ones without code using it."
+  (let ((names nil)
+        (seen (list def)))
+    (cl-labels ((visit (d)
+                  (dolist (user (gethash d (codeql-xray-users state)))
+                    (unless (memq user seen)
+                      (push user seen)
+                      (let ((missing (codeql-xray--uncoded state user)))
+                        (if (cl-some (lambda (kind) (not (member kind missing))) kinds)
+                            (push (codeql-xray-def-name user) names)
+                          (visit user)))))))
+      (visit def))
+    (nreverse names)))
+
+(defun codeql-xray--colors (state)
+  "Return a hash table of the definitions of STATE with code to their colors."
+  (let ((numbers (make-hash-table :test #'eq))
+        (n 0))
+    (dolist (def (codeql-xray-defs state))
+      (when (and (not (gethash def numbers))
+                 (cl-some (lambda (kind)
+                            (gethash def (codeql-xray--of (codeql-xray-coded state) kind)))
+                          '("DIL" "RA")))
+        (puthash def (1+ (% n codeql-xray--colors)) numbers)
+        (setq n (1+ n))))
+    numbers))
+
+(defun codeql-xray--face (n)
+  "Return the face of the color number N."
+  (intern (format "codeql-xray-%d" n)))
+
+(defun codeql-xray--paint (state)
+  "Color the definitions of the query of STATE and their code in the views."
+  (let ((src (codeql-xray-src state))
+        (numbers (codeql-xray--colors state)))
+    (codeql-xray--clear src 'base)
+    (dolist (def (codeql-xray-defs state))
+      (when-let* ((n (gethash def numbers)))
+        ;; inner definitions outshine the ones around them
+        (codeql-xray--mark src 'base (codeql-xray-def-srow def) (codeql-xray-def-erow def)
+                           (codeql-xray--face n)
+                           (- 4096 (min (- (codeql-xray-def-erow def) (codeql-xray-def-srow def))
+                                        4000)))))
+    (dolist (view (codeql-xray-views state))
+      (codeql-xray--clear (codeql-xray--view-buf view) 'base)
+      (dolist (span (codeql-xray--view-spans view))
+        (when-let* ((n (and (codeql-xray--span-def span)
+                            (gethash (codeql-xray--span-def span) numbers))))
+          (codeql-xray--mark (codeql-xray--view-buf view) 'base
+                             (codeql-xray--span-first span) (codeql-xray--span-last span)
+                             (codeql-xray--face n) 100 (codeql-xray--view-starts view)))))
+    (when (codeql-xray-result state)
+      (dolist (def (codeql-xray-defs state))
+        (when-let* ((kinds (codeql-xray--uncoded state def)))
+          (let* ((why (if (gethash (codeql-xray-def-name def) (codeql-xray-unused state))
+                          "unused"
+                        "inlined"))
+                 (into (and (equal why "inlined")
+                            (codeql-xray--inlined-into state def kinds))))
+            (when into
+              (setq why (concat why " into " (string-join into ", "))))
+            (with-current-buffer src
+              (save-excursion
+                (goto-char (point-min))
+                (when (= 0 (forward-line (codeql-xray-def-srow def)))
+                  (let ((ov (make-overlay (line-end-position) (line-end-position))))
+                    (overlay-put ov 'codeql-xray 'base)
+                    (overlay-put ov 'codeql-xray-note t)
+                    (overlay-put ov 'after-string
+                                 (concat "  " (propertize
+                                               (format "no %s: %s"
+                                                       (string-join kinds " or ") why)
+                                               'face 'codeql-xray-none)))))))))))))
+
+(defun codeql-xray--fold-text (state fold)
+  "Return the line showing the closed FOLD of STATE."
+  (let* ((def (codeql-xray--fold-def fold))
+         (n (gethash def (codeql-xray--colors state))))
+    (propertize
+     (format "▸ %s  ·  %d blocks  ·  %s  ·  %s opens"
+             (codeql-xray-def-name def) (codeql-xray--fold-count fold)
+             (codeql-xray-def-expr def)
+             (substitute-command-keys "\\<codeql-xray-mode-map>\\[codeql-xray-toggle-fold]"))
+     'face (cond ((eq def (codeql-xray-active state)) 'codeql-xray-active)
+                 (n (codeql-xray--face n))
+                 (t 'shadow)))))
+
+(defun codeql-xray--fold-closed-p (fold)
+  "Return non-nil if FOLD is closed."
+  (overlay-get (codeql-xray--fold-overlay fold) 'display))
+
+(defun codeql-xray--set-fold (state fold closed)
+  "Close FOLD of STATE when CLOSED, open it otherwise."
+  (overlay-put (codeql-xray--fold-overlay fold) 'display
+               (and closed (codeql-xray--fold-text state fold))))
+
+(defun codeql-xray--refresh-folds (state)
+  "Redraw the closed folds of the views of STATE."
+  (dolist (view (codeql-xray-views state))
+    (dolist (fold (codeql-xray--view-folds view))
+      (when (codeql-xray--fold-closed-p fold)
+        (codeql-xray--set-fold state fold t)))))
+
+(defun codeql-xray--fold-at (view row)
+  "Return the fold of VIEW at the 0-based ROW, if any."
+  (seq-find (lambda (fold)
+              (<= (codeql-xray--fold-first fold) row (codeql-xray--fold-last fold)))
+            (codeql-xray--view-folds view)))
+
+(defun codeql-xray--windows-rows (buffer)
+  "Return the windows showing BUFFER with the rows and columns of their points."
+  (mapcar (lambda (win)
+            (with-current-buffer buffer
+              (save-excursion
+                (goto-char (window-point win))
+                (list win (1- (line-number-at-pos)) (current-column)
+                      (progn (goto-char (window-start win)) (1- (line-number-at-pos)))))))
+          (get-buffer-window-list buffer nil t)))
+
+(defun codeql-xray--draw (state view)
+  "Draw the code of the definitions of the query of STATE in VIEW.
+
+Then the blocks peeked at."
+  (let* ((kind (codeql-xray--view-kind view))
+         (dump (and (codeql-xray-result state)
+                    (codeql-xray--of (codeql-xray-result state) kind)))
+         (lines nil)
+         (count 0)
+         (spans nil)
+         (groups nil))
+    (cl-flet ((add (block def)
+                (when (> count 0)
+                  (push "" lines)
+                  (setq count (1+ count)))
+                (let ((first count))
+                  (cl-loop for i from (codeql-xray-block-first block)
+                           to (codeql-xray-block-last block)
+                           do (push (aref dump i) lines))
+                  (setq count (+ count (1+ (- (codeql-xray-block-last block)
+                                              (codeql-xray-block-first block)))))
+                  (push (codeql-xray--span-create :first first :last (1- count)
+                                                  :def def :block block)
+                        spans))))
+      (if (codeql-xray-error state)
+          (setq lines (reverse (codeql-xray-error state)))
+        ;; the code of each definition together, in the order of the query
+        (let ((order (make-hash-table :test #'eq))
+              (i 0))
+          (dolist (def (codeql-xray-defs state))
+            (puthash def (setq i (1+ i)) order))
+          (dolist (m (sort (copy-sequence (codeql-xray--of (codeql-xray-mapped state) kind))
+                           (lambda (a b) (< (gethash (cdr a) order 0)
+                                            (gethash (cdr b) order 0)))))
+            (let ((group (car groups)))
+              (unless (and group (eq (codeql-xray--fold-def group) (cdr m)))
+                (setq group (codeql-xray--fold-create
+                             :def (cdr m) :first (+ count (if (> count 0) 1 0)) :count 0))
+                (push group groups))
+              (add (car m) (cdr m))
+              (setf (codeql-xray--fold-last group) (1- count))
+              (cl-incf (codeql-xray--fold-count group)))))
+        (dolist (block (codeql-xray--of (codeql-xray-peeks state) kind))
+          (add block nil))
+        (when (and (codeql-xray-result state) (= count 0))
+          (setq lines (list (format "-- no %s comes from %s.ql" kind (codeql-xray-module state)))))))
+    (setq lines (nreverse lines))
+    (let* ((buf (codeql-xray--view-buf view))
+           (open (mapcar (lambda (fold) (codeql-xray-def-name (codeql-xray--fold-def fold)))
+                         (seq-remove #'codeql-xray--fold-closed-p
+                                     (codeql-xray--view-folds view))))
+           (folded (codeql-xray--view-folds view))
+           (windows (codeql-xray--windows-rows buf))
+           (starts nil))
+      (setf (codeql-xray--view-spans view) (nreverse spans)
+            (codeql-xray--view-lines view) (vconcat lines)
+            (codeql-xray--view-comments view) nil)
+      (with-current-buffer buf
+        (let ((inhibit-read-only t)
+              (point-row (1- (line-number-at-pos)))
+              (point-col (current-column)))
+          (remove-overlays)
+          (erase-buffer)
+          (dolist (line lines)
+            (push (point) starts)
+            (insert line "\n"))
+          (setq starts (vconcat (nreverse starts)))
+          (setf (codeql-xray--view-starts view) starts)
+          ;; the many relations of a module the query instantiates fold into
+          ;; one line, kept open when they were
+          (setf (codeql-xray--view-folds view)
+                (mapcar (lambda (group)
+                          (let ((ov (make-overlay
+                                     (codeql-xray--row-pos (codeql-xray--fold-first group) starts)
+                                     (1- (codeql-xray--row-pos
+                                          (1+ (codeql-xray--fold-last group)) starts)))))
+                            (overlay-put ov 'codeql-xray 'fold)
+                            (setf (codeql-xray--fold-overlay group) ov)
+                            group))
+                        (seq-filter (lambda (group)
+                                      (eq (codeql-xray-def-kind (codeql-xray--fold-def group))
+                                          'instance))
+                                    (nreverse groups))))
+          (dolist (fold (codeql-xray--view-folds view))
+            (codeql-xray--set-fold
+             state fold
+             (not (and folded (member (codeql-xray-def-name (codeql-xray--fold-def fold))
+                                      open)))))
+          (goto-char (codeql-xray--row-pos (min point-row (max 0 (1- (length lines)))) starts))
+          (move-to-column point-col)
+          (set-buffer-modified-p nil)))
+      (dolist (w windows)
+        (pcase-let ((`(,win ,row ,col ,start) w))
+          (with-current-buffer buf
+            (let ((last (max 0 (1- (length lines)))))
+              (set-window-start win (codeql-xray--row-pos (min start last) starts) t)
+              (set-window-point win (save-excursion
+                                      (goto-char (codeql-xray--row-pos (min row last) starts))
+                                      (move-to-column col)
+                                      (point))))))))))
+
+(defun codeql-xray--render (state)
+  "Draw the views of STATE and color them and the query."
+  (dolist (view (codeql-xray-views state))
+    (codeql-xray--draw state view))
+  (codeql-xray--paint state)
+  (codeql-xray--activate state (codeql-xray-active state) 'source)
+  (codeql-xray--update-header-lines state))
+
+(defun codeql-xray--source-lines (buffer)
+  "Return the lines of BUFFER as a vector."
+  (with-current-buffer buffer
+    (vconcat (split-string (buffer-substring-no-properties (point-min) (point-max)) "\n"))))
+
+(defun codeql-xray--remap (state)
+  "Map the blocks of both dumps of STATE to the definitions of the query."
+  (let* ((lines (codeql-xray--source-lines (codeql-xray-src state)))
+         (defs (codeql-xray--outline lines))
+         ;; an edit seldom changes what the blocks map to, the keys of the
+         ;; definitions
+         (signature (mapconcat (lambda (def)
+                                 (format "%s %s %s" (codeql-xray-def-kind def)
+                                         (string-join (codeql-xray-def-keys def) " ")
+                                         (or (codeql-xray-def-shape def) "")))
+                               defs "\n"))
+         (cache (codeql-xray-map-cache state))
+         (same (and cache
+                    (eq (nth 0 cache) (codeql-xray-blocks state))
+                    (equal (nth 1 cache) signature)))
+         (index (make-hash-table :test #'eq))
+         (new (vconcat defs)))
+    (when same
+      (cl-loop for def in (nth 2 cache) for i from 0 do (puthash def i index)))
+    (setf (codeql-xray-defs state) defs
+          (codeql-xray-users state) (codeql-xray--users lines defs)
+          (codeql-xray-coded state) (codeql-xray--kinds-alist 'hash))
+    (dolist (kind '("DIL" "RA"))
+      (setf (codeql-xray--of (codeql-xray-mapped state) kind)
+            (if same
+                (mapcar (lambda (m) (cons (car m) (aref new (gethash (cdr m) index))))
+                        (codeql-xray--of (codeql-xray-mapped state) kind))
+              (let ((blocks (codeql-xray--of (codeql-xray-blocks state) kind)))
+                (and blocks (codeql-xray--map blocks (codeql-xray-module state) defs)))))
+      (dolist (m (codeql-xray--of (codeql-xray-mapped state) kind))
+        (puthash (cdr m) t (codeql-xray--of (codeql-xray-coded state) kind))))
+    (setf (codeql-xray-map-cache state) (list (codeql-xray-blocks state) signature defs))
+    ;; the active definition is the one at the same place
+    (when-let* ((active (codeql-xray-active state)))
+      (setf (codeql-xray-active state)
+            (codeql-xray--def-at defs (codeql-xray-def-srow active))))))
+
+(defun codeql-xray-show (state result)
+  "Show the decoded RESULT of `codeql query compile' in the x-ray STATE.
+
+RESULT is a plist, with the :success of the compilation, its :messages,
+and the lines of its :DIL and :RA."
+  (setf (codeql-xray-result state) nil
+        (codeql-xray-error state) nil
+        (codeql-xray-blocks state) (codeql-xray--kinds-alist)
+        (codeql-xray-unused state) (make-hash-table :test #'equal)
+        (codeql-xray-index state) (codeql-xray--kinds-alist)
+        (codeql-xray-peeks state) (codeql-xray--kinds-alist))
+  (if (not (and result (plist-get result :success)))
+      (setf (codeql-xray-error state)
+            (cons (format "-- %s.ql doesn't compile" (codeql-xray-module state))
+                  (seq-map (lambda (message)
+                             (let ((p (plist-get message :position)))
+                               (format "%s:%s:%s: %s"
+                                       (downcase (or (plist-get message :severity) ""))
+                                       (or (plist-get p :line) "?")
+                                       (or (plist-get p :column) "?")
+                                       (or (plist-get message :message) ""))))
+                           (plist-get result :messages))))
+    (setf (codeql-xray-result state)
+          (list (cons "DIL" (vconcat (plist-get result :DIL)))
+                (cons "RA" (vconcat (plist-get result :RA)))))
+    ;; the compiler warns about what it drops for being unused
+    (seq-doseq (message (plist-get result :messages))
+      (let ((case-fold-search nil)
+            (text (or (plist-get message :message) "")))
+        (when (string-match "\\`unused [[:alpha:]]+ '\\([^']+\\)'" text)
+          (puthash (match-string 1 text) t (codeql-xray-unused state)))))
+    (dolist (kind '("DIL" "RA"))
+      (setf (codeql-xray--of (codeql-xray-blocks state) kind)
+            (codeql-xray--blocks (codeql-xray--of (codeql-xray-result state) kind) kind))))
+  (codeql-xray--remap state)
+  (codeql-xray--render state))
+
+(defun codeql-xray--decode (output errors)
+  "Return the result of `codeql query compile' from its JSON OUTPUT.
+
+Or a failed one with the message ERRORS when OUTPUT isn't JSON."
+  (let ((decoded (condition-case nil
+                     (json-parse-string output :object-type 'plist :array-type 'array
+                                        :null-object nil :false-object nil)
+                   (error nil))))
+    (if (and (vectorp decoded) (> (length decoded) 0))
+        (aref decoded 0)
+      (list :success nil
+            :messages (vector (list :severity "ERROR" :message (string-trim errors)))))))
+
+(defun codeql-xray--compile (state)
+  "Compile the query of STATE and show its dumps."
+  (when-let* ((proc (codeql-xray-proc state)))
+    (setf (codeql-xray-proc state) nil)
+    (delete-process proc))
+  (with-current-buffer (codeql-xray-src state)
+    (unless codeql--cli-buffer-local
+      (user-error "The CodeQL CLI of this buffer isn't known yet"))
+    (codeql--await-search-paths)
+    (let* ((paths (codeql--search-path))
+           (command (append codeql--cli-buffer-local
+                            (list "query" "compile" "--dump-dil" "--dump-ra"
+                                  "--format=json" "--threads=0")
+                            (unless (string-empty-p paths)
+                              (list (format "--additional-packs=%s" paths)))
+                            (list "--" (codeql--tramp-unwrap (codeql-xray-path state)))))
+           (stdout (generate-new-buffer " *codeql xray*"))
+           (stderr (generate-new-buffer " *codeql xray stderr*"))
+           (src (current-buffer)))
+      (when codeql-verbose-commands
+        (message "Running x-ray cmd: %s" (string-join command " ")))
+      (setf (codeql-xray-compiling state) (float-time))
+      (codeql-xray--update-header-lines state)
+      (setf (codeql-xray-proc state)
+            (make-process
+             :name "codeql xray"
+             :buffer stdout
+             :stderr stderr
+             :command command
+             :connection-type 'pipe
+             :noquery t
+             :file-handler t
+             :sentinel
+             (lambda (proc _event)
+               (unless (process-live-p proc)
+                 (let ((output (with-current-buffer stdout (buffer-string)))
+                       (errors (with-current-buffer stderr (buffer-string))))
+                   (when-let* ((stderr-proc (get-buffer-process stderr)))
+                     (delete-process stderr-proc))
+                   (kill-buffer stdout)
+                   (kill-buffer stderr)
+                   (when (and (eq (codeql-xray-proc state) proc)
+                              (buffer-live-p src)
+                              (eq (buffer-local-value 'codeql-xray--state src) state))
+                     (setf (codeql-xray-proc state) nil
+                           (codeql-xray-elapsed state) (- (float-time)
+                                                          (codeql-xray-compiling state))
+                           (codeql-xray-compiling state) nil)
+                     (codeql-xray-show state (codeql-xray--decode output errors)))))))))))
+
+(defun codeql-xray--header-line ()
+  "Return the header line of an x-ray view."
+  (when-let* ((view codeql-xray--this-view)
+              (state codeql-xray--state))
+    (let* ((kind (codeql-xray--view-kind view))
+           (parts (list (concat " " kind))))
+      (cond ((codeql-xray-compiling state)
+             (push "compiling…" parts))
+            ((codeql-xray-result state)
+             (push (format "%d of %d blocks"
+                           (length (codeql-xray--of (codeql-xray-mapped state) kind))
+                           (length (codeql-xray--of (codeql-xray-blocks state) kind)))
+                   parts)
+             (push (format "%.1fs" (or (codeql-xray-elapsed state) 0)) parts)))
+      (push (format "%s %s"
+                    (substitute-command-keys "\\<codeql-xray-mode-map>\\[codeql-xray-other]")
+                    (codeql-xray--other-kind kind))
+            parts)
+      (string-replace "%" "%%" (string-join (nreverse parts) "  ·  ")))))
+
+(defun codeql-xray--update-header-lines (state)
+  "Redraw the header lines of the views of STATE."
+  (dolist (view (codeql-xray-views state))
+    (when (buffer-live-p (codeql-xray--view-buf view))
+      (with-current-buffer (codeql-xray--view-buf view)
+        (force-mode-line-update)))))
+
+;;;; Commands of the views
+
+(defun codeql-xray--current ()
+  "Return the x-ray state and view of the current buffer."
+  (unless (and codeql-xray--state codeql-xray--this-view)
+    (user-error "Not an x-ray of a query"))
+  (list codeql-xray--state codeql-xray--this-view))
+
+(defun codeql-xray--current-row ()
+  "Return the 0-based row of point."
+  (1- (line-number-at-pos)))
+
+(defun codeql-xray--span-at (view row)
+  "Return the span of VIEW at the 0-based ROW."
+  (seq-find (lambda (span) (<= (codeql-xray--span-first span) row (codeql-xray--span-last span)))
+            (codeql-xray--view-spans view)))
+
+(defun codeql-xray--goto-row (state view row)
+  "Go to the 0-based ROW of VIEW of STATE, opening the fold around it."
+  (when-let* ((fold (codeql-xray--fold-at view row)))
+    (codeql-xray--set-fold state fold nil))
+  (goto-char (codeql-xray--row-pos row (codeql-xray--view-starts view))))
+
+(defun codeql-xray--name-at-point ()
+  "Return the name of the relation at point of a view."
+  (let* ((line (buffer-substring-no-properties (line-beginning-position) (line-end-position)))
+         (col (- (point) (line-beginning-position)))
+         (from 0)
+         (found nil))
+    (while (and (not found) (string-match "`\\([^`]+\\)`" line from))
+      (when (and (<= (match-beginning 0) col) (< col (match-end 0)))
+        (setq found (match-string 1 line)))
+      (setq from (match-end 0)))
+    (or found
+        (let ((s (min col (length line)))
+              (delimiters '(?\s ?\t ?\( ?\) ?, ?`)))
+          (while (and (> s 0) (not (memq (aref line (1- s)) delimiters)))
+            (setq s (1- s)))
+          (when (eql (string-match "[^ \t(),`]+" line s) s)
+            (let ((name (match-string 0 line)))
+              (unless (string-match-p "\\`#*\\'" name)
+                name)))))))
+
+(defun codeql-xray--find-block (state kind name &optional similar)
+  "Return the block of the dump of KIND of STATE defining the relation NAME.
+
+Or else, when SIMILAR, one defining a relation of the same bare name."
+  (let ((index (or (codeql-xray--of (codeql-xray-index state) kind)
+                   (setf (codeql-xray--of (codeql-xray-index state) kind)
+                         (let ((index (make-hash-table :test #'equal)))
+                           (dolist (block (codeql-xray--of (codeql-xray-blocks state) kind))
+                             (dolist (n (codeql-xray-block-names block))
+                               (unless (gethash n index) (puthash n block index))
+                               (let ((bare (concat "bare:" (codeql-xray--bare n))))
+                                 (unless (gethash bare index) (puthash bare block index)))))
+                           index)))))
+    (or (gethash name index)
+        (gethash (replace-regexp-in-string
+                  "#prev\\'" "" (replace-regexp-in-string "#prev_delta\\'" "" name))
+                 index)
+        (and similar (gethash (concat "bare:" (codeql-xray--bare name)) index)))))
+
+(defun codeql-xray--show-block (state view block)
+  "Go to BLOCK in VIEW of STATE, showing it below the others if it's not shown."
+  (cl-flet ((jump ()
+              (when-let* ((span (seq-find (lambda (span) (eq (codeql-xray--span-block span) block))
+                                          (codeql-xray--view-spans view))))
+                (push-mark nil t)
+                (codeql-xray--goto-row state view (codeql-xray--span-first span))
+                t)))
+    (unless (jump)
+      (setf (codeql-xray--of (codeql-xray-peeks state) (codeql-xray--view-kind view))
+            (append (codeql-xray--of (codeql-xray-peeks state) (codeql-xray--view-kind view))
+                    (list block)))
+      (codeql-xray--render state)
+      (jump))))
+
+(defun codeql-xray-peek ()
+  "Go to the block defining the relation at point.
+
+A relation of the libraries is shown below the others, and
+\\<codeql-xray-mode-map>\\[codeql-xray-other] then shows it in the other column too."
+  (interactive)
+  (pcase-let* ((`(,state ,view) (codeql-xray--current))
+               (name (codeql-xray--name-at-point))
+               (block (and name (codeql-xray-result state)
+                           (codeql-xray--find-block state (codeql-xray--view-kind view) name))))
+    (if block
+        (codeql-xray--show-block state view block)
+      (message "No %s defines %s" (codeql-xray--view-kind view) (or name "anything here")))))
+
+(defun codeql-xray-visit-definition ()
+  "Go to the definition of the query the block at point comes from."
+  (interactive)
+  (pcase-let* ((`(,state ,view) (codeql-xray--current))
+               (span (codeql-xray--span-at view (codeql-xray--current-row)))
+               (src (codeql-xray-src state)))
+    (if (not (and span (codeql-xray--span-def span)))
+        (message "This block doesn't come from the query")
+      (let ((win (or (codeql-xray--window src)
+                     (display-buffer src))))
+        (select-window win)
+        (push-mark nil t)
+        (goto-char (point-min))
+        (forward-line (codeql-xray-def-srow (codeql-xray--span-def span)))))))
+
+(defun codeql-xray--counterpart (spans here)
+  "Return the span of SPANS with the code of the definition of the span HERE.
+
+Preferring the one of the same relation, then of the same bare relation."
+  (let* ((names (codeql-xray-block-names (codeql-xray--span-block here)))
+         (bares (mapcar #'codeql-xray--bare names))
+         (first nil)
+         (similar nil)
+         (same nil))
+    (dolist (span spans)
+      (when (and (not same) (eq (codeql-xray--span-def span) (codeql-xray--span-def here)))
+        (dolist (name (codeql-xray-block-names (codeql-xray--span-block span)))
+          (cond ((member name names) (setq same (or same span)))
+                ((and (not similar) (member (codeql-xray--bare name) bares))
+                 (setq similar span))))
+        (setq first (or first span))))
+    (or same similar first)))
+
+(defun codeql-xray-other ()
+  "Go to the other column at the code of the same relation.
+
+Or else at the code of the same definition, or show the other dump in
+the single layout."
+  (interactive)
+  (pcase-let* ((`(,state ,view) (codeql-xray--current))
+               (kind (codeql-xray--other-kind (codeql-xray--view-kind view)))
+               (other (seq-find (lambda (v)
+                                  (and (equal (codeql-xray--view-kind v) kind)
+                                       (codeql-xray--window (codeql-xray--view-buf v))))
+                                (codeql-xray-views state))))
+    (if (not other)
+        (progn
+          (setf (codeql-xray--view-kind view) kind)
+          (codeql-xray--render state))
+      (let* ((here (codeql-xray--span-at view (codeql-xray--current-row)))
+             (target nil))
+        (cond
+         ((and here (codeql-xray--span-def here))
+          (setq target (codeql-xray--counterpart (codeql-xray--view-spans other) here)))
+         ((and here (codeql-xray-result state))
+          ;; a block of the libraries peeked at, peeked at in the other dump too
+          (let ((block nil))
+            (dolist (similar '(nil t))
+              (dolist (name (codeql-xray-block-names (codeql-xray--span-block here)))
+                (setq block (or block (codeql-xray--find-block state kind name similar)))))
+            (when block
+              (cl-flet ((shown ()
+                          (seq-find (lambda (span) (eq (codeql-xray--span-block span) block))
+                                    (codeql-xray--view-spans other))))
+                (unless (shown)
+                  (setf (codeql-xray--of (codeql-xray-peeks state) kind)
+                        (append (codeql-xray--of (codeql-xray-peeks state) kind) (list block)))
+                  (codeql-xray--render state))
+                (setq target (shown)))))))
+        (unless target
+          (setq target (and (codeql-xray-active state)
+                            (seq-find (lambda (span) (eq (codeql-xray--span-def span)
+                                                         (codeql-xray-active state)))
+                                      (codeql-xray--view-spans other)))))
+        (select-window (codeql-xray--window (codeql-xray--view-buf other)))
+        (when target
+          (codeql-xray--goto-row state other (codeql-xray--span-first target)))))))
+
+(defun codeql-xray--jump-block (direction)
+  "Go to the next block when DIRECTION is positive, else the previous one.
+
+A closed fold counts as one block."
+  (pcase-let ((`(,_state ,view) (codeql-xray--current)))
+    (cl-flet ((shown (row)
+                (let ((fold (codeql-xray--fold-at view row)))
+                  (if (and fold (codeql-xray--fold-closed-p fold))
+                      (codeql-xray--fold-first fold)
+                    row))))
+      (let ((row (shown (codeql-xray--current-row)))
+            (target nil))
+        (dolist (span (codeql-xray--view-spans view))
+          (let ((first (shown (codeql-xray--span-first span))))
+            (cond ((and (> direction 0) (> first row) (not target))
+                   (setq target first))
+                  ((and (< direction 0) (< first row))
+                   (setq target first)))))
+        (when target
+          (goto-char (codeql-xray--row-pos target (codeql-xray--view-starts view))))))))
+
+(defun codeql-xray-next-block ()
+  "Go to the next block, a closed fold counting as one."
+  (interactive)
+  (codeql-xray--jump-block 1))
+
+(defun codeql-xray-previous-block ()
+  "Go to the previous block, a closed fold counting as one."
+  (interactive)
+  (codeql-xray--jump-block -1))
+
+(defun codeql-xray-toggle-fold ()
+  "Open or close the fold of the relations of an instantiated module at point."
+  (interactive)
+  (pcase-let* ((`(,state ,view) (codeql-xray--current))
+               (fold (codeql-xray--fold-at view (codeql-xray--current-row))))
+    (if (not fold)
+        (message "No instantiated module here")
+      (codeql-xray--set-fold state fold (not (codeql-xray--fold-closed-p fold)))
+      (goto-char (codeql-xray--row-pos (codeql-xray--fold-first fold)
+                                       (codeql-xray--view-starts view))))))
+
+(defun codeql-xray-recompile ()
+  "Compile the query of the x-ray again."
+  (interactive)
+  (codeql-xray--compile (car (codeql-xray--current))))
+
+(defun codeql-xray-quit ()
+  "Close the x-ray."
+  (interactive)
+  (codeql-xray-close (car (codeql-xray--current))))
+
+(defvar codeql-xray-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "TAB") #'codeql-xray-other)
+    (define-key map (kbd "RET") #'codeql-xray-visit-definition)
+    (define-key map (kbd "M-.") #'codeql-xray-peek)
+    (define-key map (kbd ".") #'codeql-xray-peek)
+    (define-key map (kbd "n") #'codeql-xray-next-block)
+    (define-key map (kbd "p") #'codeql-xray-previous-block)
+    (define-key map (kbd "o") #'codeql-xray-toggle-fold)
+    (define-key map (kbd "g") #'codeql-xray-recompile)
+    (define-key map (kbd "q") #'codeql-xray-quit)
+    map)
+  "Keymap for `codeql-xray-mode'.")
+
+(with-eval-after-load 'evil
+  (evil-define-key* '(normal motion) codeql-xray-mode-map
+                    (kbd "TAB") #'codeql-xray-other
+                    (kbd "RET") #'codeql-xray-visit-definition
+                    "gd" #'codeql-xray-peek
+                    "]]" #'codeql-xray-next-block
+                    "[[" #'codeql-xray-previous-block
+                    "o" #'codeql-xray-toggle-fold
+                    "zo" #'codeql-xray-toggle-fold
+                    "zc" #'codeql-xray-toggle-fold
+                    "za" #'codeql-xray-toggle-fold
+                    "gr" #'codeql-xray-recompile
+                    "r" #'codeql-xray-recompile
+                    "q" #'codeql-xray-quit))
+
+(defconst codeql-xray-font-lock-keywords
+  `((,(regexp-opt '("EVALUATE" "NONRECURSIVE" "RECURSIVE" "RELATION" "LAYER" "JOIN"
+                    "WITH" "ON" "FIRST" "OUTPUT" "SCAN" "AND" "NOT" "REWRITE" "TEST"
+                    "KEEPING" "SENTINEL" "return" "rec" "SYNTHETIC" "UNION" "EMPTY"
+                    "PROJECT" "STREAM" "DEDUP" "AGGREGATE" "INVOKE" "HIGHER-ORDER"
+                    "exists" "and" "or" "not" "forall" "forex" "if" "then" "else"
+                    "none" "any" "result" "this")
+                  'words)
+     . font-lock-keyword-face)
+    ("`[^`\n]+`" . font-lock-variable-name-face)
+    ("/\\*.*?\\*/" 0 font-lock-comment-face t)
+    ("\\[\\[\\[.*\\]\\]\\]" . font-lock-comment-face)
+    ("{[0-9]+}" . font-lock-constant-face)
+    ("\"\\(?:[^\"\\\n]\\|\\\\.\\)*\"" . font-lock-string-face))
+  "The highlighting of the DIL and RA in `codeql-xray-mode'.")
+
+(define-derived-mode codeql-xray-mode special-mode "CodeQL-X-Ray"
+  "Major mode for the DIL or RA of a query, beside it.
+
+\\{codeql-xray-mode-map}"
+  (setq-local truncate-lines t)
+  (setq-local font-lock-defaults '(codeql-xray-font-lock-keywords t))
+  (setq-local header-line-format '(:eval (codeql-xray--header-line)))
+  (setq-local revert-buffer-function (lambda (&rest _) (codeql-xray-recompile))))
+
+(defun codeql-xray--view-post-command ()
+  "Highlight the definition of the block at point of a view."
+  (when-let* ((state codeql-xray--state)
+              (view codeql-xray--this-view)
+              (span (codeql-xray--span-at view (codeql-xray--current-row)))
+              (def (codeql-xray--span-def span)))
+    (unless (eq def (codeql-xray-active state))
+      (codeql-xray--activate state def view))))
+
+(defun codeql-xray--source-post-command ()
+  "Highlight the definition at point of the query and its code."
+  (when-let* ((state codeql-xray--state))
+    (let ((def (codeql-xray--def-at (codeql-xray-defs state) (codeql-xray--current-row))))
+      (unless (eq def (codeql-xray-active state))
+        (codeql-xray--activate state def 'source)))))
+
+(defun codeql-xray--source-changed (&rest _)
+  "Map the code to the definitions of the edited query, once idle."
+  (when-let* ((state codeql-xray--state))
+    (when (codeql-xray-timer state)
+      (cancel-timer (codeql-xray-timer state)))
+    (setf (codeql-xray-timer state)
+          (run-with-idle-timer
+           0.3 nil
+           (lambda ()
+             (setf (codeql-xray-timer state) nil)
+             (when (and (buffer-live-p (codeql-xray-src state))
+                        (eq (buffer-local-value 'codeql-xray--state (codeql-xray-src state))
+                            state))
+               (codeql-xray--remap state)
+               (codeql-xray--render state)))))))
+
+(defun codeql-xray--source-saved ()
+  "Compile the saved query again."
+  (when codeql-xray--state
+    (codeql-xray--compile codeql-xray--state)))
+
+(defun codeql-xray--source-killed ()
+  "Close the x-ray of the killed query."
+  (when codeql-xray--state
+    (codeql-xray-close codeql-xray--state)))
+
+(defun codeql-xray--view-killed ()
+  "Forget the killed view, closing the x-ray with the last one."
+  (when-let* ((state codeql-xray--state)
+              (view codeql-xray--this-view))
+    (dolist (win (get-buffer-window-list (current-buffer) nil t))
+      (unless (one-window-p t (window-frame win))
+        (delete-window win)))
+    (setf (codeql-xray-views state) (delq view (codeql-xray-views state)))
+    (cond ((null (codeql-xray-views state))
+           (codeql-xray--teardown state))
+          ((buffer-live-p (codeql-xray-src state))
+           (run-at-time 0 nil (lambda ()
+                                (when (eq (buffer-local-value 'codeql-xray--state
+                                                              (codeql-xray-src state))
+                                          state)
+                                  (codeql-xray--paint state))))))))
+
+(defun codeql-xray--teardown (state)
+  "Stop the x-ray STATE, leaving its views alone."
+  (let ((src (codeql-xray-src state)))
+    (when-let* ((proc (codeql-xray-proc state)))
+      (setf (codeql-xray-proc state) nil)
+      (delete-process proc))
+    (when (codeql-xray-timer state)
+      (cancel-timer (codeql-xray-timer state)))
+    (when (buffer-live-p src)
+      (with-current-buffer src
+        (when (eq codeql-xray--state state)
+          (remove-overlays nil nil 'codeql-xray 'base)
+          (remove-overlays nil nil 'codeql-xray 'active)
+          (remove-hook 'post-command-hook #'codeql-xray--source-post-command t)
+          (remove-hook 'after-change-functions #'codeql-xray--source-changed t)
+          (remove-hook 'after-save-hook #'codeql-xray--source-saved t)
+          (remove-hook 'kill-buffer-hook #'codeql-xray--source-killed t)
+          (setq codeql-xray--state nil))))))
+
+(defun codeql-xray-close (state)
+  "Close the x-ray STATE and its views."
+  (let ((views (codeql-xray-views state)))
+    (codeql-xray--teardown state)
+    (setf (codeql-xray-views state) nil)
+    (dolist (view views)
+      (let ((buf (codeql-xray--view-buf view)))
+        (when (buffer-live-p buf)
+          (dolist (win (get-buffer-window-list buf nil t))
+            (unless (one-window-p t (window-frame win))
+              (delete-window win)))
+          (with-current-buffer buf
+            (setq codeql-xray--state nil))
+          (kill-buffer buf))))))
+
+(defun codeql-xray--add-view (state kind name)
+  "Add a view of the dump of KIND to STATE, in a buffer named NAME."
+  (let* ((buf (generate-new-buffer name))
+         (view (codeql-xray--view-create :kind kind :buf buf)))
+    (with-current-buffer buf
+      (codeql-xray-mode)
+      (setq codeql-xray--state state
+            codeql-xray--this-view view)
+      (add-hook 'post-command-hook #'codeql-xray--view-post-command nil t)
+      (add-hook 'kill-buffer-hook #'codeql-xray--view-killed nil t))
+    (setf (codeql-xray-views state) (append (codeql-xray-views state) (list view)))
+    view))
+
+(defun codeql-xray-attach (src &optional kinds)
+  "Return a new x-ray of the query in buffer SRC, without compiling it.
+
+It has a view of each of KINDS, \"DIL\" and \"RA\" by default."
+  (let* ((path (buffer-file-name src))
+         (state (codeql-xray--create
+                 :src src :path path :module (file-name-base path)
+                 :coded (codeql-xray--kinds-alist 'hash)
+                 :mapped (codeql-xray--kinds-alist)
+                 :blocks (codeql-xray--kinds-alist)
+                 :peeks (codeql-xray--kinds-alist)
+                 :index (codeql-xray--kinds-alist)
+                 :unused (make-hash-table :test #'equal)))
+         (kinds (or kinds '("DIL" "RA")))
+         (name (format "*codeql-xray: %s" (file-name-nondirectory path))))
+    (with-current-buffer src
+      (setq codeql-xray--state state)
+      (add-hook 'post-command-hook #'codeql-xray--source-post-command nil t)
+      (add-hook 'after-change-functions #'codeql-xray--source-changed nil t)
+      (add-hook 'after-save-hook #'codeql-xray--source-saved nil t)
+      (add-hook 'kill-buffer-hook #'codeql-xray--source-killed nil t))
+    (dolist (kind kinds)
+      ;; the columns are named after their dumps, the single view after the query
+      (codeql-xray--add-view state kind (if (cdr kinds)
+                                            (format "%s/%s*" name kind)
+                                          (concat name "*"))))
+    state))
+
+(defun codeql-xray ()
+  "Show the DIL and RA the query of the buffer compiles to beside it.
+
+Or close them when they're shown.  Like Compiler Explorer, the
+definitions of the query and their code have the same color, and moving
+point over either highlights both.  Saving the query compiles it again.
+See `codeql-xray-layout' and `codeql-xray-mode'."
+  (interactive)
+  (if codeql-xray--state
+      (codeql-xray-close codeql-xray--state)
+    (unless (and buffer-file-name (string-suffix-p ".ql" buffer-file-name))
+      (user-error "The x-ray shows what a query compiles to, open a .ql file"))
+    (unless codeql--cli-buffer-local
+      (user-error "The CodeQL CLI of this buffer isn't known yet"))
+    (when (buffer-modified-p)
+      (save-buffer))
+    (let* ((first (if (equal codeql-xray-kind "RA") "RA" "DIL"))
+           (kinds (if (eq codeql-xray-layout 'single)
+                      (list first)
+                    (list first (codeql-xray--other-kind first))))
+           (state (codeql-xray-attach (current-buffer) kinds))
+           (win (selected-window))
+           (w win))
+      (dolist (view (codeql-xray-views state))
+        (setq w (split-window w nil 'right))
+        (set-window-buffer w (codeql-xray--view-buf view)))
+      ;; the query and its views side by side, as wide as each other
+      (balance-windows (window-parent win))
+      (select-window win)
+      (codeql-xray--remap state)
+      (codeql-xray--render state)
+      (codeql-xray--compile state))))
 
 ;;; Sessions
 

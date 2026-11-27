@@ -553,6 +553,26 @@ The nodes are drawn with `codeql-graph-node-face` (bold) and the selected one, a
 
 There is AST xref support bound to `M->` in any database source file that also has an active AST viewer buffer open.
 
+### Query X-Ray
+
+`codeql-xray` (`x` in `codeql-command-map`) compiles the query with `codeql query compile --dump-dil --dump-ra` and shows beside it, like [Compiler Explorer](https://godbolt.org), the optimized DIL and RA of the predicates, classes and select clause of the query, without the ones of the libraries, in three columns: the query, its DIL and its RA. With `codeql-xray-layout` set to `single`, one column shows either dump, starting with `codeql-xray-kind`. Running `codeql-xray` again in the query buffer closes the x-ray.
+
+Each definition and its code have the same background color, `codeql-xray-1` to `codeql-xray-6`. Moving point over any of them highlights the definition and its code in all columns with `codeql-xray-active`, scrolling the others into view. A definition the compiler inlined, or dropped for being unused, is marked at the end of its line with the dumps it has no code in, like `no DIL or RA: unused`, and the definitions of the query that it went into, like `no DIL or RA: inlined into select`. Point on an inlined class also highlights the types of the variables the DIL still names it in, like `/* Query::Class */`.
+
+The many relations of a module the query instantiates, like `module Flow = TaintTracking::Global<Config>;`, belong to its alias and fold into one line per alias, like `▸ Flow  ·  1114 blocks  ·  TaintTracking::Global<Config>  ·  o opens`. Point on such an alias also highlights the DIL types naming the module it instantiates in the other code, like the variables of the select clause. Saving the query compiles it again; the header line shows how many blocks of the dump are the query's and how long compiling took. When the query doesn't compile, the columns list the compiler's messages.
+
+In the x-ray columns:
+
+| Key | Evil | Action |
+|-----|------|--------|
+| `TAB` | `TAB` | go to the other column at the code of the same relation, or else of the same definition; toggle DIL and RA in the single layout |
+| `RET` | `RET` | go to the definition of the block at point in the query |
+| `M-.`, `.` | `gd` | go to the block of the relation at point, showing a relation of the libraries below the others, which `TAB` then shows in the other column too |
+| `n`, `p` | `]]`, `[[` | go to the next or previous block, a closed fold counting as one |
+| `o` | `o`, `za`, `zo`, `zc` | open or close the fold of an instantiated module |
+| `g` | `gr`, `r` | compile the query again |
+| `q` | `q` | close the x-ray |
+
 ### Commands
 
 The control panel, a `transient` bound to `codeql-transient-binding` (default `C-c C-d`) in query buffers, shows the query server and active database of the buffer and manages them and other settings:
@@ -587,6 +607,7 @@ It doesn't run anything. Queries are run with the commands of `codeql-command-ma
 | `g` | `codeql-database-grep` |
 | `R` | `codeql-repl` |
 | `E` | `codeql-repl-send-region` |
+| `x` | `codeql-xray` |
 
 Commands that need a query server or a database fail with a message naming the command that sets it up.
 

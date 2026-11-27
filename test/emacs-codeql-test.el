@@ -2193,5 +2193,679 @@ org text after the block."
             (should (equal (length commands) 1))))
       (delete-directory codeql-state-dir t))))
 
+;;; Query x-ray
+
+(defconst codeql-test--xray-source
+  '("/** A query. */"
+    "import javascript"
+    ""
+    "module Inner {"
+    "  pragma[noinline]"
+    "  predicate big(File f, int n) { n = f.getNumberOfLines() and f.getBaseName() = \"{\" }"
+    ""
+    "  class Big extends File {"
+    "    int n;"
+    "    Big() { big(this, n) }"
+    "    // a member { with a brace"
+    "    int lines() {"
+    "      result = n"
+    "    }"
+    "  }"
+    "}"
+    ""
+    "newtype TKind = TA() or TB(int i) { i = [1 .. 2] }"
+    ""
+    "query predicate files(Inner::Big b, int n) { n = b.lines() }"
+    ""
+    "int unused(int x, Map<int, int>::T y) { x = 1 and result = 2 }"
+    ""
+    "from Inner::Big b"
+    "where b.lines() > 100"
+    "select b, b.lines()"
+    ""
+    "predicate after() { any() }")
+  "Deep.ql, the query of the x-ray tests, a definition of each kind.")
+
+(defconst codeql-test--xray-dil
+  '("overlayLocal"
+    "`Lib::helper/1#11`(int x)"
+    "{"
+    "  x = 1"
+    "}"
+    ""
+    "`Deep::Inner::big/2#0154355b`("
+    "  /* Files::File */ interned unique entity f,"
+    "  int n"
+    ")"
+    "{"
+    "  `Lib::helper/1#11`(n)"
+    "}"
+    ""
+    "#select(int b, int n)"
+    "{"
+    "  `Deep::Inner::big/2#0154355b`(b, n)"
+    "}")
+  "The DIL of Deep.ql.")
+
+(defconst codeql-test--xray-ra
+  '("LOAD RELATION: files(unique entity id, cached string name)"
+    "EVALUATE NONRECURSIVE RELATION:"
+    "  `Lib::helper/1#11`(int x) :- "
+    "    {1} r1 = CONSTANT(int)[1]"
+    "    return r1"
+    ""
+    "EVALUATE RECURSIVE LAYER:"
+    "  rec `Deep::Inner::Big.lines/0#dispred#77`(int this, int result) :- "
+    "    [[[ BASE CASE ]]]"
+    "    {2} r1 = SCAN `Deep::Inner::big/2#0154355b` OUTPUT In.0, In.1"
+    "    return r1"
+    ""
+    "  rec `Other::q/1#22`(int x) :- "
+    "    {1} r1 = SCAN `Deep::Inner::Big.lines/0#dispred#77#prev_delta` OUTPUT In.1"
+    "    return r1"
+    ""
+    "EVALUATE NONRECURSIVE RELATION:"
+    "  #select(int b, int n) :- "
+    "    {2} r1 = SCAN `Deep::Inner::Big.lines/0#dispred#77` OUTPUT In.0 'b', In.1 'n'"
+    "    return r1")
+  "The RA of Deep.ql.")
+
+(defconst codeql-test--xray-inst
+  '("import javascript"
+    "module Flow = TaintTracking::Global<Config>;"
+    "module Graph = PathGraph<Flow::PathNode,"
+    "  Flow::PathGraph>;"
+    "from Flow::PathNode n"
+    "select n")
+  "Inst.ql, instantiating parameterized modules.")
+
+(defconst codeql-test--xray-g "TaintTracking::Global<Lib::Config>::Flow")
+
+(defconst codeql-test--xray-inst-dil
+  (let ((g codeql-test--xray-g))
+    (list (format "`%s::p/0#1`()" g)
+          "{ }"
+          ""
+          (format "`Lib::PathGraph<%s::PathNode,%s::PathGraph>::edges/2#2`(int a, int b)" g g)
+          "{ }"
+          ""
+          (format "`Impl::Sens<%s::Input>::q/0#3`()" g)
+          "{ }"
+          ""
+          "`TaintTracking::Global<Lib::Other>::Flow::p/0#4`()"
+          "{ }"
+          ""
+          (format "#select(/* Lib::PathGraph<%s::PathNode, %s::PathGraph>::Node */ int n)" g g)
+          "{ `TaintTracking::Global<Lib::Other>::Flow::p/0#4`() }"))
+  "The DIL of Inst.ql.")
+
+(defconst codeql-test--xray-inst-ra
+  (let ((g codeql-test--xray-g))
+    (list "EVALUATE NONRECURSIVE RELATION:"
+          (format "  `Impl::Sens<%s::Input>::q/0#3`() :- " g)
+          "    return r1"
+          ""
+          "EVALUATE NONRECURSIVE RELATION:"
+          (format "  `num#%s::p/0#9`(int x) :- " g)
+          "    return r1"
+          ""
+          "EVALUATE NONRECURSIVE RELATION:"
+          "  #select(int n) :- "
+          "    return r1"
+          ""
+          "EVALUATE NONRECURSIVE RELATION:"
+          "  `num#TaintTracking::Global<Lib::Other>::Flow::p/0#8`() :- "
+          "    return r1"))
+  "The RA of Inst.ql.")
+
+(defun codeql-test--xray-summary (defs)
+  "Return DEFS as strings of their kinds, keys and rows."
+  (mapcar (lambda (def)
+            (format "%s %s %d-%d" (codeql-xray-def-kind def)
+                    (string-join (codeql-xray-def-keys def) ",")
+                    (codeql-xray-def-srow def) (codeql-xray-def-erow def)))
+          defs))
+
+(ert-deftest codeql-test-xray-outline ()
+  "The definitions of a query and the keys of their relations are found."
+  (let ((defs (codeql-xray--outline codeql-test--xray-source)))
+    (should (equal (codeql-test--xray-summary defs)
+                   '("predicate Inner::big/2 4-5"
+                     "class Inner::Big 7-14"
+                     "predicate Inner::Big.lines/0 11-13"
+                     "newtype TKind,TA,TB 17-17"
+                     "predicate files/2,query:files 19-19"
+                     "predicate unused/2 21-21"
+                     "select #select 23-25"
+                     "predicate after/0 27-27")))
+    ;; the characteristic predicate is part of its class
+    (should (eq (codeql-xray-def-kind (codeql-xray--def-at defs 9)) 'class))
+    (should (eq (codeql-xray-def-kind (codeql-xray--def-at defs 8)) 'class))
+    (should (equal (car (codeql-xray-def-keys (codeql-xray--def-at defs 12)))
+                   "Inner::Big.lines/0"))
+    (should-not (codeql-xray--def-at defs 16))))
+
+(ert-deftest codeql-test-xray-keys ()
+  "Relations of the query module are named by their keys, the others not."
+  (should (equal (codeql-xray--key "`Deep::Inner::big/2#0154355b`" "Deep") "Inner::big/2"))
+  (should (equal (codeql-xray--key "`#Deep::C.p/1#dispred#1234Merge`" "Deep") "C.p/1"))
+  (should (equal (codeql-xray--key "project#Deep#ab12cd::p/0#ff" "Deep") "p/0"))
+  (should (equal (codeql-xray--key "Deep::M<int, Other::X<Y>>::C#99" "Deep") "M::C"))
+  (should (equal (codeql-xray--key "#select#query" "Deep") "#select"))
+  (should (equal (codeql-xray--key "edges#query" "Deep") "query:edges"))
+  (should-not (codeql-xray--key "`Files::Container.getRelativePath/0#dispred#6933ed0f`" "Deep"))
+  (should-not (codeql-xray--key "`DeepLib::p/0#12`" "Deep"))
+  (should-not (codeql-xray--key "`NotDeep::p/0#12`" "Deep"))
+  ;; a library module named like the query
+  (should-not (codeql-xray--key "`DeepQuery::Deep::isSink/1#55`" "Deep")))
+
+(ert-deftest codeql-test-xray-blocks ()
+  "The dumps are split into blocks, the RA with all relations of a layer."
+  (let ((dil (codeql-xray--blocks codeql-test--xray-dil "DIL"))
+        (ra (codeql-xray--blocks codeql-test--xray-ra "RA")))
+    (should (equal (mapcar #'codeql-xray-block-first dil) '(0 6 14)))
+    (should (equal (mapcar #'codeql-xray-block-names dil)
+                   '(("Lib::helper/1#11") ("Deep::Inner::big/2#0154355b") ("#select"))))
+    (should (equal (mapcar (lambda (b) (list (codeql-xray-block-first b) (codeql-xray-block-last b)))
+                           ra)
+                   '((0 0) (1 4) (6 14) (16 19))))
+    (should (equal (codeql-xray-block-names (nth 2 ra))
+                   '("Deep::Inner::Big.lines/0#dispred#77" "Other::q/1#22")))
+    (should-not (codeql-xray-block-names (nth 0 ra)))))
+
+(ert-deftest codeql-test-xray-users-and-map ()
+  "Definitions are used by others, and blocks map to their definitions."
+  (let* ((defs (codeql-xray--outline codeql-test--xray-source))
+         (users (codeql-xray--users codeql-test--xray-source defs)))
+    (cl-flet ((names (name)
+                (mapcar #'codeql-xray-def-name
+                        (gethash (seq-find (lambda (d) (equal (codeql-xray-def-name d) name)) defs)
+                                 users))))
+      ;; the class itself, with its characteristic predicate, doesn't count
+      (should (equal (names "big") '("Big")))
+      (should (equal (names "Big") '("files" "select")))
+      (should (equal (names "lines") '("files" "select")))
+      (should-not (names "unused")))
+    (should (equal (mapcar (lambda (m) (car (codeql-xray-def-keys (cdr m))))
+                           (codeql-xray--map (codeql-xray--blocks codeql-test--xray-ra "RA")
+                                             "Deep" defs))
+                   '("Inner::Big.lines/0" "#select")))
+    ;; a class compiles to one relation with its characteristic predicate
+    (should (eq (codeql-xray-def-kind
+                 (cdar (codeql-xray--map (list (codeql-xray-block-create
+                                                :first 0 :last 0 :names '("Deep::Inner::Big#33")))
+                                         "Deep" defs)))
+                'class))))
+
+(ert-deftest codeql-test-xray-instances ()
+  "The relations of the modules a query instantiates map to their aliases."
+  (let ((defs (codeql-xray--outline codeql-test--xray-inst)))
+    (should (equal (mapcar (lambda (d) (format "%s %s %d-%d" (codeql-xray-def-kind d)
+                                               (codeql-xray-def-name d)
+                                               (codeql-xray-def-srow d) (codeql-xray-def-erow d)))
+                           defs)
+                   '("instance Flow 1-1" "instance Graph 2-3" "select select 4-5")))
+    (should (equal (mapcar #'codeql-xray-def-shape (seq-take defs 2))
+                   '("Global<Config>" "PathGraph<PathNode,PathGraph>")))
+    (should (equal (codeql-xray--shape "M::Global<Lib::Opt<int>>") "Global<Opt<int>>"))
+    ;; named after the instantiated module, through the ones it
+    ;; instantiates, but for those of other arguments
+    (should (equal (mapcar (lambda (m) (codeql-xray-def-name (cdr m)))
+                           (codeql-xray--map (codeql-xray--blocks codeql-test--xray-inst-dil "DIL")
+                                             "Inst" defs))
+                   '("Flow" "Graph" "Flow" "select")))))
+
+(defmacro codeql-test--with-xray (spec &rest body)
+  "Run BODY with an x-ray of a query in the windows of the frame.
+
+SPEC is (STATE SRC KINDS &optional NAME LINES DIL RA): the x-ray STATE
+of the query buffer SRC, with a view of each of KINDS left to right, of
+Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
+  (declare (indent 1))
+  (pcase-let ((`(,state ,src ,kinds ,name ,lines ,dil ,ra) spec))
+    `(let* ((,src (generate-new-buffer ,(or name "Deep.ql")))
+            (,state nil))
+       (unwind-protect
+           (progn
+             (delete-other-windows)
+             (switch-to-buffer ,src)
+             (insert (string-join ,(or lines 'codeql-test--xray-source) "\n"))
+             (setq buffer-file-name (expand-file-name ,(or name "Deep.ql") temporary-file-directory))
+             (set-buffer-modified-p nil)
+             (setq ,state (codeql-xray-attach ,src ,kinds))
+             (let ((w (selected-window)))
+               (dolist (view (codeql-xray-views ,state))
+                 (setq w (split-window w nil 'right))
+                 (set-window-buffer w (codeql-xray--view-buf view))))
+             (goto-char (point-min))
+             (codeql-xray-show ,state
+                               (list :success t
+                                     :DIL (vconcat ,(or dil 'codeql-test--xray-dil))
+                                     :RA (vconcat ,(or ra 'codeql-test--xray-ra))
+                                     :messages (vector (list :severity "WARNING"
+                                                             :message "unused predicate 'unused'"))))
+             ,@body)
+         (when (and ,state (buffer-live-p ,src) (buffer-local-value 'codeql-xray--state ,src))
+           (codeql-xray-close ,state))
+         (with-current-buffer ,src
+           (set-buffer-modified-p nil)
+           (setq buffer-file-name nil))
+         (kill-buffer ,src)
+         (delete-other-windows)))))
+
+(defun codeql-test--xray-view (state n)
+  "Return the buffer of the Nth view of STATE."
+  (codeql-xray--view-buf (nth n (codeql-xray-views state))))
+
+(defun codeql-test--xray-lines (buffer)
+  "Return the lines shown in BUFFER."
+  (with-current-buffer buffer
+    (split-string (string-remove-suffix "\n" (buffer-string)) "\n")))
+
+(defun codeql-test--xray-marks (buffer kind)
+  "Return the x-ray overlays of KIND in BUFFER, as strings of rows and faces."
+  (with-current-buffer buffer
+    (let ((row (lambda (pos) (save-excursion (goto-char pos) (1- (line-number-at-pos))))))
+      (mapcar (lambda (ov)
+                (if-let* ((note (overlay-get ov 'after-string)))
+                    (format "%d %s" (funcall row (overlay-start ov)) (string-trim note))
+                  (let ((end (overlay-end ov)))
+                    (format "%d-%d %s" (funcall row (overlay-start ov))
+                            (if (save-excursion (goto-char end) (bolp))
+                                (1- (funcall row end))
+                              (funcall row end))
+                            (overlay-get ov 'face)))))
+              (sort (seq-filter (lambda (ov) (eq (overlay-get ov 'codeql-xray) kind))
+                                (overlays-in (point-min) (point-max)))
+                    (lambda (a b) (< (overlay-start a) (overlay-start b))))))))
+
+(defun codeql-test--xray-goto (buffer line &optional col)
+  "Select the window of BUFFER at the 1-based LINE and column COL."
+  (select-window (get-buffer-window buffer))
+  (goto-char (point-min))
+  (forward-line (1- line))
+  (move-to-column (or col 0)))
+
+(defun codeql-test--xray-move (buffer line &optional col)
+  "Move to LINE and COL of BUFFER like a command does."
+  (codeql-test--xray-goto buffer line col)
+  (run-hooks 'post-command-hook))
+
+(defun codeql-test--xray-line (&optional offset)
+  "Return the line OFFSET lines from point."
+  (save-excursion
+    (forward-line (or offset 0))
+    (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
+
+(ert-deftest codeql-test-xray-view ()
+  "Only the code of the query is shown, colored like its definitions."
+  (codeql-test--with-xray (state src '("DIL"))
+    (let ((buf (codeql-test--xray-view state 0)))
+      (should (equal (codeql-test--xray-lines buf)
+                     '("`Deep::Inner::big/2#0154355b`("
+                       "  /* Files::File */ interned unique entity f,"
+                       "  int n"
+                       ")"
+                       "{"
+                       "  `Lib::helper/1#11`(n)"
+                       "}"
+                       ""
+                       "#select(int b, int n)"
+                       "{"
+                       "  `Deep::Inner::big/2#0154355b`(b, n)"
+                       "}")))
+      (should (equal (codeql-test--xray-marks buf 'base)
+                     '("0-6 codeql-xray-1" "8-11 codeql-xray-3")))
+      (let ((marks (codeql-test--xray-marks src 'base)))
+        ;; big has DIL, lines has only RA, and both keep their colors in either
+        (dolist (mark '("4-5 codeql-xray-1" "11-13 codeql-xray-2" "23-25 codeql-xray-3"
+                        ;; lines is used by files, without DIL, and the select clause
+                        "11 no DIL: inlined into select"
+                        "21 no DIL: unused"
+                        "27 no DIL: inlined"
+                        ;; a class has code when an inner definition has
+                        "7 no DIL: inlined into select"))
+          (should (member mark marks))))
+      (codeql-test--xray-goto buf 1)
+      (codeql-xray-other)
+      (should (equal (codeql-xray--view-kind (car (codeql-xray-views state))) "RA"))
+      (should (equal (car (codeql-test--xray-lines buf)) "EVALUATE RECURSIVE LAYER:"))
+      (should-not (member "7 no RA: inlined" (codeql-test--xray-marks src 'base))))))
+
+(ert-deftest codeql-test-xray-active ()
+  "The definition at point and its code are highlighted, either way around."
+  (codeql-test--with-xray (state src '("DIL"))
+    (let ((buf (codeql-test--xray-view state 0)))
+      (codeql-test--xray-move src 25)
+      (should (equal (codeql-test--xray-marks buf 'active) '("8-11 codeql-xray-active")))
+      (should (equal (codeql-test--xray-marks src 'active) '("23-25 codeql-xray-active")))
+      (codeql-test--xray-move buf 2)
+      (should (equal (codeql-test--xray-marks src 'active) '("4-5 codeql-xray-active")))
+      (codeql-xray-visit-definition)
+      (should (eq (current-buffer) src))
+      (should (= (line-number-at-pos) 5)))))
+
+(ert-deftest codeql-test-xray-peek ()
+  "The single view toggles RA and peeks at the relations of the libraries."
+  (codeql-test--with-xray (state src '("DIL"))
+    (let ((buf (codeql-test--xray-view state 0)))
+      (codeql-test--xray-goto buf 1)
+      (codeql-xray-other)
+      ;; the previous iteration of a recursive relation is the relation
+      (codeql-test--xray-goto buf 8 30)
+      (codeql-xray-peek)
+      (should (= (line-number-at-pos) 1))
+      (codeql-xray-other)
+      (codeql-test--xray-goto buf 6 6)
+      (codeql-xray-peek)
+      (should (equal (list (codeql-test--xray-line) (codeql-test--xray-line 1))
+                     '("overlayLocal" "`Lib::helper/1#11`(int x)")))
+      ;; peeked blocks have no definition in the query
+      (should (equal (codeql-test--xray-marks buf 'base)
+                     '("0-6 codeql-xray-1" "8-11 codeql-xray-3"))))))
+
+(ert-deftest codeql-test-xray-edits ()
+  "The definitions are followed as the query is edited."
+  (codeql-test--with-xray (state src '("DIL"))
+    (let ((buf (codeql-test--xray-view state 0)))
+      (with-current-buffer src
+        (goto-char (point-min))
+        (insert "\n\n"))
+      (codeql-xray--remap state)
+      (codeql-xray--render state)
+      (should (member "6-7 codeql-xray-1" (codeql-test--xray-marks src 'base)))
+      ;; a definition renamed has no code until it compiles again
+      (should (member "`Deep::Inner::big/2#0154355b`(" (codeql-test--xray-lines buf)))
+      (with-current-buffer src
+        (goto-char (point-min))
+        (search-forward "big(")
+        (replace-match "bigger("))
+      (codeql-xray--remap state)
+      (codeql-xray--render state)
+      (should-not (member "`Deep::Inner::big/2#0154355b`(" (codeql-test--xray-lines buf)))
+      (should (timerp (codeql-xray-timer state))))))
+
+(ert-deftest codeql-test-xray-error ()
+  "A query that doesn't compile shows why."
+  (codeql-test--with-xray (state src '("DIL"))
+    (codeql-xray-show state (list :success nil
+                                  :messages (vector (list :severity "ERROR"
+                                                          :message "could not resolve type Bigg"
+                                                          :position (list :line 24 :column 6)))))
+    (should (equal (codeql-test--xray-lines (codeql-test--xray-view state 0))
+                   '("-- Deep.ql doesn't compile" "error:24:6: could not resolve type Bigg")))
+    (should (equal (codeql-xray--decode "oops" "Fatal error\n")
+                   '(:success nil :messages [(:severity "ERROR" :message "Fatal error")])))))
+
+(ert-deftest codeql-test-xray-columns ()
+  "The columns tell which dumps a definition has no code in, and follow point."
+  (codeql-test--with-xray (state src '("DIL" "RA"))
+    (let ((dil (codeql-test--xray-view state 0))
+          (ra (codeql-test--xray-view state 1)))
+      (let ((marks (codeql-test--xray-marks src 'base)))
+        (dolist (mark '("11 no DIL: inlined into select"
+                        "21 no DIL or RA: unused"
+                        ;; the class has RA through lines, but no DIL
+                        "7 no DIL: inlined into select"
+                        ;; big is inlined into the characteristic predicate of Big
+                        "4 no RA: inlined into Big"))
+          (should (member mark marks))))
+      (codeql-test--xray-move src 25)
+      (should (equal (codeql-test--xray-marks dil 'active) '("8-11 codeql-xray-active")))
+      (should (equal (codeql-test--xray-marks ra 'active) '("10-13 codeql-xray-active")))
+      (codeql-test--xray-move dil 2)
+      (should (equal (codeql-test--xray-marks src 'active) '("4-5 codeql-xray-active")))
+      ;; big is inlined into the RA of lines
+      (should-not (codeql-test--xray-marks ra 'active))
+      ;; the code of the same definition in the other dump
+      (codeql-test--xray-move dil 10)
+      (codeql-xray-other)
+      (should (eq (current-buffer) ra))
+      (should (= (line-number-at-pos) 11))
+      (should (equal (codeql-xray--view-kind (car (codeql-xray-views state))) "DIL"))
+      (codeql-xray-other)
+      (should (eq (current-buffer) dil))
+      (should (= (line-number-at-pos) 9))
+      ;; and the same relation of the libraries, peeked at in both
+      (codeql-test--xray-goto dil 1)
+      (search-forward "`Lib::helper")
+      (backward-char 3)
+      (codeql-xray-peek)
+      (should (equal (codeql-test--xray-line 1) "`Lib::helper/1#11`(int x)"))
+      (codeql-xray-other)
+      (should (eq (current-buffer) ra))
+      (should (equal (codeql-test--xray-line 1) "  `Lib::helper/1#11`(int x) :- ")))))
+
+(ert-deftest codeql-test-xray-same-relation ()
+  "The other column shows the same relation of a definition with several."
+  (codeql-test--with-xray (state src '("DIL" "RA"))
+    (codeql-xray-show state
+                      (list :success t
+                            :DIL (vconcat codeql-test--xray-dil
+                                          '("" "#select#query(int b)" "{" "  #select(b, _)" "}"))
+                            :RA (vconcat codeql-test--xray-ra
+                                         '("" "EVALUATE NONRECURSIVE RELATION:"
+                                           "  #select#query(int b) :- " "    return r1"))))
+    (codeql-test--xray-goto (codeql-test--xray-view state 0) 15)
+    (codeql-xray-other)
+    (should (equal (codeql-test--xray-line 1) "  #select#query(int b) :- "))
+    (codeql-xray-other)
+    (should (equal (codeql-test--xray-line) "#select#query(int b)"))))
+
+(ert-deftest codeql-test-xray-class-mentions ()
+  "The types naming a class inlined into its users are highlighted."
+  (codeql-test--with-xray (state src '("DIL" "RA"))
+    (let ((dil (codeql-test--xray-view state 0))
+          (with-types (vconcat codeql-test--xray-dil)))
+      (aset with-types 14 "#select(/* Deep::Inner::Big */ interned unique entity b, int n)")
+      (codeql-xray-show state (list :success t :DIL with-types :RA (vconcat codeql-test--xray-ra)))
+      (codeql-test--xray-move src 8)
+      (with-current-buffer dil
+        (let ((found (seq-filter (lambda (ov) (eq (overlay-get ov 'codeql-xray) 'active))
+                                 (overlays-in (point-min) (point-max)))))
+          (should (= (length found) 1))
+          (should (equal (buffer-substring-no-properties (overlay-start (car found))
+                                                         (overlay-end (car found)))
+                         "/* Deep::Inner::Big */")))))))
+
+(ert-deftest codeql-test-xray-close-view ()
+  "Closing a view keeps the others, closing the x-ray all of them."
+  (codeql-test--with-xray (state src '("DIL" "RA"))
+    (let ((dil (codeql-test--xray-view state 0))
+          (win (split-window-right)))
+      (set-window-buffer win (codeql-test--xray-view state 1))
+      (kill-buffer (codeql-test--xray-view state 1))
+      (should-not (window-live-p win))
+      (should (equal (mapcar #'codeql-xray--view-buf (codeql-xray-views state)) (list dil)))
+      (should (eq (buffer-local-value 'codeql-xray--state src) state))
+      (with-current-buffer src
+        (codeql-xray))
+      (should-not (buffer-live-p dil))
+      (should-not (buffer-local-value 'codeql-xray--state src))
+      (with-current-buffer src
+        (should-not (seq-find (lambda (ov) (overlay-get ov 'codeql-xray))
+                              (overlays-in (point-min) (point-max))))
+        (should-not (memq #'codeql-xray--source-post-command post-command-hook))))))
+
+(ert-deftest codeql-test-xray-instance-alias ()
+  "The relations of an instance in the query are named after its alias."
+  (let* ((defs (codeql-xray--outline
+                '("module Config implements DataFlow::ConfigSig { }"
+                  "module Flow = TaintTracking::Global<Config>;"
+                  "select 1")))
+         (flow (seq-find (lambda (def) (eq (codeql-xray-def-kind def) 'instance)) defs))
+         (blocks (list (codeql-xray-block-create
+                        :first 0 :last 1
+                        :names '("Paths::Flow::Flow::BooleanCallContext::CcCall#6c5581c4"))
+                       (codeql-xray-block-create
+                        :first 3 :last 4
+                        :names '("Paths::Flow::Flow::S6::flowPath/2#56199763"))
+                       (codeql-xray-block-create
+                        :first 6 :last 7 :names '("Other::Flow::p/0#1")))))
+    (should (equal (codeql-xray-def-keys flow) '("Flow")))
+    (should (equal (mapcar (lambda (m) (codeql-xray-def-name (cdr m)))
+                           (codeql-xray--map blocks "Paths" defs))
+                   '("Flow" "Flow")))))
+
+(defmacro codeql-test--with-inst-xray (spec &rest body)
+  "Run BODY with the x-ray of Inst.ql, SPEC is (STATE SRC DIL RA)."
+  (declare (indent 1))
+  (pcase-let ((`(,state ,src ,dil ,ra) spec))
+    `(codeql-test--with-xray (,state ,src '("DIL" "RA") "Inst.ql" codeql-test--xray-inst
+                                     codeql-test--xray-inst-dil codeql-test--xray-inst-ra)
+       (let ((,dil (codeql-test--xray-view ,state 0))
+             (,ra (codeql-test--xray-view ,state 1)))
+         (ignore ,dil ,ra)
+         ,@body))))
+
+(defun codeql-test--xray-folds (buffer)
+  "Return the folds of the view BUFFER as their rows and whether they're closed."
+  (with-current-buffer buffer
+    (mapcar (lambda (fold)
+              (list (codeql-xray--fold-first fold) (codeql-xray--fold-last fold)
+                    (and (codeql-xray--fold-closed-p fold) t)))
+            (codeql-xray--view-folds codeql-xray--this-view))))
+
+(ert-deftest codeql-test-xray-folds ()
+  "The relations of an instantiated module fold into one line."
+  (codeql-test--with-inst-xray (state src dil ra)
+    ;; the code of each definition together, in the order of the query
+    (should (equal (codeql-test--xray-folds dil) '((0 4 t) (6 7 t))))
+    (should (equal (nth 9 (codeql-test--xray-lines dil))
+                   (format "#select(/* Lib::PathGraph<%s::PathNode, %s::PathGraph>::Node */ int n)"
+                           codeql-test--xray-g codeql-test--xray-g)))
+    (should (equal (substring-no-properties
+                    (overlay-get (codeql-xray--fold-overlay
+                                  (car (codeql-xray--view-folds
+                                        (car (codeql-xray-views state)))))
+                                 'display))
+                   "▸ Flow  ·  2 blocks  ·  TaintTracking::Global<Config>  ·  o opens"))
+    ;; and keeps an open one open
+    (codeql-test--xray-goto dil 1)
+    (codeql-xray-toggle-fold)
+    (codeql-xray-show state (list :success t :DIL (vconcat codeql-test--xray-inst-dil)
+                                  :RA (vconcat codeql-test--xray-inst-ra)))
+    (should (equal (codeql-test--xray-folds dil) '((0 4 nil) (6 7 t))))))
+
+(ert-deftest codeql-test-xray-fold-navigation ()
+  "A closed fold counts as one block, and the other column opens one."
+  (codeql-test--with-inst-xray (state src dil ra)
+    (codeql-test--xray-goto dil 1)
+    (codeql-xray-next-block)
+    (should (= (line-number-at-pos) 7))
+    (codeql-xray-next-block)
+    (should (string-prefix-p "#select(" (codeql-test--xray-line)))
+    (codeql-xray-previous-block)
+    (codeql-xray-previous-block)
+    (should (= (line-number-at-pos) 1))
+    ;; and an open one as its blocks
+    (codeql-xray-toggle-fold)
+    (codeql-xray-next-block)
+    (should (= (line-number-at-pos) 4))
+    ;; the same relation in the other dump, named differently, opening its fold
+    (goto-char (point-min))
+    (codeql-xray-other)
+    (should (eq (current-buffer) ra))
+    (should (equal (codeql-test--xray-folds ra) '((0 6 nil))))
+    (should (equal (codeql-test--xray-line 1)
+                   (format "  `num#%s::p/0#9`(int x) :- " codeql-test--xray-g)))))
+
+(ert-deftest codeql-test-xray-instance-peek ()
+  "A relation of the libraries named differently is peeked at in both dumps."
+  (codeql-test--with-inst-xray (state src dil ra)
+    (codeql-test--xray-goto dil 1)
+    (search-forward "Lib::Other")
+    (codeql-xray-peek)
+    (codeql-xray-other)
+    (should (eq (current-buffer) ra))
+    (should (equal (codeql-test--xray-line 1)
+                   "  `num#TaintTracking::Global<Lib::Other>::Flow::p/0#8`() :- "))))
+
+(ert-deftest codeql-test-xray-instance-mentions ()
+  "The types of an instantiated module are highlighted in other code."
+  (codeql-test--with-inst-xray (state src dil ra)
+    (cl-flet ((mentions ()
+                (with-current-buffer dil
+                  (mapcar (lambda (ov) (buffer-substring-no-properties
+                                        (overlay-start ov) (overlay-end ov)))
+                          (seq-filter (lambda (ov)
+                                        (and (eq (overlay-get ov 'codeql-xray) 'active)
+                                             (not (string-search
+                                                   "\n" (buffer-substring (overlay-start ov)
+                                                                          (overlay-end ov))))))
+                                      (overlays-in (point-min) (point-max)))))))
+      (codeql-test--xray-move src 3)
+      (should (equal (mentions)
+                     (list (format "/* Lib::PathGraph<%s::PathNode, %s::PathGraph>::Node */"
+                                   codeql-test--xray-g codeql-test--xray-g))))
+      ;; the flow only within the arguments of the type
+      (codeql-test--xray-move src 2)
+      (should-not (mentions))
+      ;; of the code of the last compile
+      (let ((plain (vconcat codeql-test--xray-inst-dil)))
+        (aset plain 12 (concat "#select(int " (make-string 300 ?n) ")"))
+        (codeql-xray-show state (list :success t :DIL plain :RA (vconcat codeql-test--xray-inst-ra))))
+      (codeql-test--xray-move src 3)
+      (should-not (mentions)))))
+
+(ert-deftest codeql-test-xray-command ()
+  "The x-ray needs a query and runs `codeql query compile' with its dumps."
+  (with-temp-buffer
+    (should-error (codeql-xray) :type 'user-error))
+  (let* ((dir (make-temp-file "codeql-xray" t))
+         (file (expand-file-name "Deep.ql" dir))
+         (commands nil)
+         (make-process (symbol-function 'make-process)))
+    (with-temp-file file
+      (insert (string-join codeql-test--xray-source "\n")))
+    (unwind-protect
+        (with-current-buffer (let ((auto-mode-alist nil)) (find-file-noselect file))
+          (setq-local codeql--cli-buffer-local '("codeql"))
+          (setq-local codeql--search-paths-buffer-local '("/packs"))
+          (delete-other-windows)
+          (switch-to-buffer (current-buffer))
+          (cl-letf (((symbol-function 'make-process)
+                     (lambda (&rest args)
+                       (push (plist-get args :command) commands)
+                       (let ((stdout (plist-get args :buffer)))
+                         (with-current-buffer stdout
+                           (insert (json-serialize
+                                    (vector (list :success t
+                                                  :messages []
+                                                  :DIL (vconcat codeql-test--xray-dil)
+                                                  :RA (vconcat codeql-test--xray-ra))))))
+                         (let ((proc (funcall make-process :name "true" :command '("true"))))
+                           (set-process-sentinel proc #'ignore)
+                           (while (process-live-p proc) (accept-process-output proc 0.05))
+                           (run-at-time 0 nil (plist-get args :sentinel) proc "finished\n")
+                           proc)))))
+            (codeql-xray)
+            (let ((state codeql-xray--state))
+              (should state)
+              (should (= (length (window-list)) 3))
+              (should (equal (mapcar #'codeql-xray--view-kind (codeql-xray-views state))
+                             '("DIL" "RA")))
+              (should (equal (car commands)
+                             (list "codeql" "query" "compile" "--dump-dil" "--dump-ra"
+                                   "--format=json" "--threads=0" "--additional-packs=/packs"
+                                   "--" file)))
+              (with-timeout (5 (error "The compile didn't finish"))
+                (while (not (codeql-xray-result state))
+                  (accept-process-output nil 0.05)))
+              (should (string-match-p "2 of 3 blocks"
+                                      (with-current-buffer (codeql-test--xray-view state 0)
+                                        (codeql-xray--header-line))))
+              ;; saving compiles again
+              (set-buffer-modified-p t)
+              (save-buffer)
+              (should (= (length commands) 2))
+              (codeql-xray)
+              (should-not codeql-xray--state)
+              (should (= (length (window-list)) 1)))))
+      (when-let* ((buf (get-file-buffer file)))
+        (with-current-buffer buf (set-buffer-modified-p nil))
+        (kill-buffer buf))
+      (delete-directory dir t))))
+
 (provide 'emacs-codeql-test)
 ;;; emacs-codeql-test.el ends here
