@@ -5838,6 +5838,12 @@ innermost node at point selected in text diagrams."
   (interactive)
   (codeql-view-ast t))
 
+(defvar codeql--cfg-position nil
+  "The (FILE LINE . COLUMN) of point when `codeql-view-cfg' was last called.
+
+The innermost node of the graph there is selected when it is shown, see
+`codeql--graph-node-at-position'.")
+
 (defun codeql-view-cfg ()
   "Display the control flow graph of the function at point.
 
@@ -5850,6 +5856,9 @@ as described for `codeql-graph-format'."
       (let ((src-filename (buffer-file-name))
             (src-buffer (current-buffer))
             (position (cons (line-number-at-pos) (codeql--lsp-abiding-column))))
+        (setq codeql--cfg-position
+              (cons (file-local-name src-filename)
+                    (cons (line-number-at-pos) (1+ (- (point) (line-beginning-position))))))
         (with-current-buffer codeql--org-query-buffer
           (message "Cooking up CFG for %s, please hold." (file-name-nondirectory src-filename))
           (let ((language (intern (format ":%s" codeql--active-database-language))))
@@ -6545,7 +6554,14 @@ labels of the nodes of a row follow the diagram from left to right."
                    widths))
          target)
     (unless codeql--graph-selected
-      (setq codeql--graph-selected (car (car (car (car rows))))))
+      ;; rather than a node without edges, like a function name in a CFG
+      (setq codeql--graph-selected
+            (let ((ids (cl-loop for (nodes) in rows append (mapcar #'car nodes))))
+              (or (cl-find-if (lambda (id)
+                                (or (aref (plist-get codeql--graph-text :successors) id)
+                                    (aref (plist-get codeql--graph-text :predecessors) id)))
+                              ids)
+                  (car ids)))))
     (pcase-dolist (`(,nodes ,node-line ,link-line) rows)
       (let ((start (point))
             (width (pop widths))
@@ -6986,8 +7002,11 @@ nil."
          (map-path (concat base ".cmapx"))
          (inhibit-read-only t)
          note)
-    (when (process-live-p codeql--graph-render-process)
-      (delete-process codeql--graph-render-process))
+    ;; forget the process first, so its sentinel doesn't take it for a failure
+    (when-let ((process codeql--graph-render-process))
+      (setq codeql--graph-render-process nil)
+      (when (process-live-p process)
+        (delete-process process)))
     (codeql--unfollow-source)
     (erase-buffer)
     (setq header-line-format nil)
@@ -7138,6 +7157,7 @@ Image formats are skipped when they can't be rendered or shown."
 (declare-function image-scroll-down "image-mode")
 (declare-function image-bob "image-mode")
 (declare-function image-eob "image-mode")
+(declare-function image-mode-setup-winprops "image-mode")
 
 (defvar codeql-graph-image-map
   (let ((map (make-sparse-keymap)))
@@ -7216,24 +7236,28 @@ see `codeql-graph-follow-source'.
 
 \\{codeql-graph-mode-map}"
   (require 'image-mode)
+  ;; image scrolling keeps per window state, see `image-mode-winprops'
+  (image-mode-setup-winprops)
   (setq truncate-lines t)
   (setq-local revert-buffer-function #'codeql--graph-revert)
   (codeql--follow-source-setup))
 
-(defun codeql--show-graph (dot-path &optional nodes query-buffer compact)
+(defun codeql--show-graph (dot-path &optional nodes query-buffer compact position)
   "Show the graph of the dot file at DOT-PATH in a `codeql-graph-mode' buffer.
 
 NODES are the nodes of the graph as returned by `codeql--bqrs-graph-nodes',
 their locations are visited with the database of QUERY-BUFFER.  The
 graph is shown as set by `codeql-graph-format', with the short labels of
-`codeql--graph-compact' when COMPACT is non-nil."
+`codeql--graph-compact' when COMPACT is non-nil.  The innermost node at
+POSITION, a (FILE LINE . COLUMN) list, is selected, see
+`codeql--graph-node-at-position'."
   (let ((nodes (and nodes (codeql--graph-match-nodes dot-path nodes))))
     (with-current-buffer (get-buffer-create
                           (format "*codeql-graph: %s*" (file-name-base dot-path)))
       (codeql-graph-mode)
       (setq codeql--graph-dot-path dot-path
             codeql--graph-text nil
-            codeql--graph-selected nil
+            codeql--graph-selected (codeql--graph-node-at-position nodes position)
             codeql--graph-trail nil
             codeql--graph-collapsed nil
             codeql--graph-format codeql-graph-format
@@ -7243,6 +7267,43 @@ graph is shown as set by `codeql-graph-format', with the short labels of
       (codeql--graph-render)
       (switch-to-buffer-other-window (current-buffer))
       (codeql--graph-follow))))
+
+(defun codeql--graph-node-at-position (nodes position)
+  "Return the dot node id of the innermost of NODES at POSITION, or nil.
+
+NODES is a vector of the (LABEL . LINK) of the nodes, as for
+`codeql--graph-nodes', and POSITION nil or a (FILE LINE . COLUMN) list
+of a file, a line and a 1-based column.  The innermost node is the one
+whose location starts last, and of those, ends first."
+  (when (and position (arrayp nodes))
+    (let ((file (file-local-name (car position)))
+          (point (cdr position))
+          (before-p (lambda (a b)
+                      (or (< (car a) (car b))
+                          (and (= (car a) (car b)) (<= (cdr a) (cdr b))))))
+          best best-start best-end)
+      (cl-loop
+       for (_ . link) across nodes
+       for id from 0
+       for parts = (and link
+                        (string-match "\\`\\(.*\\)::\\([0-9]+\\):\\([0-9]+\\):\\([0-9]+\\):\\([0-9]+\\)\\'"
+                                      link)
+                        (cons (match-string 1 link)
+                              (mapcar (lambda (group) (string-to-number (match-string group link)))
+                                      '(2 3 4 5))))
+       when (and parts (equal (file-local-name (car parts)) file))
+       do (pcase-let* ((`(,_ ,start-line ,start-column ,end-line ,end-column) parts)
+                       (start (cons start-line start-column))
+                       (end (cons end-line end-column)))
+            (when (and (funcall before-p start point)
+                       (funcall before-p point end)
+                       (or (not best)
+                           (not (funcall before-p start best-start))
+                           (and (equal start best-start)
+                                (funcall before-p end best-end)
+                                (not (equal end best-end)))))
+              (setq best id best-start start best-end end))))
+      best)))
 
 (defvar codeql--path-graph-directory nil
   "The directory of the dot files of `codeql-results-path-graph'.")
@@ -7551,7 +7612,9 @@ QUERY-PATH, and is shown in the Query Source section of the results."
                                 (when (buffer-live-p query-buffer)
                                   (with-current-buffer query-buffer
                                     (codeql--bqrs-graph-nodes bqrs-path)))
-                                query-buffer)
+                                query-buffer nil
+                                (prog1 codeql--cfg-position
+                                  (setq codeql--cfg-position nil)))
           (message "Failed to interpret graph results in %s." bqrs-path)))
        ;; fall through to raw results parsing
        (t
