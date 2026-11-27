@@ -1044,6 +1044,51 @@ OUTPUT is called with the arguments when it is a function."
           (push-button)
           (should (= codeql--graph-selected 1)))))))
 
+(ert-deftest codeql-ported-test-ast-graph ()
+  "ASTs are shown as graphs, with the innermost node at point selected."
+  (let* ((url (lambda (line column end-line end-column)
+                `((uri . "file:///a.js") (startLine . ,line) (startColumn . ,column)
+                  (endLine . ,end-line) (endColumn . ,end-column))))
+         (item (lambda (label location &rest children)
+                 (let ((item (codeql--ast-item-create :label label :location location
+                                                      :children (vconcat children))))
+                   (dolist (child children)
+                     (setf (codeql--ast-item-parent child) item))
+                   item)))
+         (tree (vector
+                (funcall item "[CallExpr] f(\"x\")" (funcall url 1 1 1 6)
+                         (funcall item "[VarRef] f" (funcall url 1 1 1 1))
+                         (funcall item "(Arguments)" nil
+                                  (funcall item "[Literal] \"x\"" (funcall url 1 3 1 5))))
+                (funcall item "[ExprStmt] g;" (funcall url 2 1 2 2))))
+         (codeql-graph-format "text")
+         (codeql-graph-follow-source nil)
+         (codeql--ast-graph-directory nil))
+    (codeql-ported-test--with-query-buffer
+      (cl-letf (((symbol-function 'switch-to-buffer-other-window) #'ignore)
+                ((symbol-function 'message) #'ignore))
+        (let ((codeql--source-link-prefix-box (list "/arch/src")))
+          (codeql--ast-to-graph tree "/arch/src/a.js" query-buffer '(1 . 4)))
+        (unwind-protect
+            (with-current-buffer "*codeql-graph: ast-a.js*"
+              (should (eq major-mode 'codeql-graph-mode))
+              (should (equal codeql--graph-nodes
+                             [("[CallExpr] f(\"x\")" . "/arch/src/a.js::1:1:1:6")
+                              ("[VarRef] f" . "/arch/src/a.js::1:1:1:1")
+                              ("(Arguments)" . nil)
+                              ("[Literal] \"x\"" . "/arch/src/a.js::1:3:1:5")
+                              ("[ExprStmt] g;" . "/arch/src/a.js::2:1:2:2")]))
+              (should (equal (codeql--dot-edges codeql--graph-dot-path)
+                             '((0 1 nil) (0 2 nil) (2 3 nil))))
+              ;; the literal is the innermost node containing 1:4
+              (should (eql codeql--graph-selected 3))
+              ;; each tree is a part of its own
+              (should (equal (plist-get codeql--graph-text :roots) '(0 4)))
+              (should (string-match-p "\\[Literal\\] \"x\"" (buffer-string))))
+          (when (get-buffer "*codeql-graph: ast-a.js*")
+            (kill-buffer "*codeql-graph: ast-a.js*"))
+          (delete-directory codeql--ast-graph-directory t))))))
+
 (ert-deftest codeql-ported-test-ast-follow-source ()
   "Moving point in the AST viewer highlights the source of its node."
   (codeql-ported-test--with-temp-dir dir

@@ -5443,6 +5443,15 @@ commands can be repeated without the prefix key.")
            do
            (cl-return t)))
 
+(defvar-local codeql--ast-as-graph nil
+  "How the AST of this source file is to be shown when it is ready.
+
+This is nil for the org tree of `codeql-view-ast', or the (LINE . COLUMN)
+position of the node to select in the graph of `codeql-view-ast-graph'.")
+
+(defvar codeql--ast-graph-directory nil
+  "The directory of the dot files of the AST graphs of this Emacs session.")
+
 (defun codeql--render-ast (json src-root src-filename src-buffer)
   (message "Rendering AST")
   ;; oh boy.
@@ -5533,10 +5542,84 @@ commands can be repeated without the prefix key.")
         (message "Tree is sorted (%d roots) ... rendering." (length sorted-tree))
         ;; render with buffer context ...
         (with-current-buffer src-buffer
-          (if (buffer-live-p codeql--org-query-buffer)
-              (codeql--ast-to-org sorted-tree src-filename src-buffer codeql--org-query-buffer)
+          (cond
+           (codeql--ast-as-graph
+            (codeql--ast-to-graph sorted-tree src-filename codeql--org-query-buffer
+                                  codeql--ast-as-graph))
+           ((buffer-live-p codeql--org-query-buffer)
+            (codeql--ast-to-org sorted-tree src-filename src-buffer codeql--org-query-buffer))
+           (t
             (message "No active buffer context available to render AST with, going to plaintext.")
-            (codeql--ast-to-org sorted-tree src-filename src-buffer)))))))
+            (codeql--ast-to-org sorted-tree src-filename src-buffer))))))))
+
+(defun codeql--ast-item-link (item query-buffer)
+  "Return the codeql: link path of the location of AST ITEM, or nil.
+
+The link is resolved with the database of QUERY-BUFFER."
+  (when-let* (((buffer-live-p query-buffer))
+              (url (codeql--location-url (codeql--ast-item-location item)))
+              ((natnump (alist-get 'startLine url)))
+              ((> (alist-get 'startLine url) 0)))
+    (with-current-buffer query-buffer
+      (ignore-errors (codeql--location-link-path url)))))
+
+(defun codeql--ast-item-contains-p (item position)
+  "Return non-nil when the location of AST ITEM contains POSITION.
+
+POSITION is a (LINE . COLUMN) cons, 1-based like locations are."
+  (when-let* ((url (codeql--location-url (codeql--ast-item-location item)))
+              (line (alist-get 'startLine url))
+              ((natnump line))
+              ((> line 0)))
+    (let ((start (cons line (or (alist-get 'startColumn url) 1)))
+          (end (cons (or (alist-get 'endLine url) line)
+                     (or (alist-get 'endColumn url) most-positive-fixnum)))
+          (before-p (lambda (a b)
+                      (or (< (car a) (car b))
+                          (and (= (car a) (car b)) (<= (cdr a) (cdr b)))))))
+      (and (funcall before-p start position) (funcall before-p position end)))))
+
+(defun codeql--ast-to-graph (sorted-tree src-filename &optional query-buffer position)
+  "Show the AST SORTED-TREE of SRC-FILENAME as a graph.
+
+The graph is shown by `codeql--show-graph', with its locations resolved
+with QUERY-BUFFER.  The innermost node containing POSITION, a (LINE .
+COLUMN) cons, is selected when the graph is shown as text."
+  (unless (and codeql--ast-graph-directory (file-directory-p codeql--ast-graph-directory))
+    (setq codeql--ast-graph-directory (make-temp-file "codeql-ast-graphs-" t)))
+  (let ((dot-path (expand-file-name (format "ast-%s.dot" (file-name-nondirectory src-filename))
+                                    codeql--ast-graph-directory))
+        (count 0)
+        nodes edges selected)
+    ;; nodes are numbered in preorder, so children come after their parents
+    (cl-labels ((walk (item parent)
+                  (let ((id count)
+                        (label (string-trim (replace-regexp-in-string
+                                             "[ \t\n]+" " "
+                                             (format "%s" (codeql--ast-item-label item))))))
+                    (setq count (1+ count))
+                    (push (cons label (codeql--ast-item-link item query-buffer)) nodes)
+                    (when parent
+                      (push (cons parent id) edges))
+                    (when (and position (codeql--ast-item-contains-p item position))
+                      (setq selected id))
+                    (cl-loop for child across (codeql--ast-item-children item)
+                             do (walk child id)))))
+      (cl-loop for root across sorted-tree do (walk root nil)))
+    (setq nodes (nreverse nodes))
+    (with-temp-file dot-path
+      (insert "digraph {\n")
+      (cl-loop for (label . _) in nodes for id from 0 do
+               (insert (format "%d[\"label\"=\"%s\"];\n" id
+                               (replace-regexp-in-string "[\"\\]" "\\\\\\&" label))))
+      (pcase-dolist (`(,from . ,to) (nreverse edges))
+        (insert (format "%d -> %d;\n" from to)))
+      (insert "}\n"))
+    (codeql--show-graph dot-path nodes query-buffer)
+    (when-let ((buffer (get-buffer (format "*codeql-graph: %s*" (file-name-base dot-path)))))
+      (with-current-buffer buffer
+        (when (and selected (codeql--graph-text-p))
+          (codeql--graph-select selected))))))
 
 (defun codeql--ast-to-org (sorted-tree src-filename src-buffer &optional buffer-context)
   ;; src-filename is (buffer-filename) for the src buffer ... XXX: check with TRAMP
@@ -5648,9 +5731,13 @@ commands can be repeated without the prefix key.")
                (< (codeql--ast-item-order left)
                   (codeql--ast-item-order right)))))
 
-(defun codeql-view-ast ()
-  "Display the AST for the current source archive file."
+(defun codeql-view-ast (&optional as-graph)
+  "Display the AST for the current source archive file.
+
+With AS-GRAPH, show it as a graph instead, see `codeql-view-ast-graph'."
   (interactive)
+  (setq codeql--ast-as-graph
+        (and as-graph (cons (line-number-at-pos) (codeql--lsp-abiding-column))))
   (cl-multiple-value-bind (json src-root) (gethash (buffer-file-name) codeql--ast-cache)
     (if json
         ;; render the AST from cache
@@ -5664,6 +5751,15 @@ commands can be repeated without the prefix key.")
               (let ((language (intern (format ":%s" codeql--active-database-language))))
                 (codeql--run-templated-query language "printAst" src-filename src-buffer))))
         (message "Did not recognize this file as being part of an active codeql database.")))))
+
+(defun codeql-view-ast-graph ()
+  "Display the AST for the current source archive file as a graph.
+
+The AST is shown in a `codeql-graph-mode' buffer as set by
+`codeql-graph-format', like the graphs of `codeql-view-cfg', with the
+innermost node at point selected in text diagrams."
+  (interactive)
+  (codeql-view-ast t))
 
 (defun codeql-view-cfg ()
   "Display the control flow graph of the function at point.

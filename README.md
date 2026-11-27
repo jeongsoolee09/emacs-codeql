@@ -521,6 +521,8 @@ Just like the vscode extension, `emacs-codeql` lets you browse the AST of a data
 
 Moving point in the source file highlights its node in the AST viewer, and moving point in the AST viewer shows the source of the node at point in another window, highlighted with `codeql-follow-source-face`, like the CFG viewer below. `codeql-ast-sync-highlighting` turns both off.
 
+`M-x RET codeql-view-ast-graph RET` shows the AST as a graph instead, in the formats of the CFG viewer below. As a text diagram, each top-level node is a part of its own, its children run side by side, and the innermost node at point is selected.
+
 ### Graph results and the CFG Viewer
 
 Results of `@kind graph` queries are interpreted as graphviz dot files with `codeql bqrs interpret --format=dot` and shown in a `codeql-graph-mode` buffer. The viewing format is set by `codeql-graph-format`: an `svg` (the default) or `png` image rendered by graphviz's `dot`, a `text` diagram, or `nil` for the dot source. When `dot` is not installed or the frame can't show images, e.g. in a terminal, the graph is drawn as text.
