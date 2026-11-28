@@ -14,6 +14,7 @@ An emacs package for writing and testing [CodeQL](https://codeql.github.com/) qu
 - Comparing the results of two query runs
 - Loading SARIF files, e.g. from `codeql database analyze` or code scanning, as browsable results
 - Query performance summaries from evaluator logs
+- A query x-ray: the DIL and RA a query compiles to, in columns beside it, each definition in its own color
 - Persistent per-project database history, with optional consult narrowing and embark actions
 - Registration of zipped database archives
 - Result browsing
@@ -366,6 +367,16 @@ Each query run writes a structured evaluator log next to its results (set `codeq
 
 `codeql-query-performance-compare` (`T`) matches the computed predicates of two runs by name and lists the time and tuples of each run, the largest difference in time first. Predicates that were taken from the cache in one of the runs show `-` for that run.
 
+#### Query x-ray
+
+`codeql-xray` (`x` in `codeql-command-map`) shows, Godbolt style, what the query compiles to: the DIL and the RA of `codeql query compile --dump-dil --dump-ra` in two columns beside the query, with only the code that comes from the query, no library code. It needs no query server or database.
+
+- Each definition of the query and its code in the dumps get a color of their own (the faces `codeql-xray-1` and on). A definition the compiler inlined into others, like a class or a small predicate, has its code colored within that of its users: the types naming the class in the DIL, the predicates it calls, and the columns of its variables in the RA. Every definition with no code of its own is told why at the end of its line, like `no DIL or RA: inlined into select` or `unused`.
+- The definition at point is highlighted in the query and in both dumps, and the other windows scroll to it; moving in a dump highlights the definition of the code at point, the block of the relation at point is marked in the margin of both dumps.
+- Saving the query compiles it again; the header line of each dump counts its blocks, the compile time and the blocks new, changed or gone since the last compile, marked at their first line. Edits before saving remap the dumps to the definitions as they move.
+
+In the dumps, `TAB` goes to the code of the same definition in the other dump, `RET` to the definition in the query, `n` and `p` to the next and previous blocks, `g` compiles again and `q` closes the x-ray; `x` in the query closes it too.
+
 #### Jumping to result locations
 
 `codeql-results-goto-location` offers every source location in the current results buffer (or page of results) for completion, each with the text of the result it belongs to, and visits the chosen one like following its link. Bind it in `codeql-results-mode-map`, or call it with `M-x`.
@@ -581,6 +592,7 @@ It doesn't run anything. Queries are run with the commands of `codeql-command-ma
 | `C` | `codeql-query-history-compare` |
 | `t` | `codeql-query-performance` |
 | `T` | `codeql-query-performance-compare` |
+| `x` | `codeql-xray` |
 | `l` | `codeql-load-sarif` |
 | `v` | `codeql-mrva` |
 | `f` | `codeql-database-open-source-archive-file` |
@@ -770,6 +782,8 @@ The regression tests in `test/` don't need the CodeQL CLI:
 ```
 emacs -Q --batch -L . -l test/emacs-codeql-test.el -f ert-run-tests-batch-and-exit
 ```
+
+The tests of the query x-ray are in `test/emacs-codeql-xray-test.el`, run the same way.
 
 The org-ql tests are skipped unless org-ql and its dependencies are on the `load-path` (add them with `-L`). The session, REPL and Org Babel tests are skipped unless the tree-sitter `ql` grammar is installed.
 
