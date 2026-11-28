@@ -10459,8 +10459,12 @@ their :events and :before-events, and the :src buffer of the query.")
                                  (if (and (plist-get entry :cold)
                                           (plist-get (plist-get data :before) :cold))
                                      ""
-                                   (substitute-command-keys
-                                    " (\\[codeql-query-server-run-query-cold] for comparable times)")))
+                                   ;; with the keys of the query buffer
+                                   (with-current-buffer (if (buffer-live-p (plist-get data :src))
+                                                            (plist-get data :src)
+                                                          (current-buffer))
+                                     (substitute-command-keys
+                                      " (\\[codeql-query-server-run-query-cold] for comparable times)"))))
                        ""))
            "")
          (format "  (sorted by %s)\n" (plist-get data :by)))
@@ -11453,6 +11457,9 @@ processes, wait until `codeql--query-server-cmd' signals readiness."
 The server is shared with the buffers that `codeql-share-query-server'
 says should share it."
   (cl-assert (eq major-mode 'ql-tree-sitter-mode) t)
+  ;; prefer query-server2 when available, known before its options are
+  (unless codeql-query-server
+    (setq codeql-query-server (codeql--resolve-query-server)))
   (let* ((ram-options (codeql--query-server-resolve-ram codeql--query-server-max-ram))
          (server-args (append
                        args
@@ -11464,10 +11471,12 @@ says should share it."
                          '("--require-db-registration"))
                         ;; new query-server options
                         ((string= codeql-query-server "query-server2")
-                         ;; without a server-wide structured log, the logs of
-                         ;; the query runs carry no tuple counts
+                         ;; without tuple counting and a server-wide
+                         ;; structured log, the logs of the query runs carry
+                         ;; no tuple counts
                          (when codeql-evaluator-log
-                           (list "--evaluator-log"
+                           (list "--tuple-counting"
+                                 "--evaluator-log"
                                  (codeql--tramp-unwrap
                                   (make-temp-name
                                    (expand-file-name "codeql-server-"
@@ -11492,12 +11501,8 @@ says should share it."
            (cmd (append
                  codeql--cli-buffer-local
                  (list "execute"
-                       ;; determine which query server to use
-                       ;; prefer query-server2 when available
                        ;; don't confuse this with codeql--query-server, which is the rpc connection
-                       (or codeql-query-server
-                           (setq codeql-query-server
-                                 (codeql--resolve-query-server))))
+                       codeql-query-server)
                  server-args)))
       (message "Starting query server.")
       ;; manage these buffer local

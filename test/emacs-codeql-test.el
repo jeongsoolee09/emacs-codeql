@@ -3406,7 +3406,7 @@ As strings of their rows, texts and faces."
             (should (string-match-p "at 10:02:00 cold: " title))
             (should (string-match-p "at 10:00:00 cold (baseline)" title))
             ;; both cold: nothing to tell about the cache
-            (should-not (string-match-p "run-query-cold" title)))
+            (should-not (string-match-p "comparable times" title)))
           (with-current-buffer hotspots
             (codeql-hotspots-pin)
             (should (eq codeql--performance-baseline run))
@@ -3420,7 +3420,7 @@ As strings of their rows, texts and faces."
             (should-not (string-match-p "(baseline)" title))
             (should (string-match-p "at 10:01:00, which" title))
             ;; read from the cache, warm
-            (should (string-match-p "run-query-cold.* for comparable times" title))))
+            (should (string-match-p "(\\(C-c C-q P\\|M-x codeql-query-server-run-query-cold\\) for comparable times)" title))))
       (setq codeql--performance-baseline nil)
       (when (buffer-live-p hotspots) (kill-buffer hotspots))
       (dolist (buffer (list src other-src))
@@ -3428,6 +3428,26 @@ As strings of their rows, texts and faces."
         (kill-buffer buffer))
       (delete-directory dir t)
       (delete-other-windows))))
+
+(ert-deftest codeql-test-query-server-evaluator-log ()
+  "The first server of a buffer writes the evaluator log its runs' tuple counts need."
+  (with-temp-buffer
+    (setq major-mode 'ql-tree-sitter-mode)
+    (let ((codeql-evaluator-log t)
+          (codeql-share-query-server 'project)
+          (cmd nil))
+      (cl-letf (((symbol-function 'codeql--resolve-query-server) (lambda () "query-server2"))
+                ((symbol-function 'codeql--query-server-resolve-ram) (lambda (_) '("-J-Xmx1M")))
+                ((symbol-function 'codeql--query-server-project) (lambda () "/p/"))
+                ((symbol-function 'codeql--make-server-process)
+                 (lambda (_coding &rest args)
+                   (setq cmd (plist-get args :command))
+                   (throw 'started nil))))
+        (catch 'started (codeql--query-server-start '("--threads=0")))
+        (should (equal codeql-query-server "query-server2"))
+        (should (member "query-server2" cmd))
+        (should (member "--evaluator-log" cmd))
+        (should (member "--tuple-counting" cmd))))))
 
 (ert-deftest codeql-test-run-query-cold ()
   "A cold run clears the cache of the database first, and is marked cold."
