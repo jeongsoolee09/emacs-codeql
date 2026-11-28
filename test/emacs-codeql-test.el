@@ -2731,7 +2731,7 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
                          (goto-char (codeql-xray--row-pos (1+ (car (codeql-test--xray-peers ra)))))
                          (codeql-test--xray-line)))))
       (with-current-buffer dil
-        (should (= left-margin-width 1)))
+        (should (= left-margin-width 2)))
       (codeql-test--xray-goto dil 1)
       (re-search-forward "^#select(")
       (let ((row (1- (line-number-at-pos))))
@@ -2747,6 +2747,48 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
                          (number-sequence (codeql-xray--span-first last)
                                           (codeql-xray--span-last last)))))
         (should (equal (funcall ra-block) "  #select#query(int b) :- "))))))
+
+(ert-deftest codeql-test-xray-diff ()
+  "The blocks new or changed since the last compile, and how many are gone."
+  (let* ((old ["`M::p/0#aa11`()" "{ x = 1 }" "" "`M::q/0#bb22`()" "{ `M::p/0#aa11`() }"
+               "" "`M::r/0#cc`()" "{ }"])
+         (new ["`M::p/0#dd33`()" "{ x = 2 }" "" "`M::q/0#ee44`()" "{ `M::p/0#dd33`() }"
+               "" "`M::s/0#ff`()" "{ }"])
+         (old-blocks (codeql-xray--blocks old "DIL"))
+         (blocks (codeql-xray--blocks new "DIL")))
+    (should (= (codeql-xray--diff old old-blocks new blocks) 1))
+    (should (equal (mapcar #'codeql-xray-block-diff blocks) '(changed nil new)))))
+
+(ert-deftest codeql-test-xray-changes ()
+  "The blocks changed since the last compile are marked, counted and gone to."
+  (codeql-test--with-xray (state src '("DIL" "RA"))
+    (let ((dil (codeql-test--xray-view state 0))
+          (ra (codeql-test--xray-view state 1))
+          (changed (copy-sequence codeql-test--xray-ra)))
+      (setf (nth 18 changed)
+            "    {2} r1 = SCAN `Deep::Inner::Big.lines/0#dispred#78` OUTPUT In.1 'b', In.0 'n'")
+      (cl-flet ((compile (ra-lines)
+                  (codeql-xray-show state (list :success t
+                                                :DIL (vconcat codeql-test--xray-dil)
+                                                :RA (vconcat ra-lines)))))
+        (compile changed)
+        (should-not (codeql-test--xray-marks dil 'diff))
+        (with-current-buffer ra
+          (let ((tags (seq-filter (lambda (ov) (and (eq (overlay-get ov 'codeql-xray) 'diff)
+                                                    (overlay-get ov 'after-string)))
+                                  (overlays-in (point-min) (point-max)))))
+            (should (= (length tags) 1))
+            (goto-char (overlay-start (car tags)))
+            (should (equal (codeql-test--xray-line 1) "  #select(int b, int n) :- "))
+            (should (string-match-p "1 changed" (codeql-xray--header-line)))))
+        (codeql-test--xray-goto ra 1)
+        (codeql-xray-next-change)
+        (should (equal (codeql-test--xray-line 1) "  #select(int b, int n) :- "))
+        ;; compiling the same again changes nothing
+        (compile changed)
+        (should-not (codeql-test--xray-marks ra 'diff))
+        (with-current-buffer ra
+          (should-not (string-match-p "changed" (codeql-xray--header-line))))))))
 
 (defmacro codeql-test--with-inst-xray (spec &rest body)
   "Run BODY with the x-ray of Inst.ql, SPEC is (STATE SRC DIL RA)."
@@ -2825,6 +2867,24 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
       (run-hooks 'post-command-hook)
       (should (codeql-test--xray-peers dil))
       (should-not (codeql-test--xray-peers ra)))))
+
+(ert-deftest codeql-test-xray-fold-changes ()
+  "A fold counts the blocks changed in it, and going to one opens it."
+  (codeql-test--with-inst-xray (state src dil ra)
+    (let ((changed (copy-sequence codeql-test--xray-inst-ra)))
+      (setf (nth 6 changed) "    return r2")
+      (codeql-xray-show state (list :success t
+                                    :DIL (vconcat codeql-test--xray-inst-dil)
+                                    :RA (vconcat changed)))
+      (let ((fold (car (codeql-xray--view-folds (nth 1 (codeql-xray-views state))))))
+        (should (= (codeql-xray--fold-changed fold) 1))
+        (should (codeql-xray--fold-closed-p fold))
+        (should (string-match-p "1 changed" (overlay-get (codeql-xray--fold-overlay fold) 'display)))
+        (codeql-test--xray-goto ra 1)
+        (codeql-xray-next-change)
+        (should (equal (codeql-test--xray-line 1)
+                       (format "  `num#%s::p/0#9`(int x) :- " codeql-test--xray-g)))
+        (should-not (codeql-xray--fold-closed-p fold))))))
 
 (ert-deftest codeql-test-xray-instance-peek ()
   "A relation of the libraries named differently is peeked at in both dumps."

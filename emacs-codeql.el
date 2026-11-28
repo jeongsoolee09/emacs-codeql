@@ -11197,6 +11197,16 @@ one dump beside the query, see `codeql-xray-kind'."
   "The notes of the definitions without code in the x-ray."
   :group 'emacs-codeql)
 
+(defface codeql-xray-new
+  '((t :inherit success))
+  "The blocks of the x-ray of relations new since the last compile."
+  :group 'emacs-codeql)
+
+(defface codeql-xray-changed
+  '((t :inherit warning))
+  "The blocks of the x-ray whose code changed since the last compile."
+  :group 'emacs-codeql)
+
 (defface codeql-xray-peer
   '((t :inherit font-lock-builtin-face))
   "The bar beside the block of the relation at point, and of the same relation."
@@ -11220,8 +11230,10 @@ its EXPR, like \"TaintTracking::Global<Config>\", and SHAPE, like
 
 (cl-defstruct (codeql-xray-block (:constructor codeql-xray-block-create)
                                  (:copier nil))
-  "The 0-based lines FIRST to LAST of a dump, defining the relations NAMES."
-  first last names)
+  "The 0-based lines FIRST to LAST of a dump, defining the relations NAMES.
+
+DIFF is `new' or `changed' when it is since the last compile."
+  first last names diff)
 
 (cl-defstruct (codeql-xray--span (:constructor codeql-xray--span-create)
                                  (:copier nil))
@@ -11230,8 +11242,10 @@ its EXPR, like \"TaintTracking::Global<Config>\", and SHAPE, like
 
 (cl-defstruct (codeql-xray--fold (:constructor codeql-xray--fold-create)
                                  (:copier nil))
-  "The COUNT blocks of the instance DEF, lines FIRST to LAST of a view."
-  def first last count overlay)
+  "The COUNT blocks of the instance DEF, lines FIRST to LAST of a view.
+
+CHANGED and NEW count those blocks changed and new since the last compile."
+  def first last count overlay changed new)
 
 (cl-defstruct (codeql-xray--view (:constructor codeql-xray--view-create)
                                  (:copier nil))
@@ -11244,7 +11258,7 @@ CURRENT is the span at point, as last followed."
                            (:copier nil))
   "The x-ray of the query in buffer SRC."
   src path module views defs users coded mapped blocks result error unused
-  index peeks active compiling elapsed proc map-cache timer)
+  index peeks active compiling elapsed proc map-cache timer last gone)
 
 (defvar-local codeql-xray--state nil
   "The x-ray of the query of this buffer, or of the one it is a view of.")
@@ -11938,14 +11952,30 @@ Those with code in any of KINDS, through the ones without code using it."
   "Return the line showing the closed FOLD of STATE."
   (let* ((def (codeql-xray--fold-def fold))
          (n (gethash def (codeql-xray--colors state))))
-    (propertize
-     (format "▸ %s  ·  %d blocks  ·  %s  ·  %s opens"
-             (codeql-xray-def-name def) (codeql-xray--fold-count fold)
-             (codeql-xray-def-expr def)
-             (substitute-command-keys "\\<codeql-xray-mode-map>\\[codeql-xray-toggle-fold]"))
-     'face (cond ((eq def (codeql-xray-active state)) 'codeql-xray-active)
-                 (n (codeql-xray--face n))
-                 (t 'shadow)))))
+    (let ((face (cond ((eq def (codeql-xray-active state)) 'codeql-xray-active)
+                      (n (codeql-xray--face n))
+                      (t 'shadow))))
+      (concat
+       (propertize (format "▸ %s  ·  %d blocks" (codeql-xray-def-name def)
+                           (codeql-xray--fold-count fold))
+                   'face face)
+       (mapconcat (lambda (diff)
+                    (when-let* ((count (if (eq diff 'new)
+                                           (codeql-xray--fold-new fold)
+                                         (codeql-xray--fold-changed fold))))
+                      (concat (propertize "  ·  " 'face face)
+                              (propertize (format "%d %s" count diff)
+                                          'face (codeql-xray--diff-face diff)))))
+                  '(changed new) "")
+       (propertize
+        (format "  ·  %s  ·  %s opens"
+                (codeql-xray-def-expr def)
+                (substitute-command-keys "\\<codeql-xray-mode-map>\\[codeql-xray-toggle-fold]"))
+        'face face)))))
+
+(defun codeql-xray--diff-face (diff)
+  "Return the face of the DIFF of a block, `new' or `changed'."
+  (if (eq diff 'new) 'codeql-xray-new 'codeql-xray-changed))
 
 (defun codeql-xray--fold-closed-p (fold)
   "Return non-nil if FOLD is closed."
@@ -12020,7 +12050,12 @@ Then the blocks peeked at."
                 (push group groups))
               (add (car m) (cdr m))
               (setf (codeql-xray--fold-last group) (1- count))
-              (cl-incf (codeql-xray--fold-count group)))))
+              (cl-incf (codeql-xray--fold-count group))
+              (pcase (codeql-xray-block-diff (car m))
+                ('new (setf (codeql-xray--fold-new group)
+                            (1+ (or (codeql-xray--fold-new group) 0))))
+                ('changed (setf (codeql-xray--fold-changed group)
+                                (1+ (or (codeql-xray--fold-changed group) 0))))))))
         (dolist (block (codeql-xray--of (codeql-xray-peeks state) kind))
           (add block nil))
         (when (and (codeql-xray-result state) (= count 0))
@@ -12048,6 +12083,24 @@ Then the blocks peeked at."
             (insert line "\n"))
           (setq starts (vconcat (nreverse starts)))
           (setf (codeql-xray--view-starts view) starts)
+          ;; the blocks new or changed since the last compile
+          (dolist (span (codeql-xray--view-spans view))
+            (when-let* ((diff (codeql-xray-block-diff (codeql-xray--span-block span)))
+                        (face (codeql-xray--diff-face diff))
+                        (bol (codeql-xray--row-pos (codeql-xray--span-first span) starts))
+                        (eol (1- (codeql-xray--row-pos (1+ (codeql-xray--span-first span))
+                                                       starts))))
+              (let ((sign (make-overlay bol bol))
+                    (tag (make-overlay eol eol)))
+                (overlay-put sign 'codeql-xray 'diff)
+                (overlay-put sign 'priority 10)
+                (overlay-put sign 'before-string
+                             (propertize " " 'display
+                                         `((margin left-margin)
+                                           ,(propertize (if (eq diff 'new) "+" "~") 'face face))))
+                (overlay-put tag 'codeql-xray 'diff)
+                (overlay-put tag 'after-string
+                             (concat "  " (propertize (symbol-name diff) 'face face))))))
           ;; the many relations of a module the query instantiates fold into
           ;; one line, kept open when they were
           (setf (codeql-xray--view-folds view)
@@ -12131,6 +12184,67 @@ Then the blocks peeked at."
       (setf (codeql-xray-active state)
             (codeql-xray--def-at defs (codeql-xray-def-srow active))))))
 
+(defun codeql-xray--body (lines block)
+  "Return the code of BLOCK of the dump LINES without the hashes.
+
+Hashes change with any edit."
+  (let ((case-fold-search nil))
+    (replace-regexp-in-string
+     "#[[:xdigit:]]+\\([^[:alnum:]_]\\|\\'\\)" "\\1"
+     (mapconcat (lambda (i) (aref lines i))
+                (number-sequence (codeql-xray-block-first block) (codeql-xray-block-last block))
+                "\n")
+     t)))
+
+(defun codeql-xray--identity (block)
+  "Return the relations of BLOCK by their names without hashes."
+  (string-join (sort (mapcar #'codeql-xray--bare (codeql-xray-block-names block)) #'string<)
+               " "))
+
+(defun codeql-xray--diff (old-lines old-blocks lines blocks)
+  "Mark the BLOCKS of LINES new or changed since the OLD-BLOCKS of OLD-LINES.
+
+Telling the relations by their names without hashes.  Return how many
+of the old ones are gone."
+  (let ((old (make-hash-table :test #'equal))
+        (seen (make-hash-table :test #'equal))
+        (gone 0))
+    (dolist (block old-blocks)
+      (let ((id (codeql-xray--identity block)))
+        (puthash id (cons (codeql-xray--body old-lines block) (gethash id old)) old)))
+    (dolist (block blocks)
+      (let* ((id (codeql-xray--identity block))
+             (bodies (gethash id old 'none)))
+        (puthash id t seen)
+        (setf (codeql-xray-block-diff block)
+              (cond ((eq bodies 'none) 'new)
+                    ((not (member (codeql-xray--body lines block) bodies)) 'changed)))))
+    (dolist (block old-blocks)
+      (unless (gethash (codeql-xray--identity block) seen)
+        (setq gone (1+ gone))))
+    gone))
+
+(defun codeql-xray--mapped-blocks (state kind)
+  "Return the blocks of the dump of KIND of STATE mapped to the query."
+  (mapcar #'car (codeql-xray--of (codeql-xray-mapped state) kind)))
+
+(defun codeql-xray--compare (state)
+  "Mark the blocks of STATE changed since the last time the query compiled."
+  (when-let* ((result (codeql-xray-result state)))
+    (let ((last (codeql-xray-last state)))
+      (setf (codeql-xray-gone state) (codeql-xray--kinds-alist))
+      (when last
+        (dolist (kind '("DIL" "RA"))
+          (setf (codeql-xray--of (codeql-xray-gone state) kind)
+                (codeql-xray--diff (codeql-xray--of (car last) kind)
+                                   (codeql-xray--of (cdr last) kind)
+                                   (codeql-xray--of result kind)
+                                   (codeql-xray--mapped-blocks state kind)))))
+      (setf (codeql-xray-last state)
+            (cons result (mapcar (lambda (kind)
+                                   (cons kind (codeql-xray--mapped-blocks state kind)))
+                                 '("DIL" "RA")))))))
+
 (defun codeql-xray-show (state result)
   "Show the decoded RESULT of `codeql query compile' in the x-ray STATE.
 
@@ -12166,6 +12280,7 @@ and the lines of its :DIL and :RA."
       (setf (codeql-xray--of (codeql-xray-blocks state) kind)
             (codeql-xray--blocks (codeql-xray--of (codeql-xray-result state) kind) kind))))
   (codeql-xray--remap state)
+  (codeql-xray--compare state)
   (codeql-xray--render state))
 
 (defun codeql-xray--decode (output errors)
@@ -12244,7 +12359,17 @@ Or a failed one with the message ERRORS when OUTPUT isn't JSON."
                            (length (codeql-xray--of (codeql-xray-mapped state) kind))
                            (length (codeql-xray--of (codeql-xray-blocks state) kind)))
                    parts)
-             (push (format "%.1fs" (or (codeql-xray-elapsed state) 0)) parts)))
+             (push (format "%.1fs" (or (codeql-xray-elapsed state) 0)) parts)
+             (let ((changed 0) (new 0)
+                   (gone (or (codeql-xray--of (codeql-xray-gone state) kind) 0)))
+               (dolist (m (codeql-xray--of (codeql-xray-mapped state) kind))
+                 (pcase (codeql-xray-block-diff (car m))
+                   ('changed (cl-incf changed))
+                   ('new (cl-incf new))))
+               (when-let* ((diffs (delq nil (list (and (> changed 0) (format "%d changed" changed))
+                                                  (and (> new 0) (format "%d new" new))
+                                                  (and (> gone 0) (format "%d gone" gone))))))
+                 (push (string-join diffs ", ") parts)))))
       (push (format "%s %s"
                     (substitute-command-keys "\\<codeql-xray-mode-map>\\[codeql-xray-other]")
                     (codeql-xray--other-kind kind))
@@ -12481,6 +12606,35 @@ A closed fold counts as one block."
         (when target
           (goto-char (codeql-xray--row-pos target (codeql-xray--view-starts view))))))))
 
+(defun codeql-xray--jump-changed (direction)
+  "Go to the next block changed since the last compile when DIRECTION is positive.
+
+Else to the previous one, opening its fold."
+  (pcase-let ((`(,state ,view) (codeql-xray--current)))
+    (let ((row (codeql-xray--current-row))
+          (target nil))
+      (dolist (span (codeql-xray--view-spans view))
+        (when (codeql-xray-block-diff (codeql-xray--span-block span))
+          (let ((first (codeql-xray--span-first span)))
+            (cond ((and (> direction 0) (> first row) (not target))
+                   (setq target first))
+                  ((and (< direction 0) (< first row))
+                   (setq target first))))))
+      (if target
+          (codeql-xray--goto-row state view target)
+        (message "No %s block changed since the last compile"
+                 (if (> direction 0) "next" "previous"))))))
+
+(defun codeql-xray-next-change ()
+  "Go to the next block changed since the last compile."
+  (interactive)
+  (codeql-xray--jump-changed 1))
+
+(defun codeql-xray-previous-change ()
+  "Go to the previous block changed since the last compile."
+  (interactive)
+  (codeql-xray--jump-changed -1))
+
 (defun codeql-xray-next-block ()
   "Go to the next block, a closed fold counting as one."
   (interactive)
@@ -12520,6 +12674,8 @@ A closed fold counts as one block."
     (define-key map (kbd ".") #'codeql-xray-peek)
     (define-key map (kbd "n") #'codeql-xray-next-block)
     (define-key map (kbd "p") #'codeql-xray-previous-block)
+    (define-key map (kbd "M-n") #'codeql-xray-next-change)
+    (define-key map (kbd "M-p") #'codeql-xray-previous-change)
     (define-key map (kbd "o") #'codeql-xray-toggle-fold)
     (define-key map (kbd "g") #'codeql-xray-recompile)
     (define-key map (kbd "q") #'codeql-xray-quit)
@@ -12533,6 +12689,8 @@ A closed fold counts as one block."
                     "gd" #'codeql-xray-peek
                     "]]" #'codeql-xray-next-block
                     "[[" #'codeql-xray-previous-block
+                    "]c" #'codeql-xray-next-change
+                    "[c" #'codeql-xray-previous-change
                     "o" #'codeql-xray-toggle-fold
                     "zo" #'codeql-xray-toggle-fold
                     "zc" #'codeql-xray-toggle-fold
@@ -12562,7 +12720,7 @@ A closed fold counts as one block."
 
 \\{codeql-xray-mode-map}"
   (setq-local truncate-lines t)
-  (setq-local left-margin-width 1)
+  (setq-local left-margin-width 2)
   (setq-local font-lock-defaults '(codeql-xray-font-lock-keywords t))
   (setq-local header-line-format '(:eval (codeql-xray--header-line)))
   (setq-local revert-buffer-function (lambda (&rest _) (codeql-xray-recompile))))

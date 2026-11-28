@@ -559,7 +559,7 @@ There is AST xref support bound to `M->` in any database source file that also h
 
 Each definition and its code have the same background color, `codeql-xray-1` to `codeql-xray-6`. Moving point over any of them highlights the definition and its code in all columns with `codeql-xray-active`, scrolling the others into view. In a dump, a bar in the margin, `codeql-xray-peer`, marks the block of the relation at point, and the block of the same relation in the other dump, which scrolls to it as point goes from block to block, opening its fold. A definition the compiler inlined, or dropped for being unused, is marked at the end of its line with the dumps it has no code in, like `no DIL or RA: unused`, and the definitions of the query that it went into, like `no DIL or RA: inlined into select`. Point on an inlined class also highlights the types of the variables the DIL still names it in, like `/* Query::Class */`.
 
-The many relations of a module the query instantiates, like `module Flow = TaintTracking::Global<Config>;`, belong to its alias and fold into one line per alias, like `▸ Flow  ·  1114 blocks  ·  TaintTracking::Global<Config>  ·  o opens`. Point on such an alias also highlights the DIL types naming the module it instantiates in the other code, like the variables of the select clause. Saving the query compiles it again; the header line shows how many blocks of the dump are the query's and how long compiling took. When the query doesn't compile, the columns list the compiler's messages.
+The many relations of a module the query instantiates, like `module Flow = TaintTracking::Global<Config>;`, belong to its alias and fold into one line per alias, like `▸ Flow  ·  1114 blocks  ·  TaintTracking::Global<Config>  ·  o opens`. Point on such an alias also highlights the DIL types naming the module it instantiates in the other code, like the variables of the select clause. Saving the query compiles it again. Then the blocks whose code changed since the last compile, hashes aside, are marked `~` and `changed` (`codeql-xray-changed`), the ones of relations it didn't have `+` and `new` (`codeql-xray-new`), with their counts and the ones gone in the header line and on the folds. The header line also shows how many blocks of the dump are the query's and how long compiling took. When the query doesn't compile, the columns list the compiler's messages.
 
 In the x-ray columns:
 
@@ -569,6 +569,7 @@ In the x-ray columns:
 | `RET` | `RET` | go to the definition of the block at point in the query |
 | `M-.`, `.` | `gd` | go to the block of the relation at point, showing a relation of the libraries below the others, which `TAB` then shows in the other column too |
 | `n`, `p` | `]]`, `[[` | go to the next or previous block, a closed fold counting as one |
+| `M-n`, `M-p` | `]c`, `[c` | go to the next or previous block changed since the last compile, opening its fold |
 | `o` | `o`, `za`, `zo`, `zc` | open or close the fold of an instantiated module |
 | `g` | `gr`, `r` | compile the query again |
 | `q` | `q` | close the x-ray |
