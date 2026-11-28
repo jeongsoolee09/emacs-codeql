@@ -3362,6 +3362,91 @@ As strings of their rows, texts and faces."
       (delete-directory dir t)
       (delete-other-windows))))
 
+(ert-deftest codeql-test-hotspots-baseline ()
+  "The runs of a query compare with the pinned baseline, telling cold runs."
+  (let* ((dir (make-temp-file "codeql-test-baseline" t))
+         (query (expand-file-name "Foo.ql" dir))
+         (other-query (expand-file-name "Bar.ql" dir))
+         (log (lambda (name) (let ((file (expand-file-name name dir)))
+                               (write-region "" nil file nil 'silent)
+                               file)))
+         (base (list :query-path query :log-path (funcall log "base.jsonl") :cold t
+                     :timestamp "Fri Nov 27 10:00:00 2026"))
+         (middle (list :query-path query :log-path (funcall log "middle.jsonl")
+                       :timestamp "Fri Nov 27 10:01:00 2026"))
+         (run (list :query-path query :log-path (funcall log "run.jsonl") :cold t
+                    :timestamp "Fri Nov 27 10:02:00 2026"))
+         (other (list :query-path other-query :log-path (funcall log "other.jsonl")
+                      :timestamp "Fri Nov 27 10:03:00 2026"))
+         (src (find-file-noselect query))
+         (other-src (find-file-noselect other-query))
+         (hotspots nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'codeql--evaluator-log-summary)
+                   (lambda (log-path)
+                     (if (equal log-path (plist-get run :log-path))
+                         (codeql-test--hotspots-after "/lib/Lib.qll")
+                       (codeql-test--hotspots-before)))))
+          (dolist (pair `((,src . (,base ,middle ,run)) (,other-src . (,other))))
+            (with-current-buffer (car pair)
+              (setq codeql--completed-query-history (make-hash-table :test #'equal))
+              (dolist (entry (cdr pair))
+                (puthash (plist-get entry :log-path) entry codeql--completed-query-history))))
+          (should (eq (codeql--previous-run src run) middle))
+          (codeql-performance-pin base)
+          (should (eq (codeql--previous-run src run) base))
+          ;; itself, and the runs of other queries, compare with the run before
+          (should-not (codeql--previous-run src base))
+          (should-not (codeql--previous-run other-src other))
+          (with-current-buffer src
+            (setq hotspots (codeql-query-hotspots run)))
+          (let ((title (with-current-buffer hotspots
+                         (goto-char (point-min))
+                         (buffer-substring (point) (line-end-position)))))
+            (should (string-match-p "at 10:02:00 cold: " title))
+            (should (string-match-p "at 10:00:00 cold (baseline)" title))
+            ;; both cold: nothing to tell about the cache
+            (should-not (string-match-p "run-query-cold" title)))
+          (with-current-buffer hotspots
+            (codeql-hotspots-pin)
+            (should (eq codeql--performance-baseline run))
+            (codeql-hotspots-pin)
+            (should-not codeql--performance-baseline))
+          (with-current-buffer src
+            (codeql-query-hotspots run))
+          (let ((title (with-current-buffer hotspots
+                         (goto-char (point-min))
+                         (buffer-substring (point) (line-end-position)))))
+            (should-not (string-match-p "(baseline)" title))
+            (should (string-match-p "at 10:01:00, which" title))
+            ;; read from the cache, warm
+            (should (string-match-p "run-query-cold.* for comparable times" title))))
+      (setq codeql--performance-baseline nil)
+      (when (buffer-live-p hotspots) (kill-buffer hotspots))
+      (dolist (buffer (list src other-src))
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-directory dir t)
+      (delete-other-windows))))
+
+(ert-deftest codeql-test-run-query-cold ()
+  "A cold run clears the cache of the database first, and is marked cold."
+  (let ((calls nil)
+        (cleared t))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'codeql--require-database) #'ignore)
+                ((symbol-function 'codeql-database-clear-cache)
+                 (lambda (callback) (push 'clear calls) (funcall callback cleared)))
+                ((symbol-function 'codeql-query-server-run-query)
+                 (lambda () (push (list 'run codeql--query-run-cold mark-active) calls))))
+        (setq mark-active t)
+        (codeql-query-server-run-query-cold)
+        (should (equal (reverse calls) '(clear (run t nil))))
+        ;; nothing run if the cache wasn't cleared
+        (setq calls nil cleared nil)
+        (codeql-query-server-run-query-cold)
+        (should (equal calls '(clear)))))))
+
 (ert-deftest codeql-test-xray-blowups ()
   "The steps blowing up, beside the cost of the run before, and going to them."
   (codeql-test--with-xray (state src '("DIL" "RA"))
@@ -3446,6 +3531,83 @@ As strings of their rows, texts and faces."
               (should (codeql-xray-reveal path "Lib::helper/1#11"))
               (should (equal (codeql-test--xray-line 1) "  `Lib::helper/1#11`(int x) :- "))
               (should-not (codeql-xray-reveal "/elsewhere/Other.ql" "Lib::helper/1#11"))))
+        (with-current-buffer src
+          (setq codeql--completed-query-history nil))
+        (delete-file previous-log)
+        (delete-file run-log)))))
+
+(ert-deftest codeql-test-xray-profiling ()
+  "Step counts beside those of the run compared with, cold runs, the baseline, the hot steps."
+  (codeql-test--with-xray (state src '("DIL" "RA"))
+    (let* ((ra (codeql-test--xray-view state 1))
+           (previous-log (make-temp-file "codeql-test-previous"))
+           (run-log (make-temp-file "codeql-test-run"))
+           (path (buffer-file-name src))
+           (previous (list :query-path path :log-path previous-log :cold t
+                           :timestamp "Fri Nov 27 10:00:00 2026"))
+           (run (list :query-path path :log-path run-log :cold t
+                      :timestamp "Fri Nov 27 10:05:00 2026"))
+           (scan "    {2} r1 = SCAN `cached_Other::q/1#22` OUTPUT In.0, In.1")
+           (delta "    {2} r1 = SCAN `Big.lines#prev_delta` OUTPUT In.1, In.0")
+           (big (lambda (millis counts rec-counts)
+                  (list
+                   (list :predicateName "Other::q/1#22" :raHash "hq" :evaluationStrategy "IN_LAYER"
+                         :resultSize 10 :dependencies '(:q "hq")
+                         :ra (list :rec (vector delta "    return r1"))
+                         :pipelineRuns (vector (list :raReference "rec" :counts rec-counts)))
+                   (list :predicateName "Deep::Inner::Big.lines/0#dispred#77" :millis millis
+                         :resultSize 20 :dependencies '(:q "hq")
+                         :ra (list :base (vector scan "    return r1"))
+                         :pipelineRuns (vector (list :raReference "base" :counts counts)))))))
+      (unwind-protect
+          (cl-letf (((symbol-function 'codeql--evaluator-log-summary-async)
+                     (lambda (log-path callback)
+                       (funcall callback (if (equal log-path run-log)
+                                             (funcall big 1200 [3000] [7])
+                                           (funcall big 900 [20] [7]))))))
+            (with-current-buffer src
+              (setq codeql--completed-query-history (make-hash-table :test #'equal))
+              (puthash "previous" previous codeql--completed-query-history)
+              (puthash "run" run codeql--completed-query-history))
+            (run-hook-with-args 'codeql-query-run-functions run)
+            (let ((row (codeql-test--xray-row ra "SCAN `Deep::Inner::big"))
+                  (rec (codeql-test--xray-row ra "prev_delta")))
+              ;; another count than before, and the same
+              (should (member "eol:was 20" (codeql-test--xray-costs ra row)))
+              (should-not (seq-find (lambda (text) (string-prefix-p "eol:was" text))
+                                    (codeql-test--xray-costs ra rec)))
+              (with-current-buffer ra
+                (should (string-match-p "⏱ 1.2 s of 1.2 s cold, was 900 ms of 900 ms cold"
+                                        (codeql-xray--header-line)))
+                (should (equal (codeql-xray--view-hot (nth 1 (codeql-xray-views state)))
+                               (list (cons row 3000) (cons rec 7)))))
+              ;; the steps by their tuples, the most first
+              (codeql-test--xray-goto ra 1)
+              (codeql-xray-next-hot)
+              (should (= (codeql-xray--current-row) row))
+              (codeql-xray-next-hot)
+              (should (= (codeql-xray--current-row) rec))
+              (codeql-xray-next-hot)
+              (should (= (codeql-xray--current-row) rec))
+              (codeql-xray-previous-hot)
+              (should (= (codeql-xray--current-row) row))
+              (codeql-xray-previous-hot)
+              (should (= (codeql-xray--current-row) row))
+              (codeql-test--xray-goto ra 1)
+              (codeql-xray-previous-hot)
+              (should (= (codeql-xray--current-row) rec))
+              ;; the baseline, pinned and unpinned
+              (codeql-performance-pin previous)
+              (with-current-buffer ra
+                (should (string-match-p "cold, baseline 900 ms of 900 ms cold"
+                                        (codeql-xray--header-line))))
+              (codeql-xray-pin-baseline)
+              (should (eq codeql--performance-baseline run))
+              (codeql-xray-pin-baseline)
+              (should-not codeql--performance-baseline)
+              (with-current-buffer ra
+                (should (string-match-p ", was 900 ms" (codeql-xray--header-line))))))
+        (setq codeql--performance-baseline nil)
         (with-current-buffer src
           (setq codeql--completed-query-history nil))
         (delete-file previous-log)

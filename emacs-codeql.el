@@ -8889,7 +8889,10 @@ flight doesn't change it.  It's a plist whose :kind is either:
   `codeql-query-server-quick-eval-predicate'.
 
 Other code that runs queries, e.g. to evaluate a snippet that has no
-file of its own, can pass a `quick-eval' provenance whose :path is nil."
+file of its own, can pass a `quick-eval' provenance whose :path is nil.
+
+Either has :cold non-nil when the run follows clearing the evaluation
+cache, see `codeql-query-server-run-query-cold'."
   (if (not quick-eval)
       (list :kind 'file :path query-path)
     (let* ((pred-pos (codeql--quick-eval-predicate-position quick-eval))
@@ -8978,8 +8981,8 @@ PROPERTIES are added to the outcome, see `codeql--query-result-handler'."
   "Functions called with the outcome of each query run that completed.
 
 The outcome is a plist, see `codeql--query-result-handler', with the
-:query-path of the query, whether it was a :quick-eval, and the
-:log-path of its evaluator log.")
+:query-path of the query, whether it was a :quick-eval, whether it was
+:cold, and the :log-path of its evaluator log.")
 
 (defun codeql--query-run-completed (handler outcome)
   "Record the query run of OUTCOME in query history and report it to HANDLER.
@@ -9022,6 +9025,8 @@ which becomes an `empty' one when the run has no results."
                :name ,(plist-get outcome :name)
                :kind ,(plist-get outcome :kind)
                :id ,(plist-get outcome :id)
+               ,@(when (plist-get outcome :cold)
+                   (list :cold t))
                ,@(when log-path
                    (list :log-path (and (file-exists-p log-path) log-path))))
              codeql--completed-query-history))))
@@ -9057,6 +9062,7 @@ HANDLER receives the outcome, see `codeql--query-result-handler'."
              :id ,(json-pointer-get query-info "/id")
              :quick-eval ,quick-eval
              :provenance ,provenance
+             :cold ,(plist-get provenance :cold)
              :buffer ,buffer-context
              :src-filename ,src-filename
              :src-root ,codeql--database-source-archive-root
@@ -9275,6 +9281,9 @@ HANDLER receives the outcome, see `codeql--query-result-handler'."
          provenance
          handler))))))
 
+(defvar codeql--query-run-cold nil
+  "Non-nil while requesting a run that follows clearing the evaluation cache.")
+
 (defun codeql--query-server-run-query-from-path (query-path
                                                  quick-eval
                                                  &optional
@@ -9302,6 +9311,8 @@ outcome, see `codeql--query-result-handler'."
          (db-path (directory-file-name codeql--active-database))
          (query-info (codeql--query-info query-path))
          (provenance (or provenance (codeql--query-provenance query-path quick-eval))))
+    (when codeql--query-run-cold
+      (setq provenance (plist-put (copy-sequence provenance) :cold t)))
     ;; request a query compilation, its success callback will then request a query run
     (codeql--query-server-request-compile-and-run
      (current-buffer)
@@ -9363,6 +9374,58 @@ no region is active, see `codeql--query-target'."
                    (y-or-n-p "Query was not saved prior to evaluation, save now?")))
       (save-buffer))
     (codeql--query-server-run-query-from-path query-path quick-eval)))
+
+(defun codeql-database-clear-cache (&optional callback)
+  "Clear the evaluation cache of the database in the query server.
+
+So the next run computes every relation again.  CALLBACK is called with
+non-nil when the cache was cleared, nil when it wasn't."
+  (interactive)
+  (codeql--require-database)
+  (let ((buffer (current-buffer))
+        (callback (or callback #'ignore)))
+    (codeql--jsonrpc-async-request
+     (codeql--query-server-current-or-error)
+     :evaluation/clearCache
+     `(:body
+       (:db ,(if (string= codeql-query-server "query-server")
+                 `(:dbDir ,codeql--database-dataset-folder :workingSet "default")
+               (codeql--file-truename codeql--active-database))
+        :dryRun :json-false)
+       :progressId ,(codeql--query-server-next-progress-id))
+     :timeout codeql-query-server-timeout
+     :success-fn
+     (jsonrpc-lambda (&key deletionMessage &allow-other-keys)
+       (message "%s" (or deletionMessage
+                         (format "Cleared the cache of %s"
+                                 (buffer-local-value 'codeql--active-database buffer))))
+       (funcall callback t))
+     :error-fn
+     (jsonrpc-lambda (&key code message &allow-other-keys)
+       (message "Could not clear the cache: %s %s" code message)
+       (funcall callback nil))
+     :deferred :evaluation/clearCache)))
+
+(defun codeql-query-server-run-query-cold ()
+  "Clear the evaluation cache of the database, then run the query.
+
+Nothing is read from the cache, so its times compare with those of
+another cold run.  The run is marked cold in the hotspots and the x-ray."
+  (interactive)
+  (codeql--require-database)
+  (when (or codeql--run-query-always-save
+            (and (buffer-modified-p)
+                 (y-or-n-p "Query was not saved prior to evaluation, save now?")))
+    (save-buffer))
+  (let ((buffer (current-buffer)))
+    (codeql-database-clear-cache
+     (lambda (cleared)
+       (when (and cleared (buffer-live-p buffer))
+         (with-current-buffer buffer
+           (let ((codeql--query-run-cold t)
+                 (codeql--run-query-always-save nil)
+                 (mark-active nil))
+             (codeql-query-server-run-query))))))))
 
 (defun codeql-query-server-quick-eval ()
   "Quick evaluate the active region, or the predicate or expression at point.
@@ -10192,12 +10255,49 @@ As its query history entries, the newest first."
   (and a b (plist-get a :log-path)
        (equal (plist-get a :log-path) (plist-get b :log-path))))
 
+(defvar codeql--performance-baseline nil
+  "The query run pinned for the later runs of its query to compare with.")
+
+(defvar codeql-performance-baseline-functions nil
+  "Functions called with the query run pinned or unpinned as the baseline.")
+
+(defun codeql--performance-baseline-p (entry)
+  "Return non-nil if the query run ENTRY is the pinned baseline."
+  (codeql--same-run-p codeql--performance-baseline entry))
+
+(defun codeql-performance-pin (entry)
+  "Pin the query run ENTRY as the baseline of its query, or unpin it.
+
+The later runs of the query compare with the baseline rather than with
+the run before them."
+  (if (codeql--performance-baseline-p entry)
+      (progn
+        (setq codeql--performance-baseline nil)
+        (message "Unpinned the baseline: runs compare with the one before again"))
+    (setq codeql--performance-baseline entry)
+    (message "Pinned the run of %s at %s as the baseline to compare with"
+             (file-name-nondirectory (plist-get entry :query-path))
+             (codeql--hotspots-clock entry)))
+  (run-hook-with-args 'codeql-performance-baseline-functions entry))
+
 (defun codeql--previous-run (src entry)
-  "Return the run of the query of buffer SRC before its run ENTRY, with a log."
-  (let ((runs (codeql--query-runs src)))
-    (when-let* ((at (seq-position runs entry #'codeql--same-run-p)))
-      (setq runs (nthcdr (1+ at) runs)))
-    (seq-find (lambda (run) (not (codeql--same-run-p run entry))) runs)))
+  "Return the run the run ENTRY of the query of buffer SRC compares with.
+
+The pinned baseline of the query, or else the run of it before ENTRY,
+with an evaluator log."
+  (let ((runs (codeql--query-runs src))
+        (baseline codeql--performance-baseline))
+    (if (and baseline
+             (buffer-file-name src)
+             (plist-get baseline :query-path)
+             (equal (expand-file-name (plist-get baseline :query-path))
+                    (expand-file-name (buffer-file-name src)))
+             (not (codeql--same-run-p baseline entry))
+             (file-exists-p (plist-get baseline :log-path)))
+        baseline
+      (when-let* ((at (seq-position runs entry #'codeql--same-run-p)))
+        (setq runs (nthcdr (1+ at) runs)))
+      (seq-find (lambda (run) (not (codeql--same-run-p run entry))) runs))))
 
 (defface codeql-hotspots-blowup
   '((t :inherit warning))
@@ -10225,6 +10325,7 @@ their :events and :before-events, and the :src buffer of the query.")
     (define-key map (kbd "RET") #'codeql-hotspots-visit)
     (define-key map (kbd "r") #'codeql-hotspots-show-step)
     (define-key map (kbd "s") #'codeql-hotspots-sort)
+    (define-key map (kbd "b") #'codeql-hotspots-pin)
     map)
   "Keymap for `codeql-hotspots-mode'.")
 
@@ -10233,6 +10334,7 @@ their :events and :before-events, and the :src buffer of the query.")
                     (kbd "RET") #'codeql-hotspots-visit
                     "r" #'codeql-hotspots-show-step
                     "s" #'codeql-hotspots-sort
+                    "b" #'codeql-hotspots-pin
                     "q" #'quit-window))
 
 (define-derived-mode codeql-hotspots-mode tabulated-list-mode "CodeQL-Hotspots"
@@ -10297,10 +10399,12 @@ their :events and :before-events, and the :src buffer of the query.")
     sum))
 
 (defun codeql--hotspots-clock (entry)
-  "Return the time of day of the query run ENTRY."
-  (if-let* ((timestamp (plist-get entry :timestamp)))
-      (format-time-string "%H:%M:%S" (date-to-time timestamp))
-    "?"))
+  "Return the time of day of the query run ENTRY, and whether it was cold."
+  (concat (if-let* ((timestamp (plist-get entry :timestamp)))
+              (format-time-string "%H:%M:%S" (date-to-time timestamp))
+            "?")
+          ;; a run with an empty cache, its times comparable with another's
+          (if (plist-get entry :cold) " cold" "")))
 
 (defun codeql--hotspots-render ()
   "Show the hotspots of this buffer, sorted as they are to be."
@@ -10343,12 +10447,20 @@ their :events and :before-events, and the :src buffer of the query.")
                  (codeql--performance-times threshold)
                  (codeql--performance-milliseconds (codeql--hotspots-total events)))
          (if before
-             (concat (format ", %s at %s"
+             (concat (format ", %s at %s%s"
                              (codeql--performance-milliseconds (codeql--hotspots-total before))
-                             (codeql--hotspots-clock (plist-get data :before)))
+                             (codeql--hotspots-clock (plist-get data :before))
+                             (if (codeql--performance-baseline-p (plist-get data :before))
+                                 " (baseline)"
+                               ""))
                      ;; what it computed before, it reads now
                      (if (> cached 0)
-                         (format ", which computed %d read from the cache now" cached)
+                         (concat (format ", which computed %d read from the cache now" cached)
+                                 (if (and (plist-get entry :cold)
+                                          (plist-get (plist-get data :before) :cold))
+                                     ""
+                                   (substitute-command-keys
+                                    " (\\[codeql-query-server-run-query-cold] for comparable times)")))
                        ""))
            "")
          (format "  (sorted by %s)\n" (plist-get data :by)))
@@ -10400,6 +10512,13 @@ or of its x-ray.  See `codeql-hotspots-mode'."
       (forward-line 1))
     (pop-to-buffer buffer)
     buffer))
+
+(defun codeql-hotspots-pin ()
+  "Pin the run of these hotspots as the baseline the later runs compare with.
+
+Or unpin it."
+  (interactive)
+  (codeql-performance-pin (plist-get codeql--hotspots :entry)))
 
 (defun codeql-hotspots-sort ()
   "Sort the hotspots by blowup, time, or change in time since the run before."
@@ -11660,6 +11779,7 @@ database is missing."
     (define-key map "E" #'codeql-repl-send-region)
     (define-key map "x" #'codeql-xray)
     (define-key map "H" #'codeql-query-hotspots)
+    (define-key map "P" #'codeql-query-server-run-query-cold)
     map)
   "Keymap of the commands that run queries in QL buffers.
 
@@ -11870,9 +11990,10 @@ code of the query took in the last run of it, and COST-BEFORE in the run
 before.  BLOWUPS are the rows of the steps blowing up, STEP-ROWS the row
 each evaluated step was matched with, by its line.  REGIONS are the parts
 of the code of their users the definitions inlined went into, see
-`codeql-xray--find-regions'."
+`codeql-xray--find-regions', and HOT the rows of the steps with their
+counts, the most tuples first."
   kind buf spans lines starts comments folds current cost cost-before blowups step-rows
-  regions)
+  regions hot)
 
 (cl-defstruct (codeql-xray (:constructor codeql-xray--create)
                            (:copier nil))
@@ -12985,6 +13106,17 @@ What its relations cost in the last run, and in the run before."
         'codeql-hotspots-blowup
       'codeql-xray-cost)))
 
+(defun codeql-xray--shaped (seg pipelines used)
+  "Return the first of PIPELINES not in USED with steps of the shapes of SEG.
+
+SEG is a list of the rows of steps of a dump with their skeletons."
+  (seq-find (lambda (pipeline)
+              (and (not (memq pipeline used))
+                   (equal (mapcar (lambda (step) (plist-get step :skeleton))
+                                  (plist-get pipeline :steps))
+                          (mapcar #'cdr seg))))
+            pipelines))
+
 (defun codeql-xray--decorate (state view)
   "Tell the time, rows and tuples the relations of VIEW took to evaluate.
 
@@ -13000,6 +13132,7 @@ where it isn't the dumped one."
     (setf (codeql-xray--view-cost view) nil
           (codeql-xray--view-cost-before view) nil
           (codeql-xray--view-blowups view) nil
+          (codeql-xray--view-hot view) nil
           (codeql-xray--view-step-rows view) (make-hash-table :test #'equal))
     (dolist (span (codeql-xray--view-spans view))
       (setf (codeql-xray--span-cost span) nil))
@@ -13045,7 +13178,9 @@ where it isn't the dumped one."
               (at (codeql-xray--span-last span) :eol (codeql-xray--cost-chunks sum before)))
             (when (and found (equal (codeql-xray--view-kind view) "RA"))
               (let ((pipelines (apply #'append (mapcar #'codeql-xray--cost-pipelines found)))
-                    (segments nil) (segment nil) (used nil))
+                    (pipelines-before (apply #'append (mapcar #'codeql-xray--cost-pipelines
+                                                              (plist-get before :found))))
+                    (segments nil) (segment nil) (used nil) (used-before nil))
                 ;; the runs of steps up to each return, each told the counts
                 ;; of the evaluated pipeline of the same shape
                 (cl-loop for row from (codeql-xray--span-first span)
@@ -13059,25 +13194,31 @@ where it isn't the dumped one."
                 (when segment
                   (push (nreverse segment) segments))
                 (dolist (seg (nreverse segments))
-                  (when-let* ((match (seq-find
-                                      (lambda (pipeline)
-                                        (and (not (memq pipeline used))
-                                             (equal (mapcar (lambda (step) (plist-get step :skeleton))
-                                                            (plist-get pipeline :steps))
-                                                    (mapcar #'cdr seg))))
-                                      pipelines)))
+                  (when-let* ((match (codeql-xray--shaped seg pipelines used)))
                     (push match used)
-                    (cl-loop for (row . _) in seg
+                    (cl-loop with was = (codeql-xray--shaped seg pipelines-before used-before)
+                             initially (when was (push was used-before))
+                             for (row . _) in seg
                              for step in (plist-get match :steps)
+                             for i from 0
                              do (unless (gethash (plist-get step :line)
                                                  (codeql-xray--view-step-rows view))
                                   (puthash (plist-get step :line) row
                                            (codeql-xray--view-step-rows view)))
                              do (when-let* ((n (plist-get step :count)))
-                                  (let ((face (codeql-xray--count-face n match)))
+                                  (let ((face (codeql-xray--count-face n match))
+                                        (before (and was (plist-get (nth i (plist-get was :steps))
+                                                                    :count))))
                                     (gutter row (codeql-xray--count n) face)
+                                    (push (cons row n) (codeql-xray--view-hot view))
                                     (when (eq face 'codeql-hotspots-blowup)
-                                      (blew-up row))))
+                                      (blew-up row))
+                                    ;; the tuples of the same step in the run
+                                    ;; compared with
+                                    (when (and before (/= before n))
+                                      (at row :eol (propertize
+                                                    (concat "was " (codeql-xray--count before))
+                                                    'face 'codeql-xray-was)))))
                              ;; the same step on other relations
                              do (unless (equal (plist-get step :relations)
                                                (codeql-xray--step-relations (aref lines row)))
@@ -13110,6 +13251,10 @@ where it isn't the dumped one."
                                           (propertize (concat "  " text) 'face face))))))))))))))
         (setf (codeql-xray--view-blowups view)
               (sort (codeql-xray--view-blowups view) #'<))
+        (setf (codeql-xray--view-hot view)
+              (sort (codeql-xray--view-hot view)
+                    (lambda (a b) (or (> (cdr a) (cdr b))
+                                      (and (= (cdr a) (cdr b)) (< (car a) (car b)))))))
         (dolist (fold (codeql-xray--view-folds view))
           (setf (codeql-xray--fold-cost fold)
                 (cl-loop for span in (codeql-xray--view-spans view)
@@ -13198,6 +13343,15 @@ of the run, or its entry in the query history, see
     (codeql-xray--load-costs state outcome)))
 
 (add-hook 'codeql-query-run-functions #'codeql-xray--query-run)
+
+(defun codeql-xray--baseline-changed (_entry)
+  "Compare the costs shown in the x-rays with the runs they compare with now."
+  (dolist (buffer (buffer-list))
+    (when-let* ((state (buffer-local-value 'codeql-xray--state buffer))
+                (costs (and (eq (codeql-xray-src state) buffer) (codeql-xray-costs state))))
+      (codeql-xray--load-costs state (codeql-xray--costs-entry costs)))))
+
+(add-hook 'codeql-performance-baseline-functions #'codeql-xray--baseline-changed)
 
 (defun codeql-xray--fold-text (state fold)
   "Return the line showing the closed FOLD of STATE."
@@ -13639,11 +13793,20 @@ Or a failed one with the message ERRORS when OUTPUT isn't JSON."
                          (costs (codeql-xray-costs state)))
                (push (concat (format "⏱ %s of %s" (codeql-xray--milliseconds cost)
                                      (codeql-xray--milliseconds (codeql-xray--costs-total costs)))
+                             (if (plist-get (codeql-xray--costs-entry costs) :cold) " cold" "")
                              (if-let* ((was (codeql-xray--view-cost-before view))
                                        (before (codeql-xray-before state)))
-                                 (format ", was %s of %s" (codeql-xray--milliseconds was)
+                                 (format ", %s %s of %s%s"
+                                         (if (codeql--performance-baseline-p
+                                              (codeql-xray--costs-entry before))
+                                             "baseline"
+                                           "was")
+                                         (codeql-xray--milliseconds was)
                                          (codeql-xray--milliseconds
-                                          (codeql-xray--costs-total before)))
+                                          (codeql-xray--costs-total before))
+                                         (if (plist-get (codeql-xray--costs-entry before) :cold)
+                                             " cold"
+                                           ""))
                                ""))
                      parts))))
       (push (format "%s %s"
@@ -13929,6 +14092,36 @@ Or makes, in the last run of the query, see `codeql-performance-blowup'."
   (interactive)
   (codeql-xray--jump-blowup -1))
 
+(defun codeql-xray--jump-hot (direction)
+  "Go to the step making the most tuples after the one at point.
+
+In DIRECTION, by their number: fewer when it is positive, more else."
+  (pcase-let ((`(,state ,view) (codeql-xray--current)))
+    (let* ((hot (codeql-xray--view-hot view))
+           (row (codeql-xray--current-row))
+           (at (cl-position row hot :key #'car))
+           (i (if at (+ at direction) (if (> direction 0) 0 (1- (length hot))))))
+      (cond ((null hot)
+             (message "%s" (substitute-command-keys
+                            "No counts of the steps: \\<codeql-xray-mode-map>\\[codeql-xray-run-query] runs the query")))
+            ((not (< -1 i (length hot)))
+             (message (if (> direction 0) "No step makes fewer tuples" "No step makes more tuples")))
+            (t
+             (push-mark nil t)
+             (codeql-xray--goto-row state view (car (nth i hot)))
+             (message "Step %d of %d by tuples: %s" (1+ i) (length hot)
+                      (codeql-xray--count (cdr (nth i hot)))))))))
+
+(defun codeql-xray-next-hot ()
+  "Go to the step making the most tuples after the one at point, by their number."
+  (interactive)
+  (codeql-xray--jump-hot 1))
+
+(defun codeql-xray-previous-hot ()
+  "Go to the step making the fewest tuples more than the one at point."
+  (interactive)
+  (codeql-xray--jump-hot -1))
+
 (defun codeql-xray-reveal (query name &optional step)
   "Go to the block of the relation NAME in the RA of an x-ray of QUERY.
 
@@ -14023,6 +14216,28 @@ RA of the query in a window."
       (let ((mark-active nil))
         (codeql-query-server-run-query)))))
 
+(defun codeql-xray-run-query-cold ()
+  "Run the query of the x-ray with an empty cache, for times to compare.
+
+See `codeql-query-server-run-query-cold'."
+  (interactive)
+  (let ((src (codeql-xray-src (car (codeql-xray--current)))))
+    (unless (buffer-live-p src)
+      (user-error "The query of this x-ray is gone"))
+    (with-current-buffer src
+      (codeql-query-server-run-query-cold))))
+
+(defun codeql-xray-pin-baseline ()
+  "Pin the last run of the query as the baseline the later runs compare with.
+
+Or unpin it."
+  (interactive)
+  (let ((src (codeql-xray-src (car (codeql-xray--current)))))
+    (if-let* ((last (and (buffer-live-p src) (car (codeql--query-runs src)))))
+        (codeql-performance-pin last)
+      (message "%s" (substitute-command-keys
+                     "No run of the query to pin yet: \\<codeql-xray-mode-map>\\[codeql-xray-run-query] runs it")))))
+
 (defun codeql-xray-quit ()
   "Close the x-ray."
   (interactive)
@@ -14040,7 +14255,11 @@ RA of the query in a window."
     (define-key map (kbd "M-p") #'codeql-xray-previous-change)
     (define-key map (kbd "]") #'codeql-xray-next-blowup)
     (define-key map (kbd "[") #'codeql-xray-previous-blowup)
+    (define-key map (kbd "}") #'codeql-xray-next-hot)
+    (define-key map (kbd "{") #'codeql-xray-previous-hot)
     (define-key map (kbd "H") #'codeql-query-hotspots)
+    (define-key map (kbd "B") #'codeql-xray-pin-baseline)
+    (define-key map (kbd "P") #'codeql-xray-run-query-cold)
     (define-key map (kbd "o") #'codeql-xray-toggle-fold)
     (define-key map (kbd "g") #'codeql-xray-recompile)
     (define-key map (kbd "r") #'codeql-xray-run-query)
@@ -14059,7 +14278,11 @@ RA of the query in a window."
                     "[c" #'codeql-xray-previous-change
                     "]x" #'codeql-xray-next-blowup
                     "[x" #'codeql-xray-previous-blowup
+                    "]h" #'codeql-xray-next-hot
+                    "[h" #'codeql-xray-previous-hot
                     "H" #'codeql-query-hotspots
+                    "B" #'codeql-xray-pin-baseline
+                    "P" #'codeql-xray-run-query-cold
                     "o" #'codeql-xray-toggle-fold
                     "zo" #'codeql-xray-toggle-fold
                     "zc" #'codeql-xray-toggle-fold
