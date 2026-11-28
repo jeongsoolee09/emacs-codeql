@@ -2851,6 +2851,26 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
                                   :RA (vconcat codeql-test--xray-inst-ra)))
     (should (equal (codeql-test--xray-folds dil) '((0 4 nil) (6 7 t))))))
 
+(ert-deftest codeql-test-xray-fold-costs ()
+  "A closed fold sums the costs of its blocks and hides theirs."
+  (codeql-test--with-inst-xray (state src dil ra)
+    (let ((g codeql-test--xray-g))
+      (setf (codeql-xray-costs state)
+            (codeql-xray--costs
+             (list (list :predicateName (format "%s::p/0#1" g) :millis 30 :resultSize 2)
+                   (list :predicateName (format "Impl::Sens<%s::Input>::q/0#3" g)
+                         :millis 12 :resultSize 5))))
+      (codeql-xray--render state)
+      (let ((fold (car (codeql-xray--view-folds (car (codeql-xray-views state))))))
+        (should (= (codeql-xray--fold-cost fold) 42))
+        (should (string-match-p "blocks  ·  ⏱ 42 ms  ·  Taint" (overlay-get (codeql-xray--fold-overlay fold)
+                                                         'display)))
+        (should (equal (codeql-test--xray-costs dil 1) '("eol:")))
+        (codeql-test--xray-goto dil 1)
+        (codeql-xray-toggle-fold)
+        (should (equal (codeql-test--xray-costs dil 1) '("eol:⏱ 30 ms · 2 rows")))
+        (should (equal (codeql-test--xray-costs dil 4) '("eol:⏱ 12 ms · 5 rows")))))))
+
 (ert-deftest codeql-test-xray-fold-navigation ()
   "A closed fold counts as one block, and the other column opens one."
   (codeql-test--with-inst-xray (state src dil ra)
@@ -2944,6 +2964,131 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
         (codeql-xray-show state (list :success t :DIL plain :RA (vconcat codeql-test--xray-inst-ra))))
       (codeql-test--xray-move src 3)
       (should-not (mentions)))))
+
+(defun codeql-test--xray-costs (buffer row)
+  "Return the cost decorations of ROW of the view BUFFER, as strings."
+  (with-current-buffer buffer
+    (let* ((bol (save-excursion (goto-char (point-min)) (forward-line row) (point)))
+           (eol (save-excursion (goto-char bol) (line-end-position)))
+           out)
+      (dolist (ov (sort (seq-filter (lambda (ov) (eq (overlay-get ov 'codeql-xray) 'cost))
+                                    (overlays-in bol (1+ eol)))
+                        (lambda (a b) (< (overlay-start a) (overlay-start b)))))
+        (when (<= bol (overlay-start ov) eol)
+          (if-let* ((over (overlay-get ov 'display)))
+              (push (concat "over:" over) out)
+            (let ((parts (split-string (or (overlay-get ov 'after-string) "") "\n")))
+              (unless (and (equal (car parts) "") (overlay-get ov 'after-string))
+                (push (concat "eol:" (string-trim-left (car parts))) out))
+              (dolist (line (cdr parts))
+                (push (concat "below:" line) out))))))
+      (nreverse out))))
+
+(defun codeql-test--xray-row (buffer regexp &optional from)
+  "Return the 0-based row of the first line of BUFFER matching REGEXP after FROM."
+  (with-current-buffer buffer
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line (or from 0))
+      (re-search-forward regexp)
+      (1- (line-number-at-pos)))))
+
+(ert-deftest codeql-test-xray-costs ()
+  "The time, rows and tuples of the relations the last run of the query evaluated."
+  (codeql-test--with-xray (state src '("DIL" "RA"))
+    (let* ((dil (codeql-test--xray-view state 0))
+           (ra (codeql-test--xray-view state 1))
+           (log (make-temp-file "codeql-test-log"))
+           (events nil)
+           (run (lambda (summary)
+                  (setq events summary)
+                  (run-hook-with-args 'codeql-query-run-functions
+                                      (list :query-path (buffer-file-name src)
+                                            :log-path log)))))
+      (unwind-protect
+          (cl-letf (((symbol-function 'codeql--evaluator-log-summary-async)
+                     (lambda (_ callback) (funcall callback events))))
+            (funcall
+             run
+             (list
+              ;; the same plan, on another relation, recursive over two iterations
+              (list :predicateName "Deep::Inner::Big.lines/0#dispred#77"
+                    :millis 1200 :resultSize 4999
+                    :ra '(:base ["    {2} r1 = SCAN `cached_Other::q/1#22` OUTPUT In.0, In.1"
+                                 "    return r1"])
+                    :pipelineRuns [(:raReference "base" :counts [2000])
+                                   (:raReference "base" :counts [2999])])
+              ;; the same plan, on the cached relation, named unquoted
+              (list :predicateName "#select" :millis 0 :resultSize 7
+                    :ra '(:pipeline ["    {2} r1 = SCAN cached_Deep::Inner::Big.lines/0#dispred#77 OUTPUT In.0, In.1"
+                                     "    return r1"])
+                    ;; -1 for no count
+                    :pipelineRuns [(:raReference "pipeline" :counts [7])
+                                   (:raReference "pipeline" :counts [-1])])
+              ;; another plan, timed with its layer
+              (list :predicateName "Other::q/1#22" :evaluationStrategy "IN_LAYER" :resultSize 1
+                    :ra '(:pipeline ["    {1} r1 = CONSTANT(int)[2]" "    return r1"])
+                    :pipelineRuns [(:raReference "pipeline" :counts [1])])
+              ;; the library, not shown
+              (list :predicateName "Lib::helper/1#11" :millis 500 :resultSize 1)
+              ;; a DIL relation inlined in the RA, not evaluated
+              (list :predicateName "Deep::Inner::big/2#0154355b"
+                    :evaluationStrategy "SENTINEL_EMPTY")))
+            ;; the counts summed over the iterations, over the indentation,
+            ;; and the relation the evaluated step reads instead
+            (should (equal (codeql-test--xray-costs ra (codeql-test--xray-row ra "SCAN `Deep::Inner::big"))
+                           '("over:5.0k"
+                             "below:  ≠ {2} r1 = SCAN `cached_Other::q/1#22` OUTPUT In.0, In.1")))
+            (let ((select (codeql-test--xray-row
+                           ra "SCAN `Deep::Inner::Big.lines/0#dispred#77` OUTPUT")))
+              (should (equal (codeql-test--xray-costs ra select) '("over:  7 ")))
+              (should (equal (codeql-test--xray-costs ra (1+ select)) '("eol:⏱ <1 ms · 7 rows"))))
+            ;; the plan evaluated where the dump has no steps of its shape,
+            ;; after the time of the whole layer
+            (let ((q (codeql-test--xray-row ra "prev_delta")))
+              (should-not (codeql-test--xray-costs ra q))
+              (should (equal (codeql-test--xray-costs ra (1+ q))
+                             '("eol:⏱ 1.2 s · 5.0k rows"
+                               "below:    evaluated with the statistics of the database:"
+                               "below:  1 {1} r1 = CONSTANT(int)[2]"
+                               "below:    return r1"))))
+            ;; the time of the query's own relations of the whole run
+            (with-current-buffer ra
+              (should (string-match-p "⏱ 1.2 s of 1.7 s" (codeql-xray--header-line))))
+            ;; the DIL at the closing brace of the block
+            (with-current-buffer dil
+              (should (equal (codeql-test--xray-costs dil (- (count-lines (point-min) (point-max)) 1))
+                             '("eol:⏱ <1 ms · 7 rows"))))
+            (let ((big (codeql-test--xray-row dil "^}" (codeql-test--xray-row dil "big/2"))))
+              (should (equal (codeql-test--xray-costs dil big)
+                             '("eol:⏱ skipped: an input is empty")))
+              ;; a run taking it from the cache
+              (funcall run (list (list :predicateName "Deep::Inner::big/2#0154355b"
+                                       :evaluationStrategy "CACHACA" :resultSize 3)))
+              (should (equal (codeql-test--xray-costs dil big) '("eol:⏱ cached · 3 rows"))))
+            ;; quick evaluations and other queries tell nothing
+            (funcall run nil)
+            (should (codeql-xray-costs state))
+            (run-hook-with-args 'codeql-query-run-functions
+                                (list :query-path (buffer-file-name src) :log-path log
+                                      :quick-eval t))
+            (should (codeql-xray-costs state)))
+        (delete-file log)))))
+
+(ert-deftest codeql-test-xray-cost-text ()
+  "Durations, counts and gutters fit the x-ray."
+  (should (equal (mapcar #'codeql-xray--milliseconds '(0 0.5 1 999.9 1000 1700))
+                 '("<1 ms" "<1 ms" "1 ms" "999 ms" "1.0 s" "1.7 s")))
+  (should (equal (mapcar #'codeql-xray--count '(0 999 1000 4999 9949 9950 123456 2500000 3e9))
+                 '("0" "999" "1.0k" "5.0k" "9.9k" "10k" "123k" "2.5M" "3.0G")))
+  (should (equal (codeql-xray--pad "7" 4) "  7 "))
+  (should (equal (codeql-xray--pad "5.0k" 4) "5.0k"))
+  (should-not (codeql-xray--pad "12.3k" 4))
+  (should (equal (codeql-xray--skeleton "    {2} r1 = JOIN r0 WITH `M::p/1#ab` ON FIRST 1 OUTPUT Lhs.0, 'x'")
+                 "{2} r1 = JOIN r0 WITH ON FIRST OUTPUT"))
+  (should (equal (codeql-xray--step-relations
+                  "    {2} r1 = JOIN cached_M::q/0#cc WITH `M::p/1#ab` ON FIRST 1 OUTPUT 'a::b'")
+                 "M::p/1 M::q/0")))
 
 (ert-deftest codeql-test-xray-command ()
   "The x-ray needs a query and runs `codeql query compile' with its dumps."

@@ -8974,12 +8974,20 @@ PROPERTIES are added to the outcome, see `codeql--query-result-handler'."
   (codeql--query-run-report
    handler `(:status error :message ,message :buffer ,buffer-context ,@properties)))
 
+(defvar codeql-query-run-functions nil
+  "Functions called with the outcome of each query run that completed.
+
+The outcome is a plist, see `codeql--query-result-handler', with the
+:query-path of the query, whether it was a :quick-eval, and the
+:log-path of its evaluator log.")
+
 (defun codeql--query-run-completed (handler outcome)
   "Record the query run of OUTCOME in query history and report it to HANDLER.
 
 OUTCOME is a `results' outcome, see `codeql--query-result-handler',
 which becomes an `empty' one when the run has no results."
   (message "Query run completed, checking results.")
+  (run-hook-with-args 'codeql-query-run-functions outcome)
   (let* ((bqrs-path (plist-get outcome :bqrs-path))
          (buffer-context (plist-get outcome :buffer))
          (query-path (plist-get outcome :query-path))
@@ -9615,27 +9623,53 @@ Interactively, prompt for FROM and then for TO."
 
 ;;; Query performance
 
+(defun codeql--evaluator-log-summary-path (log-path)
+  "Return where the summary of the evaluator log at LOG-PATH is kept."
+  (concat (file-name-sans-extension log-path) ".summary.jsonl"))
+
+(defun codeql--evaluator-log-summary-args (log-path)
+  "Return the CLI arguments summarizing the evaluator log at LOG-PATH."
+  (list "generate" "log-summary" "--format=predicates" "--minify-output"
+        "--" (codeql--tramp-unwrap log-path)
+        (codeql--tramp-unwrap (codeql--evaluator-log-summary-path log-path))))
+
+(defun codeql--read-evaluator-log-summary (summary-path)
+  "Return the predicate events of the evaluator log summary at SUMMARY-PATH."
+  (with-temp-buffer
+    (insert-file-contents summary-path)
+    (goto-char (point-min))
+    (let (events)
+      (while (progn (skip-chars-forward " \t\r\n") (not (eobp)))
+        (let ((event (json-parse-buffer :object-type 'plist :null-object nil)))
+          (when (plist-get event :predicateName)
+            (push event events))))
+      (nreverse events))))
+
 (defun codeql--evaluator-log-summary (log-path)
   "Return the predicate events of the evaluator log at LOG-PATH.
 
 The log is summarized by `codeql generate log-summary', and the summary is
 kept next to the log for later use.  Each event is a plist."
-  (let ((summary-path (concat (file-name-sans-extension log-path) ".summary.jsonl")))
+  (let ((summary-path (codeql--evaluator-log-summary-path log-path)))
     (unless (file-exists-p summary-path)
       (message "Summarizing the evaluator log ...")
-      (unless (codeql--cli-command-to-string
-               (list "generate" "log-summary" "--format=predicates" "--minify-output"
-                     "--" (codeql--tramp-unwrap log-path) (codeql--tramp-unwrap summary-path)))
+      (unless (codeql--cli-command-to-string (codeql--evaluator-log-summary-args log-path))
         (user-error "Could not summarize the evaluator log %s" log-path)))
-    (with-temp-buffer
-      (insert-file-contents summary-path)
-      (goto-char (point-min))
-      (let (events)
-        (while (progn (skip-chars-forward " \t\r\n") (not (eobp)))
-          (let ((event (json-parse-buffer :object-type 'plist :null-object nil)))
-            (when (plist-get event :predicateName)
-              (push event events))))
-        (nreverse events)))))
+    (codeql--read-evaluator-log-summary summary-path)))
+
+(defun codeql--evaluator-log-summary-async (log-path callback)
+  "Call CALLBACK with the predicate events of the evaluator log at LOG-PATH.
+
+Like `codeql--evaluator-log-summary', without blocking.  CALLBACK gets
+nil when the log can't be summarized."
+  (let ((summary-path (codeql--evaluator-log-summary-path log-path)))
+    (if (file-exists-p summary-path)
+        (funcall callback (codeql--read-evaluator-log-summary summary-path))
+      (codeql--cli-command-async
+       (codeql--evaluator-log-summary-args log-path)
+       (lambda (output)
+         (funcall callback (and output (file-exists-p summary-path)
+                                (codeql--read-evaluator-log-summary summary-path))))))))
 
 (defun codeql--performance-history-entries ()
   "Return the query history keys of runs with an evaluator log, newest first."
@@ -10806,7 +10840,15 @@ says should share it."
                          '("--require-db-registration"))
                         ;; new query-server options
                         ((string= codeql-query-server "query-server2")
-                         nil))))
+                         ;; without a server-wide structured log, the logs of
+                         ;; the query runs carry no tuple counts
+                         (when codeql-evaluator-log
+                           (list "--evaluator-log"
+                                 (codeql--tramp-unwrap
+                                  (make-temp-name
+                                   (expand-file-name "codeql-server-"
+                                                     (temporary-file-directory))))
+                                 "--evaluator-log-minify"))))))
          (project (codeql--query-server-project)))
     (cl-assert ram-options t)
     ;; spawn the server process
@@ -11260,6 +11302,16 @@ Each is different from those before it."
   "The bar beside the block of the relation at point, and of the same relation."
   :group 'emacs-codeql)
 
+(defface codeql-xray-cost
+  '((t :inherit font-lock-doc-face))
+  "What the last run of the query cost, beside the code of the x-ray."
+  :group 'emacs-codeql)
+
+(defface codeql-xray-evaluated
+  '((t :inherit font-lock-comment-face))
+  "The steps of the plan the last run of the query evaluated, in the x-ray."
+  :group 'emacs-codeql)
+
 (cl-defstruct (codeql-xray--token (:constructor codeql-xray--token-create (v row &optional id))
                                   (:copier nil))
   "A token of a query: its text V, its 0-based ROW, and whether it is an ID."
@@ -11285,28 +11337,34 @@ DIFF is `new' or `changed' when it is since the last compile."
 
 (cl-defstruct (codeql-xray--span (:constructor codeql-xray--span-create)
                                  (:copier nil))
-  "The 0-based lines FIRST to LAST of a view, showing BLOCK of DEF."
-  first last def block)
+  "The 0-based lines FIRST to LAST of a view, showing BLOCK of DEF.
+
+COST is the milliseconds its relations took in the last run of the query."
+  first last def block cost)
 
 (cl-defstruct (codeql-xray--fold (:constructor codeql-xray--fold-create)
                                  (:copier nil))
   "The COUNT blocks of the instance DEF, lines FIRST to LAST of a view.
 
-CHANGED and NEW count those blocks changed and new since the last compile."
-  def first last count overlay changed new)
+CHANGED and NEW count those blocks changed and new since the last compile,
+COST is the milliseconds they took in the last run of the query."
+  def first last count overlay changed new cost)
 
 (cl-defstruct (codeql-xray--view (:constructor codeql-xray--view-create)
                                  (:copier nil))
   "A buffer BUF showing the dump of KIND, as its LINES, SPANS and FOLDS.
 
-CURRENT is the span at point, as last followed."
-  kind buf spans lines starts comments folds current)
+CURRENT is the span at point, as last followed, COST the milliseconds the
+code of the query took in the last run of it."
+  kind buf spans lines starts comments folds current cost)
 
 (cl-defstruct (codeql-xray (:constructor codeql-xray--create)
                            (:copier nil))
-  "The x-ray of the query in buffer SRC."
+  "The x-ray of the query in buffer SRC.
+
+COSTS are those of the last run of the query, see `codeql-xray--costs'."
   src path module views defs users coded mapped blocks result error unused
-  index peeks active compiling elapsed proc map-cache timer last gone)
+  index peeks active compiling elapsed proc map-cache timer last gone costs)
 
 (defvar-local codeql-xray--state nil
   "The x-ray of the query of this buffer, or of the one it is a view of.")
@@ -11999,6 +12057,371 @@ One color each."
                                                        (string-join kinds " or ") why)
                                                'face 'codeql-xray-none)))))))))))))
 
+;;;; What the last run of the query cost
+
+(cl-defstruct (codeql-xray--cost (:constructor codeql-xray--cost-create)
+                                 (:copier nil))
+  "What evaluating a relation cost: MILLIS, ROWS and the evaluated PIPELINES.
+
+HOW it came by its rows without computing them, `cached' or `empty' when
+it was skipped as it reads an empty relation, and whether it was ever
+COMPUTED.  Each pipeline is a plist of its :ref, its :lines, each a cons
+of the line and its tuple count, and its :steps, plists of the :skeleton,
+:relations, :line and :count of each step."
+  (millis 0) (rows 0) pipelines how computed)
+
+(cl-defstruct (codeql-xray--costs (:constructor codeql-xray--costs-create)
+                                  (:copier nil))
+  "The costs of the relations of a query run BY name, and by BARE name.
+
+A bare name had by more than one relation has `ambiguous' for its cost.
+TOTAL is the milliseconds of the whole run."
+  (by (make-hash-table :test #'equal))
+  (bare (make-hash-table :test #'equal))
+  (total 0))
+
+(defun codeql-xray--unquote (line &optional regexps)
+  "Return LINE without its quoted strings, the ones of REGEXPS by default."
+  (dolist (re (or regexps '("'[^']*'" "`[^`]*`" "\"[^\"]*\"")) line)
+    (setq line (replace-regexp-in-string re "" line t t))))
+
+(defun codeql-xray--tokens (regexp line)
+  "Return the matches of REGEXP in LINE."
+  (let ((from 0) tokens)
+    (while (string-match regexp line from)
+      (push (match-string 0 line) tokens)
+      (setq from (match-end 0)))
+    (nreverse tokens)))
+
+(defun codeql-xray--skeleton (line)
+  "Return the shape of the RA step LINE: its arity, registers and operators.
+
+Without the names the compiled and the evaluated plans call the same
+relations by."
+  (let ((case-fold-search nil))
+    (string-join
+     (seq-filter (lambda (token)
+                   (or (string-match-p "\\`\\(?:{[0-9]+}\\|r[0-9]+\\|[A-Z][A-Z]+\\)\\'" token)
+                       (member token '("|" "="))))
+                 (codeql-xray--tokens "[{}[:alnum:]_#@:./|=]+" (codeql-xray--unquote line)))
+     " ")))
+
+(defun codeql-xray--step-p (line)
+  "Return non-nil if LINE is a step of an RA pipeline."
+  (string-match-p "\\`[ \t]*{[0-9]+}" line))
+
+(defun codeql-xray--return-p (line)
+  "Return non-nil if LINE is the return of an RA pipeline."
+  (string-match-p "\\`[ \t]*return" line))
+
+(defun codeql-xray--step-relations (line)
+  "Return the bare names of the relations the RA step LINE reads, sorted."
+  (let* ((line (codeql-xray--unquote line '("'[^']*'" "\"[^\"]*\"")))
+         (names (mapcar (lambda (quoted) (substring quoted 1 -1))
+                        (codeql-xray--tokens "`[^`]*`" line))))
+    (dolist (token (codeql-xray--tokens "[[:alnum:]_#@:./]+"
+                                        (codeql-xray--unquote line '("`[^`]*`"))))
+      (when (or (string-search "::" token) (string-search "#" token))
+        (push token names)))
+    (string-join (sort (mapcar (lambda (name)
+                                 (codeql-xray--bare (string-remove-prefix "cached_" name)))
+                               names)
+                       #'string<)
+                 " ")))
+
+(defun codeql-xray--costs (events)
+  "Return the costs of the relations of the EVENTS of an evaluator log summary.
+
+See `codeql-xray--costs' and `codeql-xray--cost'."
+  (let* ((costs (codeql-xray--costs-create))
+         (by (codeql-xray--costs-by costs))
+         (bare (codeql-xray--costs-bare costs)))
+    (seq-doseq (event events)
+      (when-let* ((name (plist-get event :predicateName)))
+        (let ((millis (or (plist-get event :millis) 0))
+              (strategy (plist-get event :evaluationStrategy))
+              (cost (or (gethash name by)
+                        (puthash name (codeql-xray--cost-create) by)))
+              (sums (make-hash-table :test #'equal)))
+          (cl-incf (codeql-xray--costs-total costs) millis)
+          (cl-incf (codeql-xray--cost-millis cost) millis)
+          (cl-incf (codeql-xray--cost-rows cost) (or (plist-get event :resultSize) 0))
+          (if (member strategy '("CACHACA" "SENTINEL_EMPTY"))
+              (unless (codeql-xray--cost-how cost)
+                (setf (codeql-xray--cost-how cost)
+                      (if (equal strategy "CACHACA") 'cached 'empty)))
+            (setf (codeql-xray--cost-computed cost) t))
+          ;; the tuples of each step, over the iterations of a recursive one;
+          ;; the counts skip the return lines, -1 being no count
+          (seq-doseq (run (plist-get event :pipelineRuns))
+            (let ((sum (or (gethash (plist-get run :raReference) sums)
+                           (puthash (plist-get run :raReference)
+                                    (make-hash-table :test #'eql) sums)))
+                  (i 0))
+              (seq-doseq (n (plist-get run :counts))
+                (when (and (numberp n) (>= n 0))
+                  (puthash i (+ n (gethash i sum 0)) sum))
+                (cl-incf i))))
+          (let ((ra (plist-get event :ra))
+                refs)
+            (while ra
+              (push (cons (substring (symbol-name (car ra)) 1) (cadr ra)) refs)
+              (setq ra (cddr ra)))
+            (dolist (ref (sort refs (lambda (a b) (string< (car a) (car b)))))
+              (let ((sum (gethash (car ref) sums))
+                    (i 0)
+                    lines steps)
+                (seq-doseq (line (cdr ref))
+                  (let ((n (unless (codeql-xray--return-p line)
+                             (prog1 (and sum (gethash i sum))
+                               (cl-incf i)))))
+                    (push (cons line n) lines)
+                    (when (codeql-xray--step-p line)
+                      (push (list :skeleton (codeql-xray--skeleton line)
+                                  :relations (codeql-xray--step-relations line)
+                                  :line line :count n)
+                            steps))))
+                (setf (codeql-xray--cost-pipelines cost)
+                      (append (codeql-xray--cost-pipelines cost)
+                              (list (list :ref (car ref) :lines (nreverse lines)
+                                          :steps (nreverse steps))))))))
+          ;; the evaluator names a cached relation after the cache
+          (let* ((b (codeql-xray--bare (string-remove-prefix "cached_" name)))
+                 (had (gethash b bare)))
+            (cond ((null had) (puthash b cost bare))
+                  ((not (eq had cost)) (puthash b 'ambiguous bare)))))))
+    costs))
+
+(defun codeql-xray--milliseconds (ms)
+  "Return the duration of MS milliseconds as text."
+  (cond ((< ms 1) "<1 ms")
+        ((>= ms 1000) (format "%.1f s" (/ ms 1000.0)))
+        (t (format "%d ms" (truncate ms)))))
+
+(defun codeql-xray--count (n)
+  "Return N in at most four characters, to fit the indentation of an RA step."
+  (or (cl-loop for (unit . suffix) in '((1e9 . "G") (1e6 . "M") (1e3 . "k"))
+               when (>= n unit)
+               return (let ((x (/ n unit)))
+                        (if (< x 9.95)
+                            (format "%.1f%s" x suffix)
+                          (format "%d%s" (floor (+ x 0.5)) suffix))))
+      (number-to-string n)))
+
+(defun codeql-xray--pad (text indent)
+  "Return TEXT right-aligned in INDENT columns, a space short if it fits.
+
+Or nil if it doesn't fit."
+  (let ((width (string-width text)))
+    (unless (> width indent)
+      (let ((gap (if (< width indent) 1 0)))
+        (concat (make-string (- indent width gap) ?\s) text (make-string gap ?\s))))))
+
+(defun codeql-xray--indent (line)
+  "Return the width of the indentation of LINE."
+  (string-match "\\`[ \t]*" line)
+  (match-end 0))
+
+(defun codeql-xray--cost-of (costs name)
+  "Return the cost of the relation NAME in COSTS, if known."
+  (or (gethash name (codeql-xray--costs-by costs))
+      (let ((cost (gethash (codeql-xray--bare name) (codeql-xray--costs-bare costs))))
+        (and (codeql-xray--cost-p cost) cost))))
+
+(defun codeql-xray--decorate (state view)
+  "Tell the time, rows and tuples the relations of VIEW took to evaluate.
+
+In the last run of the query of STATE, showing the plan it evaluated
+where it isn't the dumped one."
+  (let ((buf (codeql-xray--view-buf view))
+        (costs (codeql-xray-costs state))
+        (starts (codeql-xray--view-starts view))
+        (lines (codeql-xray--view-lines view))
+        (rows (make-hash-table :test #'eql)))
+    (with-current-buffer buf
+      (remove-overlays nil nil 'codeql-xray 'cost))
+    (setf (codeql-xray--view-cost view) nil)
+    (dolist (span (codeql-xray--view-spans view))
+      (setf (codeql-xray--span-cost span) nil))
+    (dolist (fold (codeql-xray--view-folds view))
+      (setf (codeql-xray--fold-cost fold) nil))
+    (when (and costs (codeql-xray-result state) (not (codeql-xray-error state)))
+      (setf (codeql-xray--view-cost view) 0)
+      (cl-flet* ((at (row key value)
+                   ;; the decorations of ROW: an :over its indentation, :eol
+                   ;; texts and :below lines
+                   (let ((deco (gethash row rows)))
+                     (puthash row (if (eq key :over)
+                                      (plist-put deco key value)
+                                    (plist-put deco key (append (plist-get deco key)
+                                                                (list value))))
+                              rows)))
+                 (cost (text) (propertize text 'face 'codeql-xray-cost))
+                 (code (text) (propertize text 'face 'codeql-xray-evaluated))
+                 (gutter (row text)
+                   (let ((padded (codeql-xray--pad text (codeql-xray--indent (aref lines row)))))
+                     (if padded
+                         (at row :over (cost padded))
+                       (at row :eol (cost text))))))
+        (dolist (span (codeql-xray--view-spans view))
+          (let ((found nil) (millis 0) (nrows 0) (computed nil) (how nil))
+            (dolist (name (codeql-xray-block-names (codeql-xray--span-block span)))
+              (when-let* ((c (codeql-xray--cost-of costs name)))
+                (unless (memq c found)
+                  (push c found)
+                  (setq millis (+ millis (codeql-xray--cost-millis c))
+                        nrows (+ nrows (codeql-xray--cost-rows c))
+                        computed (or computed (codeql-xray--cost-computed c))
+                        how (or how (codeql-xray--cost-how c))))))
+            (setq found (nreverse found))
+            (when found
+              (setf (codeql-xray--span-cost span) millis))
+            (when (codeql-xray--span-def span)
+              (cl-incf (codeql-xray--view-cost view) millis))
+            (when found
+              ;; at the end of the block, as its first line is too long to
+              ;; see the end of in a column
+              (at (codeql-xray--span-last span) :eol
+                  (cost (cond (computed
+                               (format "⏱ %s · %s rows" (codeql-xray--milliseconds millis)
+                                       (codeql-xray--count nrows)))
+                              ((eq how 'cached)
+                               (format "⏱ cached · %s rows" (codeql-xray--count nrows)))
+                              (t "⏱ skipped: an input is empty")))))
+            (when (and found (equal (codeql-xray--view-kind view) "RA"))
+              (let ((pipelines (apply #'append (mapcar #'codeql-xray--cost-pipelines found)))
+                    (segments nil) (segment nil) (used nil))
+                ;; the runs of steps up to each return, each told the counts
+                ;; of the evaluated pipeline of the same shape
+                (cl-loop for row from (codeql-xray--span-first span)
+                         to (codeql-xray--span-last span)
+                         for line = (aref lines row)
+                         do (cond ((codeql-xray--step-p line)
+                                   (push (cons row (codeql-xray--skeleton line)) segment))
+                                  ((and segment (codeql-xray--return-p line))
+                                   (push (nreverse segment) segments)
+                                   (setq segment nil))))
+                (when segment
+                  (push (nreverse segment) segments))
+                (dolist (seg (nreverse segments))
+                  (when-let* ((match (seq-find
+                                      (lambda (pipeline)
+                                        (and (not (memq pipeline used))
+                                             (equal (mapcar (lambda (step) (plist-get step :skeleton))
+                                                            (plist-get pipeline :steps))
+                                                    (mapcar #'cdr seg))))
+                                      pipelines)))
+                    (push match used)
+                    (cl-loop for (row . _) in seg
+                             for step in (plist-get match :steps)
+                             do (when-let* ((n (plist-get step :count)))
+                                  (gutter row (codeql-xray--count n)))
+                             ;; the same step on other relations
+                             do (unless (equal (plist-get step :relations)
+                                               (codeql-xray--step-relations (aref lines row)))
+                                  (let* ((line (plist-get step :line))
+                                         (indent (codeql-xray--indent line)))
+                                    (at row :below
+                                        (concat (cost (or (codeql-xray--pad "≠" indent) "≠ "))
+                                                (code (substring line indent)))))))))
+                ;; the pipelines the dump has no steps of the shape of
+                (when-let* ((unused (seq-remove (lambda (pipeline) (memq pipeline used))
+                                                pipelines)))
+                  (let ((last (codeql-xray--span-last span)))
+                    (at last :below (cost "    evaluated with the statistics of the database:"))
+                    (dolist (pipeline unused)
+                      (when (cdr unused)
+                        (at last :below (cost (format "    [%s]" (plist-get pipeline :ref)))))
+                      (pcase-dolist (`(,line . ,n) (plist-get pipeline :lines))
+                        (unless (equal line "")
+                          (let* ((indent (codeql-xray--indent line))
+                                 (text (if n (codeql-xray--count n) ""))
+                                 (padded (codeql-xray--pad text indent)))
+                            (at last :below
+                                (if padded
+                                    (concat (cost padded) (code (substring line indent)))
+                                  (concat (code line) (cost (concat "  " text)))))))))))))))
+        (dolist (fold (codeql-xray--view-folds view))
+          (setf (codeql-xray--fold-cost fold)
+                (cl-loop for span in (codeql-xray--view-spans view)
+                         when (and (>= (codeql-xray--span-first span) (codeql-xray--fold-first fold))
+                                   (<= (codeql-xray--span-last span) (codeql-xray--fold-last fold)))
+                         sum (or (codeql-xray--span-cost span) 0))))
+        (with-current-buffer buf
+          (maphash
+           (lambda (row deco)
+             (let ((bol (codeql-xray--row-pos row starts))
+                   (eol (1- (codeql-xray--row-pos (1+ row) starts))))
+               (when-let* ((over (plist-get deco :over)))
+                 (let ((ov (make-overlay bol (+ bol (length over)))))
+                   (overlay-put ov 'codeql-xray 'cost)
+                   (overlay-put ov 'display over)))
+               (when (or (plist-get deco :eol) (plist-get deco :below))
+                 (let ((ov (make-overlay eol eol)))
+                   (overlay-put ov 'codeql-xray 'cost)
+                   (overlay-put ov 'priority 5)
+                   (overlay-put ov 'codeql-xray-after
+                                (concat (mapconcat (lambda (text) (concat "  " text))
+                                                   (plist-get deco :eol) "")
+                                        (mapconcat (lambda (line) (concat "\n" line))
+                                                   (plist-get deco :below) "")))
+                   (overlay-put ov 'after-string (overlay-get ov 'codeql-xray-after))))))
+           rows))))))
+
+(defun codeql-xray--load-costs (state entry)
+  "Show where the time of a run of the query of STATE went.
+
+ENTRY is the outcome of the run, or its entry in the query history, see
+`codeql-query-run-functions'."
+  (let ((src (codeql-xray-src state))
+        (log-path (plist-get entry :log-path))
+        (query-path (plist-get entry :query-path)))
+    (when (and log-path query-path (not (plist-get entry :quick-eval))
+               (buffer-live-p src) (codeql-xray-path state)
+               (equal (expand-file-name query-path)
+                      (expand-file-name (codeql-xray-path state)))
+               (file-exists-p log-path))
+      (with-current-buffer src
+        (codeql--evaluator-log-summary-async
+         log-path
+         (lambda (events)
+           (when (and events (buffer-live-p src)
+                      (eq (buffer-local-value 'codeql-xray--state src) state))
+             (setf (codeql-xray-costs state) (codeql-xray--costs events))
+             (dolist (view (codeql-xray-views state))
+               (when (buffer-live-p (codeql-xray--view-buf view))
+                 (codeql-xray--decorate state view)))
+             (codeql-xray--refresh-folds state)
+             (codeql-xray--update-header-lines state))))))))
+
+(defun codeql-xray--query-run (outcome)
+  "Show where the time of the query run of OUTCOME went, in its x-ray."
+  (when-let* ((path (plist-get outcome :query-path))
+              (src (find-buffer-visiting path))
+              (state (buffer-local-value 'codeql-xray--state src)))
+    (codeql-xray--load-costs state outcome)))
+
+(add-hook 'codeql-query-run-functions #'codeql-xray--query-run)
+
+(defun codeql-xray--last-run (src)
+  "Return the history entry of the last run of the whole query of buffer SRC."
+  (let ((path (buffer-file-name src))
+        last)
+    (when-let* ((history (buffer-local-value 'codeql--completed-query-history src)))
+      (maphash (lambda (_ entry)
+                 (when (and (not (plist-get entry :quick-eval))
+                            (plist-get entry :log-path)
+                            (plist-get entry :query-path)
+                            (equal (expand-file-name (plist-get entry :query-path))
+                                   (expand-file-name path))
+                            (or (null last)
+                                (not (time-less-p
+                                      (date-to-time (plist-get entry :timestamp))
+                                      (date-to-time (plist-get last :timestamp))))))
+                   (setq last entry)))
+               history))
+    last))
+
 (defun codeql-xray--fold-text (state fold)
   "Return the line showing the closed FOLD of STATE."
   (let* ((def (codeql-xray--fold-def fold))
@@ -12018,6 +12441,10 @@ One color each."
                               (propertize (format "%d %s" count diff)
                                           'face (codeql-xray--diff-face diff)))))
                   '(changed new) "")
+       (when-let* ((cost (codeql-xray--fold-cost fold)))
+         (concat (propertize "  ·  " 'face face)
+                 (propertize (concat "⏱ " (codeql-xray--milliseconds cost))
+                             'face 'codeql-xray-cost)))
        (propertize
         (format "  ·  %s  ·  %s opens"
                 (codeql-xray-def-expr def)
@@ -12034,8 +12461,15 @@ One color each."
 
 (defun codeql-xray--set-fold (state fold closed)
   "Close FOLD of STATE when CLOSED, open it otherwise."
-  (overlay-put (codeql-xray--fold-overlay fold) 'display
-               (and closed (codeql-xray--fold-text state fold))))
+  (let* ((ov (codeql-xray--fold-overlay fold))
+         (start (overlay-start ov))
+         (end (overlay-end ov)))
+    (overlay-put ov 'display (and closed (codeql-xray--fold-text state fold)))
+    ;; the texts after the lines of a closed fold would show after its line
+    (with-current-buffer (overlay-buffer ov)
+      (dolist (o (overlays-in start (min (1+ end) (point-max))))
+        (when (and (overlay-get o 'codeql-xray-after) (<= (overlay-start o) end))
+          (overlay-put o 'after-string (unless closed (overlay-get o 'codeql-xray-after))))))))
 
 (defun codeql-xray--refresh-folds (state)
   "Redraw the closed folds of the views of STATE."
@@ -12150,8 +12584,9 @@ Then the blocks peeked at."
                                          `((margin left-margin)
                                            ,(propertize (if (eq diff 'new) "+" "~") 'face face))))
                 (overlay-put tag 'codeql-xray 'diff)
-                (overlay-put tag 'after-string
-                             (concat "  " (propertize (symbol-name diff) 'face face))))))
+                (overlay-put tag 'codeql-xray-after
+                             (concat "  " (propertize (symbol-name diff) 'face face)))
+                (overlay-put tag 'after-string (overlay-get tag 'codeql-xray-after)))))
           ;; the many relations of a module the query instantiates fold into
           ;; one line, kept open when they were
           (setf (codeql-xray--view-folds view)
@@ -12167,6 +12602,7 @@ Then the blocks peeked at."
                                       (eq (codeql-xray-def-kind (codeql-xray--fold-def group))
                                           'instance))
                                     (nreverse groups))))
+          (codeql-xray--decorate state view)
           (dolist (fold (codeql-xray--view-folds view))
             (codeql-xray--set-fold
              state fold
@@ -12420,7 +12856,12 @@ Or a failed one with the message ERRORS when OUTPUT isn't JSON."
                (when-let* ((diffs (delq nil (list (and (> changed 0) (format "%d changed" changed))
                                                   (and (> new 0) (format "%d new" new))
                                                   (and (> gone 0) (format "%d gone" gone))))))
-                 (push (string-join diffs ", ") parts)))))
+                 (push (string-join diffs ", ") parts)))
+             (when-let* ((cost (codeql-xray--view-cost view))
+                         (costs (codeql-xray-costs state)))
+               (push (format "⏱ %s of %s" (codeql-xray--milliseconds cost)
+                             (codeql-xray--milliseconds (codeql-xray--costs-total costs)))
+                     parts))))
       (push (format "%s %s"
                     (substitute-command-keys "\\<codeql-xray-mode-map>\\[codeql-xray-other]")
                     (codeql-xray--other-kind kind))
@@ -12712,6 +13153,16 @@ Else to the previous one, opening its fold."
   (interactive)
   (codeql-xray--compile (car (codeql-xray--current))))
 
+(defun codeql-xray-run-query ()
+  "Run the query of the x-ray, to see what its code costs."
+  (interactive)
+  (let ((src (codeql-xray-src (car (codeql-xray--current)))))
+    (unless (buffer-live-p src)
+      (user-error "The query of this x-ray is gone"))
+    (with-current-buffer src
+      (let ((mark-active nil))
+        (codeql-query-server-run-query)))))
+
 (defun codeql-xray-quit ()
   "Close the x-ray."
   (interactive)
@@ -12729,6 +13180,7 @@ Else to the previous one, opening its fold."
     (define-key map (kbd "M-p") #'codeql-xray-previous-change)
     (define-key map (kbd "o") #'codeql-xray-toggle-fold)
     (define-key map (kbd "g") #'codeql-xray-recompile)
+    (define-key map (kbd "r") #'codeql-xray-run-query)
     (define-key map (kbd "q") #'codeql-xray-quit)
     map)
   "Keymap for `codeql-xray-mode'.")
@@ -12748,6 +13200,7 @@ Else to the previous one, opening its fold."
                     "za" #'codeql-xray-toggle-fold
                     "gr" #'codeql-xray-recompile
                     "r" #'codeql-xray-recompile
+                    "p" #'codeql-xray-run-query
                     "q" #'codeql-xray-quit))
 
 (defconst codeql-xray-font-lock-keywords
@@ -12918,6 +13371,8 @@ It has a view of each of KINDS, \"DIL\" and \"RA\" by default."
       (codeql-xray--add-view state kind (if (cdr kinds)
                                             (format "%s/%s*" name kind)
                                           (concat name "*"))))
+    (when-let* ((entry (codeql-xray--last-run src)))
+      (codeql-xray--load-costs state entry))
     state))
 
 (defun codeql-xray ()

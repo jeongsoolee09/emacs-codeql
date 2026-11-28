@@ -561,6 +561,8 @@ Each definition and its code have the same background color, `codeql-xray-1`, `c
 
 The many relations of a module the query instantiates, like `module Flow = TaintTracking::Global<Config>;`, belong to its alias and fold into one line per alias, like `▸ Flow  ·  1114 blocks  ·  TaintTracking::Global<Config>  ·  o opens`. Point on such an alias also highlights the DIL types naming the module it instantiates in the other code, like the variables of the select clause. Saving the query compiles it again. Then the blocks whose code changed since the last compile, hashes aside, are marked `~` and `changed` (`codeql-xray-changed`), the ones of relations it didn't have `+` and `new` (`codeql-xray-new`), with their counts and the ones gone in the header line and on the folds. The header line also shows how many blocks of the dump are the query's and how long compiling took. When the query doesn't compile, the columns list the compiler's messages.
 
+Running the query (`r` in the columns, `p` with evil) tells what its code cost, from the summary of the evaluator log of the run (see `codeql-evaluator-log`), and so does opening the x-ray after a run. Each block ends with the time and rows of its relations, like `⏱ 40 ms · 1.2k rows`, or `⏱ cached · 3 rows`, or `⏱ skipped: an input is empty`, in `codeql-xray-cost`; the folds sum the times of their blocks, and the header line tells the time of the query's code of the whole run, like `⏱ 1.2 s of 1.7 s`. Each RA step shows its tuple count, summed over the iterations of a recursive relation, over its indentation, from the evaluated pipeline of the same shape. As the evaluator plans with the statistics of the database, a step reading other relations than the dumped one is followed by the evaluated step, after `≠`, and a pipeline of another shape by the whole evaluated plan, in `codeql-xray-evaluated`. The query server writes a server-wide evaluator log while `codeql-evaluator-log` is on, without which the logs of the runs carry no tuple counts.
+
 In the x-ray columns:
 
 | Key | Evil | Action |
@@ -572,6 +574,7 @@ In the x-ray columns:
 | `M-n`, `M-p` | `]c`, `[c` | go to the next or previous block changed since the last compile, opening its fold |
 | `o` | `o`, `za`, `zo`, `zc` | open or close the fold of an instantiated module |
 | `g` | `gr`, `r` | compile the query again |
+| `r` | `p` | run the query, to tell what its code costs |
 | `q` | `q` | close the x-ray |
 
 ### Commands
