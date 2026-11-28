@@ -12843,10 +12843,10 @@ See `codeql-xray--costs' and `codeql-xray--cost'."
           (cl-incf (codeql-xray--costs-total costs) millis)
           (cl-incf (codeql-xray--cost-millis cost) millis)
           (cl-incf (codeql-xray--cost-rows cost) (or (plist-get event :resultSize) 0))
-          (if (member strategy '("CACHACA" "SENTINEL_EMPTY"))
+          (if (member strategy '("CACHACA" "CACHE_HIT" "SENTINEL_EMPTY"))
               (unless (codeql-xray--cost-how cost)
                 (setf (codeql-xray--cost-how cost)
-                      (if (equal strategy "CACHACA") 'cached 'empty)))
+                      (if (equal strategy "SENTINEL_EMPTY") 'empty 'cached)))
             (setf (codeql-xray--cost-computed cost) t))
           (progn
             (dolist (ref (codeql--performance-pipelines event))
@@ -14268,7 +14268,9 @@ See `codeql-xray-layout' and `codeql-xray-mode'."
            (w win))
       (dolist (view (codeql-xray-views state))
         (setq w (split-window w nil 'right))
-        (set-window-buffer w (codeql-xray--view-buf view)))
+        (set-window-buffer w (codeql-xray--view-buf view))
+        ;; weakly, so the results of running the query don't cover a dump
+        (set-window-dedicated-p w 'codeql-xray))
       ;; the query and its views side by side, as wide as each other
       (balance-windows (window-parent win))
       (select-window win)

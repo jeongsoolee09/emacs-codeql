@@ -3211,7 +3211,14 @@ As strings of their rows, texts and faces."
                  "{2} r1 = JOIN r0 WITH ON FIRST OUTPUT"))
   (should (equal (codeql-xray--step-relations
                   "    {2} r1 = JOIN cached_M::q/0#cc WITH `M::p/1#ab` ON FIRST 1 OUTPUT 'a::b'")
-                 "M::p/1 M::q/0")))
+                 "M::p/1 M::q/0"))
+  ;; a relation a run before cached, either way the evaluator tells it
+  (dolist (strategy '("CACHACA" "CACHE_HIT"))
+    (let ((costs (codeql-xray--costs
+                  (vector (list :predicateName "M::p/1#ab" :evaluationStrategy strategy
+                                :resultSize 5)))))
+      (should (equal (codeql-xray--cost-text (codeql-xray--sum-costs costs '("M::p/1#ab")))
+                     "cached · 5 rows")))))
 
 (defconst codeql-test--hotspots-join
   "    {2} r1 = JOIN x WITH x ON FIRST 1 OUTPUT Lhs.0, Rhs.1"
@@ -3481,6 +3488,17 @@ As strings of their rows, texts and faces."
               (should (= (length (window-list)) 3))
               (should (equal (mapcar #'codeql-xray--view-kind (codeql-xray-views state))
                              '("DIL" "RA")))
+              ;; the results of a run of the query don't cover the dumps
+              (let ((other (get-buffer-create " *codeql-test-results*")))
+                (with-selected-window (get-buffer-window (codeql-test--xray-view state 0))
+                  (switch-to-buffer-other-window other))
+                (should (get-buffer-window other))
+                (should (get-buffer-window (codeql-test--xray-view state 0)))
+                (should (get-buffer-window (codeql-test--xray-view state 1)))
+                (if (> (length (window-list)) 3)
+                    (delete-window (get-buffer-window other))
+                  (set-window-buffer (get-buffer-window other) (current-buffer)))
+                (kill-buffer other))
               (should (equal (car commands)
                              (list "codeql" "query" "compile" "--dump-dil" "--dump-ra"
                                    "--format=json" "--threads=0" "--additional-packs=/packs"
