@@ -12758,6 +12758,48 @@ nil if none is in COSTS."
       (format " · %s blowup" (codeql--performance-times (plist-get sum :blowup)))
     ""))
 
+(defun codeql-xray--cost-chunks (sum before)
+  "Return the text of the costs SUM with its blowup, beside the costs BEFORE."
+  (concat (propertize (concat "⏱ " (codeql-xray--cost-text sum)) 'face 'codeql-xray-cost)
+          (propertize (codeql-xray--blowup-text sum) 'face 'codeql-hotspots-blowup)
+          (if before
+              (propertize (concat "  was " (codeql-xray--cost-text before)
+                                  (codeql-xray--blowup-text before))
+                          'face 'codeql-xray-was)
+            "")))
+
+(defun codeql-xray--decorate-source (state)
+  "Tell at the end of each definition of the query of STATE what it cost.
+
+What its relations cost in the last run, and in the run before."
+  (let ((src (codeql-xray-src state)))
+    (when (buffer-live-p src)
+      (with-current-buffer src
+        (remove-overlays nil nil 'codeql-xray 'cost)
+        (when (and (codeql-xray-costs state) (codeql-xray-result state)
+                   (not (codeql-xray-error state)))
+          (let ((names (make-hash-table :test #'eq)))
+            (dolist (kind '("DIL" "RA"))
+              (dolist (m (codeql-xray--of (codeql-xray-mapped state) kind))
+                (puthash (cdr m) (append (gethash (cdr m) names)
+                                         (codeql-xray-block-names (car m)))
+                         names)))
+            (save-excursion
+              (dolist (def (codeql-xray-defs state))
+                (when-let* ((sum (codeql-xray--sum-costs (codeql-xray-costs state)
+                                                         (gethash def names))))
+                  (let ((before (and (codeql-xray-before state)
+                                     (codeql-xray--sum-costs (codeql-xray-before state)
+                                                             (gethash def names))))
+                        (ov nil))
+                    ;; at its end, like at the ends of the blocks in the dumps
+                    (goto-char (point-min))
+                    (forward-line (codeql-xray-def-erow def))
+                    (setq ov (make-overlay (line-end-position) (line-end-position)))
+                    (overlay-put ov 'codeql-xray 'cost)
+                    (overlay-put ov 'after-string
+                                 (concat "  " (codeql-xray--cost-chunks sum before)))))))))))))
+
 (defun codeql-xray--count-face (n pipeline)
   "Return the face of the tuple count N of a step of PIPELINE."
   (let ((scale (plist-get pipeline :scale)))
@@ -12822,15 +12864,7 @@ where it isn't the dumped one."
             (when sum
               ;; at the end of the block, as its first line is too long to
               ;; see the end of in a column
-              (at (codeql-xray--span-last span) :eol
-                  (concat (cost (concat "⏱ " (codeql-xray--cost-text sum)))
-                          (propertize (codeql-xray--blowup-text sum)
-                                      'face 'codeql-hotspots-blowup)
-                          (if before
-                              (propertize (concat "  was " (codeql-xray--cost-text before)
-                                                  (codeql-xray--blowup-text before))
-                                          'face 'codeql-xray-was)
-                            ""))))
+              (at (codeql-xray--span-last span) :eol (codeql-xray--cost-chunks sum before)))
             (when (and found (equal (codeql-xray--view-kind view) "RA"))
               (let ((pipelines (apply #'append (mapcar #'codeql-xray--cost-pipelines found)))
                     (segments nil) (segment nil) (used nil))
@@ -12956,6 +12990,7 @@ of the run, or its entry in the query history, see
                             (when (buffer-live-p (codeql-xray--view-buf view))
                               (codeql-xray--decorate state view)))
                           (codeql-xray--refresh-folds state)
+                          (codeql-xray--decorate-source state)
                           (codeql-xray--update-header-lines state)))))))
         (let ((previous (codeql--previous-run src entry))
               (costs (codeql-xray-costs state))
@@ -13190,6 +13225,7 @@ Then the blocks peeked at."
   (dolist (view (codeql-xray-views state))
     (codeql-xray--draw state view))
   (codeql-xray--paint state)
+  (codeql-xray--decorate-source state)
   (codeql-xray--activate state (codeql-xray-active state) 'source)
   (codeql-xray--update-header-lines state))
 
@@ -13963,6 +13999,7 @@ And follow the relation of the block at point across the views."
         (when (eq codeql-xray--state state)
           (remove-overlays nil nil 'codeql-xray 'base)
           (remove-overlays nil nil 'codeql-xray 'active)
+          (remove-overlays nil nil 'codeql-xray 'cost)
           (remove-hook 'post-command-hook #'codeql-xray--source-post-command t)
           (remove-hook 'after-change-functions #'codeql-xray--source-changed t)
           (remove-hook 'after-save-hook #'codeql-xray--source-saved t)

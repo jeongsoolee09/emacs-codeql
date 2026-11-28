@@ -3055,6 +3055,23 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
             ;; the time of the query's own relations of the whole run
             (with-current-buffer ra
               (should (string-match-p "⏱ 1.2 s of 1.7 s" (codeql-xray--header-line))))
+            ;; at the end of each definition of the query
+            (with-current-buffer src
+              (let ((notes (mapcar (lambda (ov)
+                                     (cons (line-number-at-pos (overlay-start ov))
+                                           (substring-no-properties (overlay-get ov 'after-string))))
+                                   (seq-filter (lambda (ov) (eq (overlay-get ov 'codeql-xray) 'cost))
+                                               (overlays-in (point-min) (point-max))))))
+                (should (member (cons (1+ (cl-position "select b, b.lines()" codeql-test--xray-source
+                                                       :test #'equal))
+                                      "  ⏱ <1 ms · 7 rows")
+                                notes))
+                (should (equal (save-excursion
+                                 (goto-char (overlay-start
+                                             (seq-find (lambda (ov) (eq (overlay-get ov 'codeql-xray) 'cost))
+                                                       (overlays-in (point-min) (point-max)))))
+                                 (eolp))
+                               t))))
             ;; the DIL at the closing brace of the block
             (with-current-buffer dil
               (should (equal (codeql-test--xray-costs dil (- (count-lines (point-min) (point-max)) 1))
