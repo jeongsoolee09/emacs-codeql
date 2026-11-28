@@ -2261,7 +2261,7 @@ org text after the block."
     "    return r1"
     ""
     "  rec `Other::q/1#22`(int x) :- "
-    "    {1} r1 = SCAN `Deep::Inner::Big.lines/0#dispred#77#prev_delta` OUTPUT In.1"
+    "    {2} r1 = SCAN `Deep::Inner::Big.lines/0#dispred#77#prev_delta` OUTPUT In.1, In.0"
     "    return r1"
     ""
     "EVALUATE NONRECURSIVE RELATION:"
@@ -3089,6 +3089,237 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
   (should (equal (codeql-xray--step-relations
                   "    {2} r1 = JOIN cached_M::q/0#cc WITH `M::p/1#ab` ON FIRST 1 OUTPUT 'a::b'")
                  "M::p/1 M::q/0")))
+
+(defconst codeql-test--hotspots-join
+  "    {2} r1 = JOIN x WITH x ON FIRST 1 OUTPUT Lhs.0, Rhs.1"
+  "A step of the hotspot tests.")
+
+(defun codeql-test--hotspots-after (lib)
+  "Return the events of a run with a hotspot, at line 3 of LIB."
+  (list (list :predicateName "D::cached/0#ffffffff" :evaluationStrategy "CACHE_HIT" :resultSize 1)
+        (list :predicateName "A::p/1#aaaaaaaa" :raHash "ha" :millis 900 :resultSize 10
+              :dependencies '(:x "hx") :position (concat lib ":3,11-3,11")
+              :ra (list :pipeline (vector codeql-test--hotspots-join
+                                          "    {1} r2 = SCAN r1 OUTPUT In.0" "    return r2"))
+              ;; over two iterations
+              :pipelineRuns [(:raReference "pipeline" :counts [6000 6])
+                             (:raReference "pipeline" :counts [4000 4])])
+        (list :predicateName "x" :raHash "hx" :evaluationStrategy "EXTENSIONAL" :resultSize 100)
+        (list :predicateName "B::q/0#bbbbbbbb" :millis 5 :resultSize 3 :dependencies '(:x "hx")
+              :ra '(:pipeline ["    {1} r1 = SCAN x OUTPUT In.0" "    return r1"])
+              :pipelineRuns [(:raReference "pipeline" :counts [3])])
+        (list :predicateName "D::empty/0#eeeeeeee" :evaluationStrategy "SENTINEL_EMPTY"
+              :dependencies '(:x "hx"))))
+
+(defun codeql-test--hotspots-before ()
+  "Return the events of the run before the one of `codeql-test--hotspots-after'."
+  (list (list :predicateName "A::p/1#cccccccc" :millis 50 :resultSize 10
+              :dependencies '(:x "hx2")
+              :ra (list :pipeline (vector codeql-test--hotspots-join "    return r1"))
+              :pipelineRuns [(:raReference "pipeline" :counts [20])])
+        (list :predicateName "x" :raHash "hx2" :evaluationStrategy "EXTENSIONAL" :resultSize 100)
+        (list :predicateName "C::gone/0#dddddddd" :millis 7 :resultSize 1)
+        (list :predicateName "D::cached/0#eeeeeeee" :millis 3 :resultSize 1)))
+
+(ert-deftest codeql-test-hotspots-blowups ()
+  "The step making the most tuples, and how many times as many as its relation reads or makes."
+  (let* ((events (append (codeql-test--hotspots-after "/lib/Lib.qll")
+                         ;; the same relation evaluated again, with more
+                         ;; tuples from a larger input
+                         (list (list :predicateName "A::p/1#ffffffff" :millis 0 :resultSize 0
+                                     :dependencies '(:y "hy")
+                                     :ra '(:pipeline ["    {1} r1 = SCAN y OUTPUT In.0" "    return r1"])
+                                     :pipelineRuns [(:raReference "pipeline" :counts [50000])])
+                               (list :predicateName "y" :raHash "hy" :evaluationStrategy "EXTENSIONAL"
+                                     :resultSize 100000))))
+         (rows (codeql--performance-sort
+                (codeql--performance-against (codeql--performance-blowups events)
+                                             (codeql--performance-blowups
+                                              (codeql-test--hotspots-before))
+                                             (codeql--performance-cached events))
+                'blowup))
+         (names (lambda () (mapcar #'codeql--hotspot-name rows))))
+    (should (equal (funcall names) '("A::p/1#aaaaaaaa" "B::q/0#bbbbbbbb"
+                                     "C::gone/0#dddddddd" "D::cached/0#eeeeeeee")))
+    (let ((a (car rows)))
+      ;; the counts summed over the iterations, over the larger of its input
+      ;; and its result
+      (should (equal (list (codeql--hotspot-peak a) (codeql--hotspot-blowup a) (codeql--hotspot-step a))
+                     (list 10000 100.0 codeql-test--hotspots-join)))
+      ;; the same relation compiled again, by its name without hashes
+      (should (equal (list (codeql--hotspot-peak (codeql--hotspot-before a))
+                           (codeql--hotspot-millis (codeql--hotspot-before a)))
+                     '(20 50))))
+    (should-not (codeql--hotspot-before (nth 1 rows)))
+    (should (and (codeql--hotspot-gone (nth 2 rows)) (codeql--hotspot-gone (nth 3 rows))))
+    ;; read from the cache
+    (should-not (codeql--hotspot-cached (nth 2 rows)))
+    (should (codeql--hotspot-cached (nth 3 rows)))
+    (should (equal (mapcar #'codeql--performance-times '(100 2.5 0.03)) '("×100" "×2.5" "×0.0")))
+    (should (equal (codeql--performance-stable "M::p/1#0a1b2c3d#ff") "M::p/1#ff"))
+    (should (equal (codeql--performance-stable "M::p/1#0a1b2c3d") "M::p/1"))
+    ;; by time, the relations not evaluated last
+    (setq rows (codeql--performance-sort rows 'time))
+    (should (equal (funcall names) '("A::p/1#aaaaaaaa" "B::q/0#bbbbbbbb"
+                                     "C::gone/0#dddddddd" "D::cached/0#eeeeeeee")))
+    ;; by the change, among the others
+    (setq rows (codeql--performance-sort rows 'change))
+    (should (equal (seq-take (funcall names) 3)
+                   '("A::p/1#aaaaaaaa" "C::gone/0#dddddddd" "B::q/0#bbbbbbbb")))))
+
+(ert-deftest codeql-test-hotspots-buffer ()
+  "The relations by their blowup beside the run before, going to their QL and RA."
+  (let* ((dir (make-temp-file "codeql-test-hotspots" t))
+         (lib (expand-file-name "Lib.qll" dir))
+         (run (list :query-path "/q/Foo.ql" :log-path "/q/run.jsonl"
+                    :timestamp "Fri Nov 27 10:05:00 2026"))
+         (previous (list :query-path "/q/Foo.ql" :log-path "/q/previous.jsonl"
+                         :timestamp "Fri Nov 27 10:00:00 2026"))
+         (buffer nil))
+    (with-temp-file lib
+      (insert "import javascript\n\npredicate p(int x) { x = 1 }\n"))
+    (unwind-protect
+        (cl-letf (((symbol-function 'codeql--evaluator-log-summary)
+                   (lambda (log-path)
+                     (if (equal log-path "/q/run.jsonl")
+                         (codeql-test--hotspots-after lib)
+                       (codeql-test--hotspots-before)))))
+          (delete-other-windows)
+          (setq buffer (codeql-query-hotspots run previous))
+          (should (eq (current-buffer) buffer))
+          (let ((lines (split-string (buffer-string) "\n")))
+            (should (string-match-p "Hotspots of Foo.ql at 10:05:00: 1 of 2 blow up ×50 or more"
+                                    (nth 0 lines)))
+            (should (string-match-p "which computed 1 read from the cache now" (nth 0 lines)))
+            (should (string-match-p (concat "\\`\\s-*×100\\s-+10k\\s-+10\\s-+900 ms\\s-+│"
+                                            "\\s-+×0.2\\s-+20\\s-+50 ms\\s-+│\\s-+A::p/1#aaaaaaaa")
+                                    (nth 1 lines)))
+            (should (string-match-p "new" (nth 2 lines)))
+            (should (string-match-p "\\`\\s-*gone" (nth 3 lines)))
+            (should (string-match-p "\\`\\s-*cached" (nth 4 lines))))
+          ;; blowing up, and slower than before
+          (goto-char (point-min))
+          (forward-line 1)
+          (cl-flet ((face-of (text)
+                      (save-excursion
+                        (search-forward text (line-end-position))
+                        (get-text-property (match-beginning 0) 'face))))
+            (should (eq (face-of "×100") 'codeql-hotspots-blowup))
+            (should (eq (face-of "900 ms") 'codeql-hotspots-slower)))
+          ;; the step blowing up in its RA, without an x-ray
+          (codeql-hotspots-show-step)
+          (with-current-buffer "*codeql-performance-ra*"
+            (goto-char (window-point (get-buffer-window (current-buffer))))
+            (should (equal (buffer-substring (line-beginning-position) (line-end-position))
+                           codeql-test--hotspots-join)))
+          ;; its QL, in the window showing it
+          (delete-other-windows)
+          (let ((lib-win (split-window nil nil 'above)))
+            (set-window-buffer lib-win (find-file-noselect lib))
+            (split-window nil nil 'below)
+            (codeql-hotspots-visit)
+            (should (eq (selected-window) lib-win))
+            (should (= (line-number-at-pos) 3)))
+          ;; sorted by time
+          (select-window (get-buffer-window buffer))
+          (codeql-hotspots-sort)
+          (let ((lines (split-string (buffer-string) "\n")))
+            (should (string-match-p "sorted by time" (nth 0 lines)))
+            (should (string-match-p "C::gone" (nth 3 lines)))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (when (get-buffer "*codeql-performance-ra*") (kill-buffer "*codeql-performance-ra*"))
+      (when-let* ((b (find-buffer-visiting lib))) (kill-buffer b))
+      (delete-directory dir t)
+      (delete-other-windows))))
+
+(ert-deftest codeql-test-xray-blowups ()
+  "The steps blowing up, beside the cost of the run before, and going to them."
+  (codeql-test--with-xray (state src '("DIL" "RA"))
+    (let* ((ra (codeql-test--xray-view state 1))
+           (previous-log (make-temp-file "codeql-test-previous"))
+           (run-log (make-temp-file "codeql-test-run"))
+           (path (buffer-file-name src))
+           (previous (list :query-path path :log-path previous-log
+                           :timestamp "Fri Nov 27 10:00:00 2026"))
+           (run (list :query-path path :log-path run-log :timestamp "Fri Nov 27 10:05:00 2026"))
+           (scan "    {2} r1 = SCAN `cached_Other::q/1#22` OUTPUT In.0, In.1")
+           (delta "    {2} r1 = SCAN `Big.lines#prev_delta` OUTPUT In.1, In.0")
+           (big (lambda (millis counts q-counts)
+                  (list
+                   ;; a plan of another shape
+                   (list :predicateName "Other::q/1#22" :raHash "hq" :evaluationStrategy "IN_LAYER"
+                         :resultSize 10 :dependencies '(:q "hq")
+                         :ra (list :pipeline ["    {1} r1 = CONSTANT(int)[2]" "    return r1"]
+                                   ;; of the shape of the base case too
+                                   :rec (vector delta "    return r1"))
+                         :pipelineRuns (vector (list :raReference "pipeline" :counts q-counts)
+                                               (list :raReference "rec" :counts [7])))
+                   (list :predicateName "Deep::Inner::Big.lines/0#dispred#77" :millis millis
+                         :resultSize 20 :dependencies '(:q "hq")
+                         :ra (list :base (vector scan "    return r1"))
+                         :pipelineRuns (vector (list :raReference "base" :counts counts)))))))
+      (unwind-protect
+          (cl-letf (((symbol-function 'codeql--evaluator-log-summary-async)
+                     (lambda (log-path callback)
+                       ;; a regression: 5000 tuples for 20 rows, when there were 20
+                       (funcall callback (if (equal log-path run-log)
+                                             (funcall big 1200 [5000] [600])
+                                           (funcall big 40 [20] [10]))))))
+            (with-current-buffer src
+              (setq codeql--completed-query-history (make-hash-table :test #'equal))
+              (puthash "previous" previous codeql--completed-query-history)
+              (puthash "run" run codeql--completed-query-history))
+            (run-hook-with-args 'codeql-query-run-functions run)
+            (let ((row (codeql-test--xray-row ra "SCAN `Deep::Inner::big"))
+                  (last (1+ (codeql-test--xray-row ra "prev_delta"))))
+              (with-current-buffer ra
+                (let ((over (seq-find (lambda (ov) (eq (overlay-get ov 'codeql-xray) 'cost))
+                                      (overlays-in (codeql-xray--row-pos row)
+                                                   (1+ (codeql-xray--row-pos row))))))
+                  (should (equal (overlay-get over 'display) "5.0k"))
+                  (should (eq (get-text-property 0 'face (overlay-get over 'display))
+                              'codeql-hotspots-blowup))))
+              ;; at the end of the layer
+              (let ((costs (codeql-test--xray-costs ra last)))
+                (should (equal (car costs)
+                               "eol:⏱ 1.2 s · 30 rows · ×250 blowup  was 40 ms · 30 rows"))
+                ;; 600 tuples for 10 rows, of the plan evaluated
+                (should (equal (nth 2 costs) "below:600 {1} r1 = CONSTANT(int)[2]")))
+              (with-current-buffer ra
+                (let* ((ov (seq-find (lambda (ov) (overlay-get ov 'after-string))
+                                     (overlays-in (codeql-xray--row-pos last)
+                                                  (codeql-xray--row-pos (1+ last)))))
+                       (text (overlay-get ov 'after-string)))
+                  (cl-flet ((face-at (s) (get-text-property (string-search s text) 'face text)))
+                    (should (eq (face-at "⏱") 'codeql-xray-cost))
+                    (should (eq (face-at " · ×250") 'codeql-hotspots-blowup))
+                    (should (eq (face-at "  was") 'codeql-xray-was))
+                    (should (eq (face-at "600 ") 'codeql-hotspots-blowup))))
+                (should (string-match-p "⏱ 1.2 s of 1.2 s, was 40 ms of 40 ms"
+                                        (codeql-xray--header-line))))
+              (codeql-test--xray-goto ra 1)
+              (codeql-xray-next-blowup)
+              (should (= (codeql-xray--current-row) row))
+              (codeql-xray-next-blowup)
+              (should (= (codeql-xray--current-row) last))
+              (codeql-xray-previous-blowup)
+              (should (= (codeql-xray--current-row) row))
+              ;; the step of the hotspots, from another window
+              (select-window (get-buffer-window src))
+              (should (codeql-xray-reveal path "Deep::Inner::Big.lines/0#dispred#77" scan))
+              (should (eq (current-buffer) ra))
+              (should (= (codeql-xray--current-row) row))
+              ;; the step it was matched with, of a shape another step has too
+              (should (codeql-xray-reveal path "Other::q/1#22" delta))
+              (should (= (codeql-xray--current-row) (1- last)))
+              ;; a relation of the libraries, peeked at
+              (should (codeql-xray-reveal path "Lib::helper/1#11"))
+              (should (equal (codeql-test--xray-line 1) "  `Lib::helper/1#11`(int x) :- "))
+              (should-not (codeql-xray-reveal "/elsewhere/Other.ql" "Lib::helper/1#11"))))
+        (with-current-buffer src
+          (setq codeql--completed-query-history nil))
+        (delete-file previous-log)
+        (delete-file run-log)))))
 
 (ert-deftest codeql-test-xray-command ()
   "The x-ray needs a query and runs `codeql query compile' with its dumps."

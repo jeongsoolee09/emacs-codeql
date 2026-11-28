@@ -366,6 +366,8 @@ Each query run writes a structured evaluator log next to its results (set `codeq
 
 `codeql-query-performance-compare` (`T`) matches the computed predicates of two runs by name and lists the time and tuples of each run, the largest difference in time first. Predicates that were taken from the cache in one of the runs show `-` for that run.
 
+`codeql-query-hotspots` (`H`) lists the relations of the last run of the query by their blowup: the most tuples a step of the relation made, its peak, over the larger of the rows of the largest relation it reads and its own, like the warnings of bad join orders of VS Code. Beside them, the same relations, hashes aside, in the run of the query before, with the times faster (`codeql-hotspots-faster`) and slower (`codeql-hotspots-slower`) than before. Blowups of `codeql-performance-blowup` (default: 50) times or more are highlighted `codeql-hotspots-blowup`. A relation the run before computed shows `cached` when this run read it from the cache, and `gone` when it didn't need it, after the others. `s` sorts by blowup, time or change in time, `RET` goes to the QL of the relation, in a window showing its file if any, and `r` to the step of its peak in the RA of the x-ray of the query, or else in the RA it was evaluated with.
+
 #### Jumping to result locations
 
 `codeql-results-goto-location` offers every source location in the current results buffer (or page of results) for completion, each with the text of the result it belongs to, and visits the chosen one like following its link. Bind it in `codeql-results-mode-map`, or call it with `M-x`.
@@ -561,7 +563,7 @@ Each definition and its code have the same background color, `codeql-xray-1`, `c
 
 The many relations of a module the query instantiates, like `module Flow = TaintTracking::Global<Config>;`, belong to its alias and fold into one line per alias, like `▸ Flow  ·  1114 blocks  ·  TaintTracking::Global<Config>  ·  o opens`. Point on such an alias also highlights the DIL types naming the module it instantiates in the other code, like the variables of the select clause. Saving the query compiles it again. Then the blocks whose code changed since the last compile, hashes aside, are marked `~` and `changed` (`codeql-xray-changed`), the ones of relations it didn't have `+` and `new` (`codeql-xray-new`), with their counts and the ones gone in the header line and on the folds. The header line also shows how many blocks of the dump are the query's and how long compiling took. When the query doesn't compile, the columns list the compiler's messages.
 
-Running the query (`r` in the columns, `p` with evil) tells what its code cost, from the summary of the evaluator log of the run (see `codeql-evaluator-log`), and so does opening the x-ray after a run. Each block ends with the time and rows of its relations, like `⏱ 40 ms · 1.2k rows`, or `⏱ cached · 3 rows`, or `⏱ skipped: an input is empty`, in `codeql-xray-cost`; the folds sum the times of their blocks, and the header line tells the time of the query's code of the whole run, like `⏱ 1.2 s of 1.7 s`. Each RA step shows its tuple count, summed over the iterations of a recursive relation, over its indentation, from the evaluated pipeline of the same shape. As the evaluator plans with the statistics of the database, a step reading other relations than the dumped one is followed by the evaluated step, after `≠`, and a pipeline of another shape by the whole evaluated plan, in `codeql-xray-evaluated`. The query server writes a server-wide evaluator log while `codeql-evaluator-log` is on, without which the logs of the runs carry no tuple counts.
+Running the query (`r` in the columns, `p` with evil) tells what its code cost, from the summary of the evaluator log of the run (see `codeql-evaluator-log`), and so does opening the x-ray after a run. Each block ends with the time and rows of its relations, like `⏱ 40 ms · 1.2k rows`, or `⏱ cached · 3 rows`, or `⏱ skipped: an input is empty`, in `codeql-xray-cost`; the folds sum the times of their blocks, and the header line tells the time of the query's code of the whole run, like `⏱ 1.2 s of 1.7 s`. Each RA step shows its tuple count, summed over the iterations of a recursive relation, over its indentation, from the evaluated pipeline of the same shape. As the evaluator plans with the statistics of the database, a step reading other relations than the dumped one is followed by the evaluated step, after `≠`, and a pipeline of another shape by the whole evaluated plan, in `codeql-xray-evaluated`. The query server writes a server-wide evaluator log while `codeql-evaluator-log` is on, without which the logs of the runs carry no tuple counts. A count blowing up, `codeql-performance-blowup` times as many tuples as its relation reads or makes or more, is highlighted `codeql-hotspots-blowup`, and the block's mark tells the largest blowup, like `⏱ 1.2 s · 30 rows · ×250 blowup`. Beside it, the cost of the same relations in the run of the query before (`codeql-xray-was`), like `was 40 ms · 30 rows`, and in the header line, like `⏱ 3 ms of 4 ms, was 44 ms of 342 ms`, to tell what a change of the query did. `H` lists the hotspots of the run, see `codeql-query-hotspots`.
 
 In the x-ray columns:
 
@@ -575,6 +577,8 @@ In the x-ray columns:
 | `o` | `o`, `za`, `zo`, `zc` | open or close the fold of an instantiated module |
 | `g` | `gr`, `r` | compile the query again |
 | `r` | `p` | run the query, to tell what its code costs |
+| `]`, `[` | `]x`, `[x` | go to the next or previous step blowing up in the last run |
+| `H` | `H` | list the hotspots of the last run, `codeql-query-hotspots` |
 | `q` | `q` | close the x-ray |
 
 ### Commands
@@ -605,6 +609,7 @@ It doesn't run anything. Queries are run with the commands of `codeql-command-ma
 | `C` | `codeql-query-history-compare` |
 | `t` | `codeql-query-performance` |
 | `T` | `codeql-query-performance-compare` |
+| `H` | `codeql-query-hotspots` |
 | `l` | `codeql-load-sarif` |
 | `v` | `codeql-mrva` |
 | `f` | `codeql-database-open-source-archive-file` |
