@@ -2707,6 +2707,47 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
                            (codeql-xray--map blocks "Paths" defs))
                    '("Flow" "Flow")))))
 
+(defun codeql-test--xray-peers (buffer)
+  "Return the 0-based rows of BUFFER marked with the bar of the relation at point."
+  (with-current-buffer buffer
+    (sort (mapcar (lambda (ov) (save-excursion (goto-char (overlay-start ov))
+                                               (1- (line-number-at-pos))))
+                  (seq-filter (lambda (ov) (eq (overlay-get ov 'codeql-xray) 'peer))
+                              (overlays-in (point-min) (point-max))))
+          #'<)))
+
+(ert-deftest codeql-test-xray-follow ()
+  "The block of the relation at point is marked in both dumps, as point moves."
+  (codeql-test--with-xray (state src '("DIL" "RA") nil nil
+                                 (append codeql-test--xray-dil
+                                         '("" "#select#query(int b)" "{" "  #select(b, _)" "}"))
+                                 (append codeql-test--xray-ra
+                                         '("" "EVALUATE NONRECURSIVE RELATION:"
+                                           "  #select#query(int b) :- " "    return r1")))
+    (let* ((dil (codeql-test--xray-view state 0))
+           (ra (codeql-test--xray-view state 1))
+           (ra-block (lambda ()
+                       (with-current-buffer ra
+                         (goto-char (codeql-xray--row-pos (1+ (car (codeql-test--xray-peers ra)))))
+                         (codeql-test--xray-line)))))
+      (with-current-buffer dil
+        (should (= left-margin-width 1)))
+      (codeql-test--xray-goto dil 1)
+      (re-search-forward "^#select(")
+      (let ((row (1- (line-number-at-pos))))
+        (run-hooks 'post-command-hook)
+        (should (= (car (codeql-test--xray-peers dil)) row)))
+      (let ((first (funcall ra-block)))
+        (should (string-prefix-p "  #select(" first))
+        (select-window (get-buffer-window dil))
+        (re-search-forward "^#select#query")
+        (run-hooks 'post-command-hook)
+        (let ((last (car (last (codeql-xray--view-spans (car (codeql-xray-views state)))))))
+          (should (equal (codeql-test--xray-peers dil)
+                         (number-sequence (codeql-xray--span-first last)
+                                          (codeql-xray--span-last last)))))
+        (should (equal (funcall ra-block) "  #select#query(int b) :- "))))))
+
 (defmacro codeql-test--with-inst-xray (spec &rest body)
   "Run BODY with the x-ray of Inst.ql, SPEC is (STATE SRC DIL RA)."
   (declare (indent 1))
@@ -2769,6 +2810,21 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
     (should (equal (codeql-test--xray-folds ra) '((0 6 nil))))
     (should (equal (codeql-test--xray-line 1)
                    (format "  `num#%s::p/0#9`(int x) :- " codeql-test--xray-g)))))
+
+(ert-deftest codeql-test-xray-follow-strict ()
+  "No other block is marked for a relation one dump has, nor for a closed fold."
+  (codeql-test--with-xray (state src '("DIL" "RA") "Inst.ql" codeql-test--xray-inst
+                                 (append (list (format "`%s::r/0#5`()" codeql-test--xray-g) "{ }" "")
+                                         codeql-test--xray-inst-dil)
+                                 codeql-test--xray-inst-ra)
+    (let ((dil (codeql-test--xray-view state 0))
+          (ra (codeql-test--xray-view state 1)))
+      (codeql-test--xray-move dil 1)
+      (should-not (codeql-test--xray-peers dil))
+      (codeql-xray-toggle-fold)
+      (run-hooks 'post-command-hook)
+      (should (codeql-test--xray-peers dil))
+      (should-not (codeql-test--xray-peers ra)))))
 
 (ert-deftest codeql-test-xray-instance-peek ()
   "A relation of the libraries named differently is peeked at in both dumps."

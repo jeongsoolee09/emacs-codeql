@@ -11197,6 +11197,11 @@ one dump beside the query, see `codeql-xray-kind'."
   "The notes of the definitions without code in the x-ray."
   :group 'emacs-codeql)
 
+(defface codeql-xray-peer
+  '((t :inherit font-lock-builtin-face))
+  "The bar beside the block of the relation at point, and of the same relation."
+  :group 'emacs-codeql)
+
 (cl-defstruct (codeql-xray--token (:constructor codeql-xray--token-create (v row &optional id))
                                   (:copier nil))
   "A token of a query: its text V, its 0-based ROW, and whether it is an ID."
@@ -11230,8 +11235,10 @@ its EXPR, like \"TaintTracking::Global<Config>\", and SHAPE, like
 
 (cl-defstruct (codeql-xray--view (:constructor codeql-xray--view-create)
                                  (:copier nil))
-  "A buffer BUF showing the dump of KIND, as its LINES, SPANS and FOLDS."
-  kind buf spans lines starts comments folds)
+  "A buffer BUF showing the dump of KIND, as its LINES, SPANS and FOLDS.
+
+CURRENT is the span at point, as last followed."
+  kind buf spans lines starts comments folds current)
 
 (cl-defstruct (codeql-xray (:constructor codeql-xray--create)
                            (:copier nil))
@@ -12028,7 +12035,8 @@ Then the blocks peeked at."
            (starts nil))
       (setf (codeql-xray--view-spans view) (nreverse spans)
             (codeql-xray--view-lines view) (vconcat lines)
-            (codeql-xray--view-comments view) nil)
+            (codeql-xray--view-comments view) nil
+            (codeql-xray--view-current view) nil)
       (with-current-buffer buf
         (let ((inhibit-read-only t)
               (point-row (1- (line-number-at-pos)))
@@ -12356,10 +12364,11 @@ A relation of the libraries is shown below the others, and
         (goto-char (point-min))
         (forward-line (codeql-xray-def-srow (codeql-xray--span-def span)))))))
 
-(defun codeql-xray--counterpart (spans here)
+(defun codeql-xray--counterpart (spans here &optional strict)
   "Return the span of SPANS with the code of the definition of the span HERE.
 
-Preferring the one of the same relation, then of the same bare relation."
+Preferring the one of the same relation, then of the same bare relation.
+When STRICT, only those."
   (let* ((names (codeql-xray-block-names (codeql-xray--span-block here)))
          (bares (mapcar #'codeql-xray--bare names))
          (first nil)
@@ -12372,7 +12381,39 @@ Preferring the one of the same relation, then of the same bare relation."
                 ((and (not similar) (member (codeql-xray--bare name) bares))
                  (setq similar span))))
         (setq first (or first span))))
-    (or same similar first)))
+    (or same similar (and (not strict) first))))
+
+(defun codeql-xray--mark-peer (view span)
+  "Mark the lines of SPAN of VIEW with a bar in the margin."
+  (with-current-buffer (codeql-xray--view-buf view)
+    (let ((starts (codeql-xray--view-starts view))
+          (bar (propertize " " 'display `((margin left-margin)
+                                          ,(propertize "▌" 'face 'codeql-xray-peer)))))
+      (cl-loop for row from (codeql-xray--span-first span) to (codeql-xray--span-last span)
+               for pos = (codeql-xray--row-pos row starts)
+               do (let ((ov (make-overlay pos pos)))
+                    (overlay-put ov 'codeql-xray 'peer)
+                    (overlay-put ov 'before-string bar))))))
+
+(defun codeql-xray--follow (state view span)
+  "Mark SPAN of VIEW of STATE, and the block of the same relation in the others.
+
+Show that block, opening its fold."
+  (dolist (v (codeql-xray-views state))
+    (codeql-xray--clear (codeql-xray--view-buf v) 'peer))
+  (when span
+    (codeql-xray--mark-peer view span)
+    (dolist (v (codeql-xray-views state))
+      (when-let* ((target (and (not (eq v view))
+                               (codeql-xray--counterpart (codeql-xray--view-spans v) span t))))
+        (codeql-xray--mark-peer v target)
+        (when-let* ((buf (codeql-xray--view-buf v))
+                    (win (codeql-xray--window buf)))
+          (let ((fold (codeql-xray--fold-at v (codeql-xray--span-first target))))
+            (when (and fold (codeql-xray--fold-closed-p fold))
+              (codeql-xray--set-fold state fold nil)))
+          (codeql-xray--reveal buf (codeql-xray--span-first target)
+                               (codeql-xray--view-starts v)))))))
 
 (defun codeql-xray-other ()
   "Go to the other column at the code of the same relation.
@@ -12521,18 +12562,29 @@ A closed fold counts as one block."
 
 \\{codeql-xray-mode-map}"
   (setq-local truncate-lines t)
+  (setq-local left-margin-width 1)
   (setq-local font-lock-defaults '(codeql-xray-font-lock-keywords t))
   (setq-local header-line-format '(:eval (codeql-xray--header-line)))
   (setq-local revert-buffer-function (lambda (&rest _) (codeql-xray-recompile))))
 
 (defun codeql-xray--view-post-command ()
-  "Highlight the definition of the block at point of a view."
+  "Highlight the definition of the block at point of a view.
+
+And follow the relation of the block at point across the views."
   (when-let* ((state codeql-xray--state)
-              (view codeql-xray--this-view)
-              (span (codeql-xray--span-at view (codeql-xray--current-row)))
-              (def (codeql-xray--span-def span)))
-    (unless (eq def (codeql-xray-active state))
-      (codeql-xray--activate state def view))))
+              (view codeql-xray--this-view))
+    (let* ((row (codeql-xray--current-row))
+           (span (codeql-xray--span-at view row))
+           (def (and span (codeql-xray--span-def span)))
+           (fold (codeql-xray--fold-at view row)))
+      (when (and def (not (eq def (codeql-xray-active state))))
+        (codeql-xray--activate state def view))
+      ;; a closed fold stands for all of its blocks
+      (when (and fold (codeql-xray--fold-closed-p fold))
+        (setq span nil))
+      (unless (eq span (codeql-xray--view-current view))
+        (setf (codeql-xray--view-current view) span)
+        (codeql-xray--follow state view span)))))
 
 (defun codeql-xray--source-post-command ()
   "Highlight the definition at point of the query and its code."
