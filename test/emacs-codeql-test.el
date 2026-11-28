@@ -2790,6 +2790,27 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
         (with-current-buffer ra
           (should-not (string-match-p "changed" (codeql-xray--header-line))))))))
 
+(ert-deftest codeql-test-xray-colors ()
+  "Each definition has a color of its own, and its code in the dumps the same."
+  (let ((lines nil)
+        (dil nil))
+    (dotimes (i 8)
+      (push (format "predicate p%d() { any() }" (1+ i)) lines)
+      (setq dil (append dil (list (format "`Many::p%d/0#%d`()" (1+ i) (1+ i)) "{ }" ""))))
+    (codeql-test--with-xray (state src '("DIL") "Many.ql" (nreverse lines) dil nil)
+      (let* ((faces (lambda (buf)
+                      (mapcar (lambda (mark) (cadr (split-string mark " ")))
+                              (codeql-test--xray-marks buf 'base))))
+             (ql (funcall faces src)))
+        (should (= (length ql) 8))
+        (should (equal ql (funcall faces (codeql-test--xray-view state 0))))
+        (should (= (length (seq-uniq (mapcar (lambda (face) (face-attribute (intern face) :background))
+                                             ql)))
+                   8))
+        (should (equal (codeql-xray--color 7 'light) (codeql-xray--color 7 'light)))
+        (should-not (member (codeql-xray--color 7 'dark)
+                            (cdr (assq 'dark codeql-xray--palette))))))))
+
 (defmacro codeql-test--with-inst-xray (spec &rest body)
   "Run BODY with the x-ray of Inst.ql, SPEC is (STATE SRC DIL RA)."
   (declare (indent 1))

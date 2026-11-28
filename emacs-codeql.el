@@ -11184,8 +11184,56 @@ one dump beside the query, see `codeql-xray-kind'."
   "The sixth color of the definitions of a query and their code."
   :group 'emacs-codeql)
 
-(defconst codeql-xray--colors 6
-  "The number of colors of the definitions, `codeql-xray-1' and on.")
+(defconst codeql-xray--palette
+  '((light "#dbe8f6" "#ecdff6" "#dcf3e4" "#f6ecd8" "#f7dde4" "#e8f3d6")
+    (dark "#1f3548" "#3d2a48" "#21402f" "#463a22" "#48262f" "#2f3f1f"))
+  "The colors of `codeql-xray-1' to `codeql-xray-6' for each background.
+
+Past those, more are made with the hues spread by the golden ratio.")
+
+(defvar codeql-xray--made-colors
+  (mapcar (lambda (p) (cons (car p) (copy-sequence (cdr p)))) codeql-xray--palette)
+  "The colors of the definitions made so far, for each background.")
+
+(defvar codeql-xray--defined-colors 6
+  "The number of faces of the colors of the definitions, `codeql-xray-1' and on.")
+
+(defun codeql-xray--hsl (h s l)
+  "Return the color of the hue H, saturation S and lightness L, from 0 to 1."
+  (cl-flet ((channel (n)
+              (let* ((k (mod (+ n (* h 12)) 12))
+                     (a (* s (min l (- 1 l)))))
+                (floor (+ (* (- l (* a (max -1 (min (- k 3) (- 9 k) 1)))) 255) 0.5)))))
+    (format "#%02x%02x%02x" (channel 0) (channel 8) (channel 4))))
+
+(defun codeql-xray--color (i background)
+  "Return the I-th color, from 1, for the BACKGROUND, `light' or `dark'.
+
+Each is different from those before it."
+  (let ((colors (alist-get background codeql-xray--made-colors)))
+    (while (< (length colors) i)
+      (let ((n (length colors))
+            (bg nil))
+        (while (or (not bg) (member bg colors))
+          (setq n (1+ n))
+          (let ((hue (mod (+ 0.58 (* n 0.618034)) 1)))
+            (setq bg (if (eq background 'light)
+                         (codeql-xray--hsl hue 0.6 0.91)
+                       (codeql-xray--hsl hue 0.4 0.21)))))
+        (setq colors (append colors (list bg)))
+        (setf (alist-get background codeql-xray--made-colors) colors)))
+    (nth (1- i) colors)))
+
+(defun codeql-xray--define-colors (n)
+  "Make the faces of the colors of the definitions up to `codeql-xray-N'."
+  (while (< codeql-xray--defined-colors n)
+    (let* ((i (cl-incf codeql-xray--defined-colors))
+           (face (intern (format "codeql-xray-%d" i))))
+      (face-spec-set face `((((background light))
+                             :background ,(codeql-xray--color i 'light) :extend t)
+                            (t :background ,(codeql-xray--color i 'dark) :extend t)))
+      (put face 'face-documentation
+           (format "Color %d of the definitions of a query and their code." i)))))
 
 (defface codeql-xray-active
   '((t :inherit region :weight bold :extend t))
@@ -11889,7 +11937,9 @@ Those with code in any of KINDS, through the ones without code using it."
     (nreverse names)))
 
 (defun codeql-xray--colors (state)
-  "Return a hash table of the definitions of STATE with code to their colors."
+  "Return a hash table of the definitions of STATE with code to their colors.
+
+One color each."
   (let ((numbers (make-hash-table :test #'eq))
         (n 0))
     (dolist (def (codeql-xray-defs state))
@@ -11897,8 +11947,9 @@ Those with code in any of KINDS, through the ones without code using it."
                  (cl-some (lambda (kind)
                             (gethash def (codeql-xray--of (codeql-xray-coded state) kind)))
                           '("DIL" "RA")))
-        (puthash def (1+ (% n codeql-xray--colors)) numbers)
-        (setq n (1+ n))))
+        (setq n (1+ n))
+        (puthash def n numbers)))
+    (codeql-xray--define-colors n)
     numbers))
 
 (defun codeql-xray--face (n)
