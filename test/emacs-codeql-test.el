@@ -2475,9 +2475,31 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
                                 (1- (funcall row end))
                               (funcall row end))
                             (overlay-get ov 'face)))))
-              (sort (seq-filter (lambda (ov) (eq (overlay-get ov 'codeql-xray) kind))
+              (sort (seq-filter (lambda (ov) (and (eq (overlay-get ov 'codeql-xray) kind)
+                                                  (not (overlay-get ov 'codeql-xray-region))))
                                 (overlays-in (point-min) (point-max)))
                     (lambda (a b) (< (overlay-start a) (overlay-start b))))))))
+
+(defun codeql-test--xray-texts (buffer kind)
+  "Return the x-ray overlays of KIND within a line of BUFFER.
+
+As strings of their rows, texts and faces."
+  (with-current-buffer buffer
+    (mapcar (lambda (ov)
+              (format "%d %s %s" (1- (line-number-at-pos (overlay-start ov)))
+                      (buffer-substring-no-properties (overlay-start ov) (overlay-end ov))
+                      (overlay-get ov 'face)))
+            (sort (seq-filter (lambda (ov)
+                                (and (eq (overlay-get ov 'codeql-xray) kind)
+                                     (< (overlay-start ov) (overlay-end ov))
+                                     (save-excursion
+                                       (goto-char (overlay-start ov))
+                                       (<= (overlay-end ov) (line-end-position 1)))
+                                     (not (save-excursion (goto-char (overlay-start ov))
+                                                          (and (bolp) (= (overlay-end ov)
+                                                                         (line-beginning-position 2)))))))
+                              (overlays-in (point-min) (point-max)))
+                  (lambda (a b) (< (overlay-start a) (overlay-start b)))))))
 
 (defun codeql-test--xray-goto (buffer line &optional col)
   "Select the window of BUFFER at the 1-based LINE and column COL."
@@ -2515,10 +2537,15 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
                        "  `Deep::Inner::big/2#0154355b`(b, n)"
                        "}")))
       (should (equal (codeql-test--xray-marks buf 'base)
-                     '("0-6 codeql-xray-1" "8-11 codeql-xray-3")))
+                     '("0-6 codeql-xray-1" "8-11 codeql-xray-4")))
+      ;; Big has no DIL of its own, but its characteristic predicate went
+      ;; into the select, calling big
+      (should (equal (codeql-test--xray-texts buf 'base)
+                     '("10 `Deep::Inner::big/2#0154355b` codeql-xray-2")))
       (let ((marks (codeql-test--xray-marks src 'base)))
-        ;; big has DIL, lines has only RA, and both keep their colors in either
-        (dolist (mark '("4-5 codeql-xray-1" "11-13 codeql-xray-2" "23-25 codeql-xray-3"
+        ;; big has DIL, lines has only RA, and all keep their colors in either
+        (dolist (mark '("4-5 codeql-xray-1" "7-14 codeql-xray-2" "11-13 codeql-xray-3"
+                        "23-25 codeql-xray-4"
                         ;; lines is used by files, without DIL, and the select clause
                         "11 no DIL: inlined into select"
                         "21 no DIL: unused"
@@ -2562,7 +2589,7 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
                      '("overlayLocal" "`Lib::helper/1#11`(int x)")))
       ;; peeked blocks have no definition in the query
       (should (equal (codeql-test--xray-marks buf 'base)
-                     '("0-6 codeql-xray-1" "8-11 codeql-xray-3"))))))
+                     '("0-6 codeql-xray-1" "8-11 codeql-xray-4"))))))
 
 (ert-deftest codeql-test-xray-edits ()
   "The definitions are followed as the query is edited."
@@ -2615,8 +2642,11 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
       (should (equal (codeql-test--xray-marks ra 'active) '("10-13 codeql-xray-active")))
       (codeql-test--xray-move dil 2)
       (should (equal (codeql-test--xray-marks src 'active) '("4-5 codeql-xray-active")))
-      ;; big is inlined into the RA of lines
-      (should-not (codeql-test--xray-marks ra 'active))
+      ;; big is inlined into the RA of lines, which scans it
+      (should (equal (codeql-test--xray-texts ra 'active)
+                     '("3 `Deep::Inner::big/2#0154355b` codeql-xray-active")))
+      (should (equal (codeql-test--xray-texts ra 'base)
+                     '("3 `Deep::Inner::big/2#0154355b` codeql-xray-1")))
       ;; the code of the same definition in the other dump
       (codeql-test--xray-move dil 10)
       (codeql-xray-other)
@@ -2660,13 +2690,89 @@ Deep.ql or else of the query NAME with LINES compiling to DIL and RA."
       (aset with-types 14 "#select(/* Deep::Inner::Big */ interned unique entity b, int n)")
       (codeql-xray-show state (list :success t :DIL with-types :RA (vconcat codeql-test--xray-ra)))
       (codeql-test--xray-move src 8)
-      (with-current-buffer dil
-        (let ((found (seq-filter (lambda (ov) (eq (overlay-get ov 'codeql-xray) 'active))
-                                 (overlays-in (point-min) (point-max)))))
-          (should (= (length found) 1))
-          (should (equal (buffer-substring-no-properties (overlay-start (car found))
-                                                         (overlay-end (car found)))
-                         "/* Deep::Inner::Big */")))))))
+      ;; and the call of its characteristic predicate, once each
+      (should (equal (codeql-test--xray-texts dil 'active)
+                     '("8 /* Deep::Inner::Big */ codeql-xray-active"
+                       "10 `Deep::Inner::big/2#0154355b` codeql-xray-active"))))))
+
+(defconst codeql-test--xray-route
+  '("import javascript"
+    "predicate isRoute(File f) { f.getBaseName() = \"r.js\" }"
+    "class Input extends DataFlow::Node {"
+    "  Input() { isRoute(this.getFile()) }"
+    "  string kind() { result = super.getSourceType() }"
+    "}"
+    "from Input i"
+    "select i, i.kind()")
+  "Route.ql, a class inlined into the select.")
+
+(defconst codeql-test--xray-route-dil
+  '("`Route::isRoute/1#aa`(/* Files::File */ interned unique entity f)"
+    "{ `Files::File.getBaseName/0#dispred#bb`(f, \"r.js\") }"
+    ""
+    "#select(/* Route::Input */ DataFlowNode#4b input, string kind)"
+    "{"
+    "  `Route::isRoute/1#aa`(`AST::AstNode.getFile/0#dispred#cc`(input)) and"
+    "  `DataFlow::Node.getSourceType/0#dd`(input, kind) and"
+    "  `Lib::Input.kind/0#ee`(input, _)"
+    "}")
+  "The DIL of Route.ql.")
+
+(defconst codeql-test--xray-route-ra
+  '("EVALUATE NONRECURSIVE RELATION:"
+    "  `Route::isRoute/1#aa`(int f) :- "
+    "    {1} r1 = SCAN `Files::File.getBaseName/0#dispred#bb` OUTPUT In.0"
+    "    return r1"
+    ""
+    "EVALUATE NONRECURSIVE RELATION:"
+    "  #select(numbered_tuple input, string kind) :- "
+    "    {1} r1 = JOIN `Route::isRoute/1#aa` WITH `AST::AstNode.getFile/0#dispred#cc` ON In.0 OUTPUT Rhs.0 'input'"
+    "    {2} r2 = JOIN r1 WITH `DataFlow::Node.getSourceType/0#dd` ON In.0 OUTPUT In.0 'input', Rhs.1 'kind'"
+    "    return r2")
+  "The RA of Route.ql.")
+
+(ert-deftest codeql-test-xray-inlined-regions ()
+  "Inlined definitions color the code of their users they went into."
+  (codeql-test--with-xray (state src '("DIL" "RA") "Route.ql" codeql-test--xray-route
+                                 codeql-test--xray-route-dil codeql-test--xray-route-ra)
+    (let ((dil (codeql-test--xray-view state 0))
+          (ra (codeql-test--xray-view state 1)))
+      ;; each definition in its own color, even with no code of its own
+      (let ((marks (codeql-test--xray-marks src 'base)))
+        (dolist (mark '("1-1 codeql-xray-1" "2-5 codeql-xray-2" "4-4 codeql-xray-3"
+                        "6-7 codeql-xray-4" "2 no DIL or RA: inlined into select"))
+          (should (member mark marks))))
+      ;; the class: the type naming it and the predicates its characteristic
+      ;; predicate calls; its member: the predicate it calls
+      (should (equal (codeql-test--xray-texts dil 'base)
+                     '("3 /* Route::Input */ codeql-xray-2"
+                       "5 `Route::isRoute/1#aa` codeql-xray-2"
+                       "5 `AST::AstNode.getFile/0#dispred#cc` codeql-xray-2"
+                       "6 `DataFlow::Node.getSourceType/0#dd` codeql-xray-3")))
+      ;; and in the RA the columns of the variables of the class
+      (should (equal (codeql-test--xray-texts ra 'base)
+                     '("6 input codeql-xray-2"
+                       "7 `Route::isRoute/1#aa` codeql-xray-2"
+                       "7 `AST::AstNode.getFile/0#dispred#cc` codeql-xray-2"
+                       "7 'input' codeql-xray-2"
+                       "8 `DataFlow::Node.getSourceType/0#dd` codeql-xray-3"
+                       "8 'input' codeql-xray-2")))
+      ;; from the query to their code
+      (codeql-test--xray-move src 5)
+      (should (equal (codeql-test--xray-texts dil 'active)
+                     '("6 `DataFlow::Node.getSourceType/0#dd` codeql-xray-active")))
+      (should (equal (codeql-test--xray-texts ra 'active)
+                     '("8 `DataFlow::Node.getSourceType/0#dd` codeql-xray-active")))
+      ;; and back, on the columns of the class in the select
+      (codeql-test--xray-move ra 9 83)
+      (should (equal (codeql-test--xray-marks src 'active) '("2-5 codeql-xray-active")))
+      (should (equal (codeql-test--xray-texts dil 'active)
+                     '("3 /* Route::Input */ codeql-xray-active"
+                       "5 `Route::isRoute/1#aa` codeql-xray-active"
+                       "5 `AST::AstNode.getFile/0#dispred#cc` codeql-xray-active")))
+      ;; elsewhere in the select, even past them
+      (codeql-test--xray-move ra 9 95)
+      (should (equal (codeql-test--xray-marks src 'active) '("6-7 codeql-xray-active"))))))
 
 (ert-deftest codeql-test-xray-close-view ()
   "Closing a view keeps the others, closing the x-ray all of them."
